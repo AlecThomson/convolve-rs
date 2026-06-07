@@ -3,5 +3,22 @@ name = "convolve-rs"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "convolve_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beamcon_2d"
+path = "src/main.rs"
+
 [dependencies]
-fitsio = "0.21.10"
+fitsio = "0.21"
+ndarray = "0.16"
+rustfft = "6"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif = { version = "0.17", features = ["rayon"] }
