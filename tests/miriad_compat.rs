@@ -7,17 +7,37 @@
 /// All other tests are pure-Rust algebraic invariant checks that do not require
 /// any external binaries.
 
-use convolve_rs::{Beam, gaussft, fftfreq, smooth};
+use convolve_rs::{Beam, common_beam, gaussft, fftfreq, smooth};
+use convolve_rs::cube_io;
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
+use fitsio::tables::{ColumnDataType, ColumnDescription};
 use ndarray::Array2;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ── Test constants ────────────────────────────────────────────────────────────
 
-/// Path to MIRIAD binaries.
-const MIRIAD_BIN: &str = "/Users/alec.thomson/bin/miriad/darwin_arm64/bin";
+/// Find the MIRIAD binary directory.
+///
+/// Checks the `MIRIAD_BIN` environment variable first, then searches `PATH`
+/// for a directory that contains both `fits` and `convol`.
+fn find_miriad_bin_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("MIRIAD_BIN") {
+        let p = PathBuf::from(dir);
+        if p.join("fits").exists() && p.join("convol").exists() {
+            return Some(p);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            if dir.join("fits").exists() && dir.join("convol").exists() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
 
 const PIX_ARCSEC: f64 = 2.5;
 const OLD_BMAJ: f64 = 20.0;
@@ -117,12 +137,8 @@ fn read_fits_pixels(path: &Path) -> Vec<f32> {
 
 // ── MIRIAD helpers ────────────────────────────────────────────────────────────
 
-fn miriad_bin(name: &str) -> PathBuf {
-    Path::new(MIRIAD_BIN).join(name)
-}
-
 fn miriad_available() -> bool {
-    miriad_bin("fits").exists() && miriad_bin("convol").exists()
+    find_miriad_bin_dir().is_some()
 }
 
 /// Invoke MIRIAD `fits op=xyin` + `convol options=final` + `fits op=xyout` to
@@ -132,16 +148,17 @@ fn miriad_smooth(
     output_fits: &Path,
     target_beam: &Beam,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mir_root = Path::new(MIRIAD_BIN).parent().unwrap();
+    let bin_dir = find_miriad_bin_dir().ok_or("MIRIAD not found")?;
+    let mir_root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
 
     let tmpdir = output_fits.parent().unwrap();
     let mir_in  = tmpdir.join("in.im");
     let mir_out = tmpdir.join("sm.im");
 
     // FITS → MIRIAD
-    let status = Command::new(miriad_bin("fits"))
-        .env("MIR", mir_root)
-        .arg(format!("op=xyin"))
+    let status = Command::new(bin_dir.join("fits"))
+        .env("MIR", &mir_root)
+        .arg("op=xyin")
         .arg(format!("in={}", input_fits.display()))
         .arg(format!("out={}", mir_in.display()))
         .status()?;
@@ -154,8 +171,8 @@ fn miriad_smooth(
         target_beam.minor_arcsec(),
     );
     let pa = format!("pa={}", target_beam.pa_deg);
-    let status = Command::new(miriad_bin("convol"))
-        .env("MIR", mir_root)
+    let status = Command::new(bin_dir.join("convol"))
+        .env("MIR", &mir_root)
         .arg(format!("map={}", mir_in.display()))
         .arg(&fwhm)
         .arg(&pa)
@@ -165,8 +182,8 @@ fn miriad_smooth(
     if !status.success() { return Err("convol failed".into()); }
 
     // MIRIAD → FITS
-    let status = Command::new(miriad_bin("fits"))
-        .env("MIR", mir_root)
+    let status = Command::new(bin_dir.join("fits"))
+        .env("MIR", &mir_root)
         .arg("op=xyout")
         .arg(format!("in={}", mir_out.display()))
         .arg(format!("out={}", output_fits.display()))
@@ -451,7 +468,7 @@ fn test_common_beam_two_circular() {
 #[test]
 fn test_smooth_matches_miriad() {
     if !miriad_available() {
-        eprintln!("MIRIAD not found at {MIRIAD_BIN}, skipping test_smooth_matches_miriad");
+        eprintln!("MIRIAD not found on PATH or MIRIAD_BIN, skipping test_smooth_matches_miriad");
         return;
     }
 
@@ -510,5 +527,374 @@ fn test_smooth_matches_miriad() {
     }
 
     // Clean up
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+// ── Additional common-beam tests ──────────────────────────────────────────────
+
+/// Three different elliptical beams — common beam must enclose all three.
+#[test]
+fn test_common_beam_three_different() {
+    let b1 = Beam::from_arcsec(20.0, 10.0,  30.0).unwrap();
+    let b2 = Beam::from_arcsec(18.0, 12.0, -20.0).unwrap();
+    let b3 = Beam::from_arcsec(15.0, 15.0,   0.0).unwrap();
+    let result = common_beam(&[b1, b2, b3], 1e-4, 200, 5e-4).unwrap();
+
+    // Must be at least as large as the largest input beam's major axis.
+    assert!(
+        result.major_arcsec() >= 20.0 - 0.1,
+        "common major {:.3}\" < largest input 20.0\"",
+        result.major_arcsec(),
+    );
+    // Every input beam must fit inside the result.
+    for b in [b1, b2, b3] {
+        assert!(
+            result.deconvolve(&b).is_ok(),
+            "input beam {b} does not fit inside common beam {result}",
+        );
+    }
+}
+
+// ── 3D cube helpers ────────────────────────────────────────────────────────────
+
+const CUBE_NCHAN: usize = 5;
+const CUBE_NY: usize = 100;
+const CUBE_NX: usize = 100;
+const CUBE_OLD_BMAJ: f64 = 50.0;
+const CUBE_OLD_BMIN: f64 = 10.0;
+const CUBE_OLD_BPA: f64 = 0.0;
+const CUBE_TARGET_BMAJ: f64 = 60.0;
+const CUBE_TARGET_BMIN: f64 = 60.0;
+const CUBE_TARGET_BPA: f64 = 0.0;
+
+/// Write a 4D FITS cube [nstokes=1, nchan, ny, nx] with a CASAMBM BEAMS table.
+///
+/// Data layout (C row-major, matching FITS Fortran-order with last index fastest):
+/// flat[c * ny * nx + j * nx + i] = channel c, row j, col i.
+fn write_test_cube_casambm(
+    path: &Path,
+    channel_images: &[Array2<f32>],
+    beams: &[Beam],
+    pix_arcsec: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nchan = channel_images.len();
+    assert_eq!(beams.len(), nchan, "beam/channel count mismatch");
+    let (ny, nx) = channel_images[0].dim();
+    let pix_deg = pix_arcsec / 3600.0;
+
+    // fitsio reverses dimensions → pass [nstokes, nchan, ny, nx] to get
+    // NAXIS1=nx, NAXIS2=ny, NAXIS3=nchan, NAXIS4=1.
+    let description = ImageDescription {
+        data_type: ImageType::Float,
+        dimensions: &[1, nchan, ny, nx],
+    };
+    let mut fptr = FitsFile::create(path.to_str().ok_or("non-UTF-8 path")?)
+        .with_custom_primary(&description)
+        .open()?;
+    let hdu = fptr.primary_hdu()?;
+
+    // WCS
+    hdu.write_key(&mut fptr, "CDELT1", -pix_deg)?;
+    hdu.write_key(&mut fptr, "CDELT2",  pix_deg)?;
+    hdu.write_key(&mut fptr, "CDELT3",  1.0e6_f64)?;
+    hdu.write_key(&mut fptr, "CDELT4",  1.0_f64)?;
+    hdu.write_key(&mut fptr, "CRPIX1", (nx / 2 + 1) as f64)?;
+    hdu.write_key(&mut fptr, "CRPIX2", (ny / 2 + 1) as f64)?;
+    hdu.write_key(&mut fptr, "CRPIX3",  1.0_f64)?;
+    hdu.write_key(&mut fptr, "CRPIX4",  1.0_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL1",  0.0_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL2",  0.0_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL3",  1.4e9_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL4",  1.0_f64)?;
+    hdu.write_key(&mut fptr, "CTYPE1", "RA---SIN")?;
+    hdu.write_key(&mut fptr, "CTYPE2", "DEC--SIN")?;
+    hdu.write_key(&mut fptr, "CTYPE3", "FREQ")?;
+    hdu.write_key(&mut fptr, "CTYPE4", "STOKES")?;
+    hdu.write_key(&mut fptr, "EQUINOX",  2000.0_f64)?;
+    hdu.write_key(&mut fptr, "BUNIT",   "Jy/beam")?;
+    hdu.write_key(&mut fptr, "CASAMBM", "T")?;
+
+    // Reference beam from channel 0 (CRPIX3=1 → 0-based index 0).
+    hdu.write_key(&mut fptr, "BMAJ", beams[0].major_deg)?;
+    hdu.write_key(&mut fptr, "BMIN", beams[0].minor_deg)?;
+    hdu.write_key(&mut fptr, "BPA",  beams[0].pa_deg)?;
+
+    // Write all channel data as one flat C-order array.
+    let flat: Vec<f32> = channel_images.iter()
+        .flat_map(|img| img.iter().copied())
+        .collect();
+    hdu.write_image(&mut fptr, &flat)?;
+
+    // Append BEAMS binary-table extension.
+    let bmaj_v: Vec<f32> = beams.iter().map(|b| b.major_arcsec() as f32).collect();
+    let bmin_v: Vec<f32> = beams.iter().map(|b| b.minor_arcsec() as f32).collect();
+    let bpa_v:  Vec<f32> = beams.iter().map(|b| b.pa_deg as f32).collect();
+    let chan_v:  Vec<i32> = (0..nchan as i32).collect();
+    let pol_v:   Vec<i32> = vec![0; nchan];
+
+    let col_bmaj = ColumnDescription::new("BMAJ").with_type(ColumnDataType::Float).create()?;
+    let col_bmin = ColumnDescription::new("BMIN").with_type(ColumnDataType::Float).create()?;
+    let col_bpa  = ColumnDescription::new("BPA") .with_type(ColumnDataType::Float).create()?;
+    let col_chan = ColumnDescription::new("CHAN") .with_type(ColumnDataType::Int)  .create()?;
+    let col_pol  = ColumnDescription::new("POL") .with_type(ColumnDataType::Int)  .create()?;
+
+    let tbl = fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
+    tbl.write_col(&mut fptr, "BMAJ", &bmaj_v)?;
+    tbl.write_col(&mut fptr, "BMIN", &bmin_v)?;
+    tbl.write_col(&mut fptr, "BPA",  &bpa_v)?;
+    tbl.write_col(&mut fptr, "CHAN", &chan_v)?;
+    tbl.write_col(&mut fptr, "POL",  &pol_v)?;
+    tbl.write_key(&mut fptr, "NCHAN", nchan as i64)?;
+    tbl.write_key(&mut fptr, "NPOL",  1i64)?;
+
+    Ok(())
+}
+
+/// Read raw pixel data for every channel of a FITS cube, returned as a flat Vec.
+///
+/// Does not go through `read_cube_meta`; useful when the output FITS may lack
+/// a BEAMS table (e.g. plain MIRIAD output).
+fn read_cube_flat(path: &Path, nchan: usize, ny: usize, nx: usize) -> Vec<f32> {
+    let path_str = path.to_string_lossy().into_owned();
+    let mut fptr = FitsFile::open(&path_str).expect("open fits");
+    let hdu = fptr.primary_hdu().expect("primary hdu");
+    let plane = ny * nx;
+    let mut out = Vec::with_capacity(nchan * plane);
+    for c in 0..nchan {
+        let start = c * plane;
+        let end   = start + plane;
+        let pixels: Vec<f32> = hdu.read_section(&mut fptr, start, end).expect("read_section");
+        out.extend_from_slice(&pixels);
+    }
+    out
+}
+
+/// MIRIAD smoothing of a spectral cube: fits op=xyin → convol options=cube → fits op=xyout.
+///
+/// Uses `options=cube` which reads per-channel beams from the CASAMBM BEAMS table
+/// and computes the appropriate convolution kernel for each channel (equivalent to
+/// `options=final` applied per channel), matching Python `test_robust_3d`.
+fn miriad_smooth_cube(
+    input_fits: &Path,
+    output_fits: &Path,
+    target: &Beam,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bin_dir = find_miriad_bin_dir().ok_or("MIRIAD not found")?;
+    let mir_root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
+    let tmpdir = output_fits.parent().unwrap();
+    let mir_in  = tmpdir.join("cube_in.im");
+    let mir_out = tmpdir.join("cube_sm.im");
+
+    let status = Command::new(bin_dir.join("fits"))
+        .env("MIR", &mir_root)
+        .arg("op=xyin")
+        .arg(format!("in={}",  input_fits.display()))
+        .arg(format!("out={}", mir_in.display()))
+        .status()?;
+    if !status.success() { return Err("fits op=xyin failed".into()); }
+
+    let status = Command::new(bin_dir.join("convol"))
+        .env("MIR", &mir_root)
+        .arg(format!("map={}", mir_in.display()))
+        .arg(format!("fwhm={},{}", target.major_arcsec(), target.minor_arcsec()))
+        .arg(format!("pa={}", target.pa_deg))
+        .arg("options=cube")
+        .arg(format!("out={}", mir_out.display()))
+        .status()?;
+    if !status.success() { return Err("convol failed".into()); }
+
+    let status = Command::new(bin_dir.join("fits"))
+        .env("MIR", &mir_root)
+        .arg("op=xyout")
+        .arg(format!("in={}",  mir_out.display()))
+        .arg(format!("out={}", output_fits.display()))
+        .status()?;
+    if !status.success() { return Err("fits op=xyout failed".into()); }
+
+    Ok(())
+}
+
+// ── 3D cube tests ─────────────────────────────────────────────────────────────
+
+/// Write a CASAMBM cube then read back each channel with `read_channel`,
+/// verifying the pixel values round-trip exactly.
+#[test]
+fn test_cube_io_roundtrip() {
+    let tmpdir = test_tmpdir("cube_roundtrip");
+    let path = tmpdir.join("cube.fits");
+
+    let nchan = 3usize;
+    let ny = 20usize;
+    let nx = 20usize;
+
+    // Each channel gets a distinct uniform value so we can tell them apart.
+    let channels: Vec<Array2<f32>> = (0..nchan)
+        .map(|c| Array2::from_elem((ny, nx), (c as f32 + 1.0) * 10.0))
+        .collect();
+    let beam = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
+    let beams: Vec<Beam> = vec![beam; nchan];
+
+    write_test_cube_casambm(&path, &channels, &beams, PIX_ARCSEC)
+        .expect("write_test_cube_casambm failed");
+
+    let meta = cube_io::read_cube_meta(&path).expect("read_cube_meta failed");
+    assert_eq!(meta.nfreq, nchan);
+    assert_eq!(meta.ny, ny);
+    assert_eq!(meta.nx, nx);
+    assert!(meta.is_4d);
+
+    for c in 0..nchan {
+        let plane = cube_io::read_channel(&path, c, &meta)
+            .unwrap_or_else(|e| panic!("read_channel({c}) failed: {e}"));
+        let expected = (c as f32 + 1.0) * 10.0;
+        for &v in plane.iter() {
+            assert!(
+                (v - expected).abs() < 1e-4,
+                "channel {c}: expected {expected}, got {v}",
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+/// Write a CASAMBM cube with per-channel beams, parse it with `read_cube_meta`,
+/// and verify every beam is recovered within f32 precision (≈0.1 arcsec).
+#[test]
+fn test_cube_casambm_beams_roundtrip() {
+    let tmpdir = test_tmpdir("cube_beams");
+    let path = tmpdir.join("cube.fits");
+
+    let nchan = 4usize;
+    let ny = 10usize;
+    let nx = 10usize;
+
+    let beams_in: Vec<Beam> = (0..nchan)
+        .map(|c| Beam::from_arcsec(20.0 + c as f64 * 5.0, 10.0, 0.0).unwrap())
+        .collect();
+    let channels: Vec<Array2<f32>> = (0..nchan)
+        .map(|_| Array2::zeros((ny, nx)))
+        .collect();
+
+    write_test_cube_casambm(&path, &channels, &beams_in, PIX_ARCSEC)
+        .expect("write failed");
+
+    let meta = cube_io::read_cube_meta(&path).expect("read_cube_meta failed");
+    assert_eq!(meta.beams.len(), nchan);
+
+    for (c, (expected, actual)) in beams_in.iter().zip(meta.beams.iter()).enumerate() {
+        let actual = actual.unwrap_or_else(|| panic!("channel {c} beam is None"));
+        let tol_as = 0.1; // f32 storage precision ~= 0.004 arcsec for ~50"
+        assert!(
+            (actual.major_arcsec() - expected.major_arcsec()).abs() < tol_as,
+            "channel {c}: BMAJ {:.3}\" vs {:.3}\"",
+            actual.major_arcsec(), expected.major_arcsec(),
+        );
+        assert!(
+            (actual.minor_arcsec() - expected.minor_arcsec()).abs() < tol_as,
+            "channel {c}: BMIN {:.3}\" vs {:.3}\"",
+            actual.minor_arcsec(), expected.minor_arcsec(),
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+/// For each channel of a cube, smoothing a normalised PSF image to a larger beam
+/// should scale the pixel sum by Ω_new / Ω_old (the beam area ratio).
+///
+/// This is the per-channel version of `test_smooth_beam_area_ratio`.
+#[test]
+fn test_cube_channel_beam_area_ratio() {
+    let old    = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
+    let target = Beam::from_arcsec(CUBE_TARGET_BMAJ, CUBE_TARGET_BMIN, CUBE_TARGET_BPA).unwrap();
+    let pix_deg = PIX_ARCSEC / 3600.0;
+
+    let bmaj_pix = CUBE_OLD_BMAJ / PIX_ARCSEC;
+    let bmin_pix = CUBE_OLD_BMIN / PIX_ARCSEC;
+    let expected_ratio = (target.major_deg * target.minor_deg)
+        / (old.major_deg * old.minor_deg);
+
+    for c in 0..CUBE_NCHAN {
+        let image = make_gaussian_image(CUBE_NY, CUBE_NX, bmaj_pix, bmin_pix, CUBE_OLD_BPA);
+        let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+
+        let sum_in:  f64 = image.iter().map(|&x| x as f64).sum();
+        let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
+        let ratio = sum_out / sum_in;
+
+        assert!(
+            (ratio - expected_ratio).abs() / expected_ratio < 0.02,
+            "channel {c}: sum ratio {ratio:.6} vs expected {expected_ratio:.6} (2% tol)",
+        );
+    }
+}
+
+/// Compare our per-channel UV convolution against MIRIAD `convol options=cube`.
+///
+/// Mirrors the Python `test_robust_3d` in RACS-tools/tests/test_3d.py:
+///   - 4D CASAMBM cube, all channels BMAJ=50", BMIN=10", BPA=0°, pix=2.5"/pix
+///   - Target beam: BMAJ=60", BMIN=60", BPA=0°
+///   - MIRIAD: `convol options=cube` (per-channel beam from BEAMS table)
+///   - Rust: channel-by-channel `smooth` from old_beam → target_beam
+///   - Pixel-by-pixel comparison at atol = 1e-3
+#[test]
+fn test_cube_smoothed_matches_miriad_3d() {
+    if !miriad_available() {
+        eprintln!("MIRIAD not found on PATH or MIRIAD_BIN, skipping test_cube_smoothed_matches_miriad_3d");
+        return;
+    }
+
+    let tmpdir = test_tmpdir("cube_miriad3d");
+    let input_fits  = tmpdir.join("cube_input.fits");
+    let miriad_fits = tmpdir.join("cube_miriad.fits");
+
+    let old    = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
+    let target = Beam::from_arcsec(CUBE_TARGET_BMAJ, CUBE_TARGET_BMIN, CUBE_TARGET_BPA).unwrap();
+    let pix_deg = PIX_ARCSEC / 3600.0;
+
+    let bmaj_pix = CUBE_OLD_BMAJ / PIX_ARCSEC;
+    let bmin_pix = CUBE_OLD_BMIN / PIX_ARCSEC;
+    let image = make_gaussian_image(CUBE_NY, CUBE_NX, bmaj_pix, bmin_pix, CUBE_OLD_BPA);
+
+    let beams: Vec<Beam> = vec![old; CUBE_NCHAN];
+    let channels: Vec<Array2<f32>> = vec![image.clone(); CUBE_NCHAN];
+
+    write_test_cube_casambm(&input_fits, &channels, &beams, PIX_ARCSEC)
+        .expect("write_test_cube_casambm failed");
+
+    miriad_smooth_cube(&input_fits, &miriad_fits, &target)
+        .expect("MIRIAD cube smooth failed");
+
+    // Read the MIRIAD output pixels directly (may not have CASAMBM).
+    let mir_flat = read_cube_flat(&miriad_fits, CUBE_NCHAN, CUBE_NY, CUBE_NX);
+
+    let atol = 1e-3_f32;
+    for c in 0..CUBE_NCHAN {
+        let rust_plane = smooth(&image, &old, &target, pix_deg, pix_deg, None)
+            .expect("smooth failed");
+        let rust_flat: Vec<f32> = rust_plane.into_raw_vec_and_offset().0;
+
+        let plane_start = c * CUBE_NY * CUBE_NX;
+        let mir_plane = &mir_flat[plane_start..plane_start + CUBE_NY * CUBE_NX];
+
+        let mismatches: Vec<(usize, f32, f32)> = mir_plane.iter()
+            .zip(rust_flat.iter())
+            .enumerate()
+            .filter(|&(_, (m, r))| (m - r).abs() > atol)
+            .map(|(i, (m, r))| (i, *m, *r))
+            .collect();
+
+        if !mismatches.is_empty() {
+            let n = mismatches.len();
+            let (idx0, m0, r0) = mismatches[0];
+            panic!(
+                "channel {c}: {n} pixel(s) differ by > {atol}: \
+                 first at local index {idx0}: MIRIAD={m0:.6e} Rust={r0:.6e} diff={:.6e}",
+                (m0 - r0).abs(),
+            );
+        }
+    }
+
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
