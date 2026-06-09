@@ -3,6 +3,7 @@ pub mod common_beam;
 pub mod convolve_uv;
 pub mod smooth;
 pub mod fits_io;
+pub mod cube_io;
 
 pub use beam::{Beam, BeamError, gauss_factor};
 pub use common_beam::{common_beam, find_commonbeam_between, CommonBeamError};

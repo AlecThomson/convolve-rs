@@ -8,7 +8,7 @@ name = "convolve_rs"
 path = "src/lib.rs"
 
 [[bin]]
-name = "beamcon_2d"
+name = "convolvers"
 path = "src/main.rs"
 
 [dependencies]
