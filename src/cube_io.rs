@@ -201,7 +201,7 @@ pub fn read_channel(path: &Path, chan: usize, meta: &CubeMeta) -> Result<Array2<
 
     let plane = meta.ny * meta.nx;
     let start = chan * plane;
-    let end   = start + plane - 1;
+    let end   = start + plane;
 
     let data: Vec<f32> = hdu.read_section(&mut fptr, start, end)?;
     Ok(Array2::from_shape_vec((meta.ny, meta.nx), data)?)
@@ -217,7 +217,7 @@ pub fn write_channel(path: &Path, chan: usize, data: &Array2<f32>, meta: &CubeMe
 
     let plane = meta.ny * meta.nx;
     let start = chan * plane;
-    let end   = start + plane - 1;
+    let end   = start + plane;
 
     let flat: Vec<f32> = data.iter().copied().collect();
     hdu.write_section(&mut fptr, start, end, &flat)?;
