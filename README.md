@@ -89,9 +89,9 @@ uvx prek run --all-files   # run all hooks manually
 
 convolve-rs is released under the [BSD 3-Clause License](LICENSE).
 
-It draws on prior work in the radio-astronomy community: the UV-plane convolution
-and cube handling are ported from [RACS-tools](https://github.com/alecthomson/RACS-tools)
-(BSD), and the common-beam computation follows [radio_beam](https://github.com/radio-astro-tools/radio-beam)
-(BSD). The Gaussian beam algebra is an independent implementation of standard
-formulae (Wild 1970) — [MIRIAD](https://github.com/csiro/miriad) is used only as a validation reference in the test suite. See
-[NOTICE.md](NOTICE.md) for full attributions.
+It builds on prior work in the radio-astronomy community: the UV-plane convolution
+and cube handling are ported from [RACS-tools](https://github.com/alecthomson/RACS-tools),
+and the common-beam computation follows [radio_beam](https://github.com/radio-astro-tools/radio-beam)
+(both BSD). The Gaussian beam algebra implements the standard formulae of Wild
+(1970), and [MIRIAD](https://github.com/csiro/miriad) (GPL) serves as a validation
+reference in the test suite. See [NOTICE.md](NOTICE.md) for full attributions.

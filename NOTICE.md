@@ -56,7 +56,7 @@ MIRIAD is distributed under the **GNU General Public License**:
 The Gaussian beam algebra in `src/beam.rs` (convolution, deconvolution, and the
 Jy/beam flux-scaling factor) is an **independent implementation** of the standard
 second-moment / covariance formulation of an elliptical Gaussian (see Wild 1970,
-*Aust. J. Phys.* 23, 113). It expresses each beam as a 2×2 covariance matrix and
+*Aust. J. Phys.* 23, 113, https://ui.adsabs.harvard.edu/abs/1970AuJPh..23..113W). It expresses each beam as a 2×2 covariance matrix and
 combines beams by matrix addition/subtraction and eigendecomposition. These are
 textbook results, used identically across the field (including by `radio_beam`
 and RACS-tools, both BSD-licensed). **No MIRIAD source code is copied, ported, or
