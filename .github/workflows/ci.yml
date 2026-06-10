@@ -34,6 +34,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v7
 
+      # ty type-checks against installed deps (numpy, astropy, ...), so build
+      # the extension and populate .venv first; ty auto-discovers ./.venv.
+      - name: Build extension and install deps
+        run: uv sync --extra test --extra dev
+
       # Single source of truth: the same hooks developers run locally
       # (.pre-commit-config.yaml) — ruff, ty, cargo fmt, clippy. prek exits
       # nonzero if any autofix hook had to change a file, so this fails CI
