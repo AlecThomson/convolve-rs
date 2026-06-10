@@ -243,3 +243,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Benchmark notebook outputs (scripts/benchmark.ipynb)
+scripts/bench_out/
+bench_out/

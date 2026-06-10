@@ -15,6 +15,14 @@ readme = "README.md"
 
 [project.optional-dependencies]
 test = ["pytest", "radio-beam", "astropy"]
+benchmark = [
+    "astropy>=6.1.7",
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.10.9",
+    "nbconvert>=7.17.1",
+    "nbformat>=5.10.4",
+    "pandas>=2.3.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
