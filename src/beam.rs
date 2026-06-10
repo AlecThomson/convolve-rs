@@ -34,24 +34,45 @@ impl Beam {
             return Err(BeamError::NotFinite);
         }
         if minor_deg > major_deg {
-            return Err(BeamError::InvalidAxes { major: major_deg, minor: minor_deg });
+            return Err(BeamError::InvalidAxes {
+                major: major_deg,
+                minor: minor_deg,
+            });
         }
-        Ok(Self { major_deg, minor_deg, pa_deg })
+        Ok(Self {
+            major_deg,
+            minor_deg,
+            pa_deg,
+        })
     }
 
-    pub fn from_arcsec(major_arcsec: f64, minor_arcsec: f64, pa_deg: f64) -> Result<Self, BeamError> {
+    pub fn from_arcsec(
+        major_arcsec: f64,
+        minor_arcsec: f64,
+        pa_deg: f64,
+    ) -> Result<Self, BeamError> {
         Self::new(major_arcsec / 3600.0, minor_arcsec / 3600.0, pa_deg)
     }
 
     pub fn zero() -> Self {
-        Self { major_deg: 0.0, minor_deg: 0.0, pa_deg: 0.0 }
+        Self {
+            major_deg: 0.0,
+            minor_deg: 0.0,
+            pa_deg: 0.0,
+        }
     }
 
-    pub fn major_arcsec(&self) -> f64 { self.major_deg * 3600.0 }
-    pub fn minor_arcsec(&self) -> f64 { self.minor_deg * 3600.0 }
+    pub fn major_arcsec(&self) -> f64 {
+        self.major_deg * 3600.0
+    }
+    pub fn minor_arcsec(&self) -> f64 {
+        self.minor_deg * 3600.0
+    }
 
     pub fn is_finite(&self) -> bool {
-        self.major_deg.is_finite() && self.minor_deg.is_finite() && self.pa_deg.is_finite()
+        self.major_deg.is_finite()
+            && self.minor_deg.is_finite()
+            && self.pa_deg.is_finite()
             && self.major_deg > 0.0
     }
 
@@ -60,7 +81,9 @@ impl Beam {
     }
 
     pub fn is_circular(&self, rtol: f64) -> bool {
-        if self.major_deg == 0.0 { return true; }
+        if self.major_deg == 0.0 {
+            return true;
+        }
         (self.major_deg - self.minor_deg) / self.major_deg <= rtol
     }
 
@@ -74,11 +97,21 @@ impl Beam {
     /// Implements MIRIAD gaupar.for GauDfac by R. Sault.
     /// Inputs/outputs in degrees. PA returned in radians, then converted.
     pub fn deconvolve(&self, other: &Beam) -> Result<Beam, BeamError> {
-        let (new_major, new_minor, new_pa_rad) =
-            deconvolve_deg(self.major_deg, self.minor_deg, self.pa_deg,
-                           other.major_deg, other.minor_deg, other.pa_deg, false)?;
+        let (new_major, new_minor, new_pa_rad) = deconvolve_deg(
+            self.major_deg,
+            self.minor_deg,
+            self.pa_deg,
+            other.major_deg,
+            other.minor_deg,
+            other.pa_deg,
+            false,
+        )?;
         let pa_deg = new_pa_rad.to_degrees();
-        Ok(Beam { major_deg: new_major, minor_deg: new_minor, pa_deg })
+        Ok(Beam {
+            major_deg: new_major,
+            minor_deg: new_minor,
+            pa_deg,
+        })
     }
 
     /// Like `deconvolve` but returns a zero beam on failure instead of an error.
@@ -104,8 +137,9 @@ impl Beam {
             + (other.major_deg * pa2.sin()).powi(2)
             + (other.minor_deg * pa2.cos()).powi(2);
 
-        let gamma = 2.0 * ((self.minor_deg.powi(2) - self.major_deg.powi(2)) * pa1.sin() * pa1.cos()
-            + (other.minor_deg.powi(2) - other.major_deg.powi(2)) * pa2.sin() * pa2.cos());
+        let gamma = 2.0
+            * ((self.minor_deg.powi(2) - self.major_deg.powi(2)) * pa1.sin() * pa1.cos()
+                + (other.minor_deg.powi(2) - other.major_deg.powi(2)) * pa2.sin() * pa2.cos());
 
         let s = alpha + beta;
         let t = ((alpha - beta).powi(2) + gamma.powi(2)).sqrt();
@@ -155,28 +189,37 @@ impl fmt::Display for Beam {
 }
 
 impl PartialEq for Beam {
-    fn eq(&self, other: &Self) -> bool { self.approx_eq(other) }
+    fn eq(&self, other: &Self) -> bool {
+        self.approx_eq(other)
+    }
 }
 
 /// MIRIAD GauDfac: deconvolve beam2 from beam1 (all params in degrees, PA returns radians).
 ///
 /// Returns `(new_major_deg, new_minor_deg, new_pa_rad)`.
 pub(crate) fn deconvolve_deg(
-    maj1: f64, min1: f64, pa1_deg: f64,
-    maj2: f64, min2: f64, pa2_deg: f64,
+    maj1: f64,
+    min1: f64,
+    pa1_deg: f64,
+    maj2: f64,
+    min2: f64,
+    pa2_deg: f64,
     failure_returns_zero: bool,
 ) -> Result<(f64, f64, f64), BeamError> {
     let pa1 = pa1_deg * DEG2RAD;
     let pa2 = pa2_deg * DEG2RAD;
 
     let alpha = (maj1 * pa1.cos()).powi(2) + (min1 * pa1.sin()).powi(2)
-        - (maj2 * pa2.cos()).powi(2) - (min2 * pa2.sin()).powi(2);
+        - (maj2 * pa2.cos()).powi(2)
+        - (min2 * pa2.sin()).powi(2);
 
     let beta = (maj1 * pa1.sin()).powi(2) + (min1 * pa1.cos()).powi(2)
-        - (maj2 * pa2.sin()).powi(2) - (min2 * pa2.cos()).powi(2);
+        - (maj2 * pa2.sin()).powi(2)
+        - (min2 * pa2.cos()).powi(2);
 
-    let gamma = 2.0 * ((min1.powi(2) - maj1.powi(2)) * pa1.sin() * pa1.cos()
-        - (min2.powi(2) - maj2.powi(2)) * pa2.sin() * pa2.cos());
+    let gamma = 2.0
+        * ((min1.powi(2) - maj1.powi(2)) * pa1.sin() * pa1.cos()
+            - (min2.powi(2) - maj2.powi(2)) * pa2.sin() * pa2.cos());
 
     let s = alpha + beta;
     let t = ((alpha - beta).powi(2) + gamma.powi(2)).sqrt();
@@ -231,14 +274,19 @@ pub fn gauss_factor(
     let cospa2 = bpa2.cos();
     let sinpa2 = bpa2.sin();
 
-    let alpha = (bmaj1 * cospa1).powi(2) + (bmin1 * sinpa1).powi(2)
-        + (bmaj2 * cospa2).powi(2) + (bmin2 * sinpa2).powi(2);
+    let alpha = (bmaj1 * cospa1).powi(2)
+        + (bmin1 * sinpa1).powi(2)
+        + (bmaj2 * cospa2).powi(2)
+        + (bmin2 * sinpa2).powi(2);
 
-    let beta = (bmaj1 * sinpa1).powi(2) + (bmin1 * cospa1).powi(2)
-        + (bmaj2 * sinpa2).powi(2) + (bmin2 * cospa2).powi(2);
+    let beta = (bmaj1 * sinpa1).powi(2)
+        + (bmin1 * cospa1).powi(2)
+        + (bmaj2 * sinpa2).powi(2)
+        + (bmin2 * cospa2).powi(2);
 
-    let gamma = 2.0 * ((bmin1.powi(2) - bmaj1.powi(2)) * sinpa1 * cospa1
-        + (bmin2.powi(2) - bmaj2.powi(2)) * sinpa2 * cospa2);
+    let gamma = 2.0
+        * ((bmin1.powi(2) - bmaj1.powi(2)) * sinpa1 * cospa1
+            + (bmin2.powi(2) - bmaj2.powi(2)) * sinpa2 * cospa2);
 
     let s = alpha + beta;
     let t = ((alpha - beta).powi(2) + gamma.powi(2)).sqrt();
@@ -270,10 +318,18 @@ mod tests {
         let beam_b = Beam::new(6.0 / 3600.0, 5.0 / 3600.0, 15.0).unwrap();
         let convolved = beam_a.convolve(&beam_b);
         let recovered = convolved.deconvolve(&beam_a).unwrap();
-        assert!((recovered.major_deg - beam_b.major_deg).abs() < 1e-9,
-            "major mismatch: {} vs {}", recovered.major_deg, beam_b.major_deg);
-        assert!((recovered.minor_deg - beam_b.minor_deg).abs() < 1e-9,
-            "minor mismatch: {} vs {}", recovered.minor_deg, beam_b.minor_deg);
+        assert!(
+            (recovered.major_deg - beam_b.major_deg).abs() < 1e-9,
+            "major mismatch: {} vs {}",
+            recovered.major_deg,
+            beam_b.major_deg
+        );
+        assert!(
+            (recovered.minor_deg - beam_b.minor_deg).abs() < 1e-9,
+            "minor mismatch: {} vs {}",
+            recovered.minor_deg,
+            beam_b.minor_deg
+        );
     }
 
     #[test]

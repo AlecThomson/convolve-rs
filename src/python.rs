@@ -4,9 +4,9 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods, gen_stub_pyfunction};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
-use crate::beam::{gauss_factor as rust_gauss_factor, Beam};
+use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
 use crate::smooth::smooth as rust_smooth;
 
@@ -138,7 +138,9 @@ impl PyBeam {
     /// Returns:
     ///     Beam: The convolved beam.
     fn convolve(&self, other: &PyBeam) -> PyBeam {
-        Self { inner: self.inner.convolve(&other.inner) }
+        Self {
+            inner: self.inner.convolve(&other.inner),
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -227,9 +229,16 @@ fn smooth<'py>(
     cutoff_arcsec: Option<f64>,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let owned = image.as_array().to_owned();
-    rust_smooth(&owned, &old_beam.inner, &new_beam.inner, dx_deg, dy_deg, cutoff_arcsec)
-        .map(|arr| arr.into_pyarray(py))
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+    rust_smooth(
+        &owned,
+        &old_beam.inner,
+        &new_beam.inner,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+    )
+    .map(|arr| arr.into_pyarray(py))
+    .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Compute the MIRIAD ``gaufac`` flux-scaling factor for a Jy/beam convolution.

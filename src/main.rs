@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
@@ -10,7 +10,7 @@ use tracing::{info, warn};
 use convolve_rs::{
     beam::Beam,
     common_beam::{common_beam, fits_in_beam},
-    cube_io::{self, CubeMode, CubeMeta},
+    cube_io::{self, CubeMeta, CubeMode},
     fits_io::{output_path, read_fits, write_fits},
     smooth::smooth,
 };
@@ -18,7 +18,10 @@ use convolve_rs::{
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "convolvers", about = "Convolve FITS images/cubes to a common beam")]
+#[command(
+    name = "convolvers",
+    about = "Convolve FITS images/cubes to a common beam"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -139,8 +142,12 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             let data = read_fits(f).with_context(|| format!("reading {}", f.display()))?;
             if let Some(cutoff) = args.shared.cutoff {
                 if data.beam.major_arcsec() > cutoff {
-                    warn!("{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
-                          f.display(), data.beam.major_arcsec(), cutoff);
+                    warn!(
+                        "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
+                        f.display(),
+                        data.beam.major_arcsec(),
+                        cutoff
+                    );
                 }
             }
             Ok(data.beam)
@@ -155,14 +162,23 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             b
         }
         None => {
-            let valid: Vec<Beam> = all_beams.iter()
-                .filter(|b| b.is_finite() && !b.is_zero()
-                    && args.shared.cutoff.is_none_or(|c| b.major_arcsec() <= c))
+            let valid: Vec<Beam> = all_beams
+                .iter()
+                .filter(|b| {
+                    b.is_finite()
+                        && !b.is_zero()
+                        && args.shared.cutoff.is_none_or(|c| b.major_arcsec() <= c)
+                })
                 .cloned()
                 .collect();
             anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
-            common_beam(&valid, args.shared.tolerance, args.shared.nsamps, args.shared.epsilon)
-                .context("could not find common beam")?
+            common_beam(
+                &valid,
+                args.shared.tolerance,
+                args.shared.nsamps,
+                args.shared.epsilon,
+            )
+            .context("could not find common beam")?
         }
     };
 
@@ -183,16 +199,32 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         .zip(all_beams.par_iter())
         .map(|(file, old_beam)| {
             let data = read_fits(file).with_context(|| format!("reading {}", file.display()))?;
-            let out = output_path(file, Some(&args.shared.suffix),
-                                  args.shared.prefix.as_deref(), args.shared.outdir.as_deref());
+            let out = output_path(
+                file,
+                Some(&args.shared.suffix),
+                args.shared.prefix.as_deref(),
+                args.shared.outdir.as_deref(),
+            );
             let conv_beam = common.deconvolve_or_zero(old_beam);
-            let smoothed = smooth(&data.image, old_beam, &common, data.dx_deg, data.dy_deg, args.shared.cutoff)
-                .with_context(|| format!("smoothing {}", file.display()))?;
+            let smoothed = smooth(
+                &data.image,
+                old_beam,
+                &common,
+                data.dx_deg,
+                data.dy_deg,
+                args.shared.cutoff,
+            )
+            .with_context(|| format!("smoothing {}", file.display()))?;
             write_fits(&smoothed, &out, file, &common, data.is_4d)
                 .with_context(|| format!("writing {}", out.display()))?;
             info!("{} → {}", file.display(), out.display());
             pb.inc(1);
-            Ok(BeamLogEntry2D { filename: out, old_beam: *old_beam, new_beam: common, conv_beam })
+            Ok(BeamLogEntry2D {
+                filename: out,
+                old_beam: *old_beam,
+                new_beam: common,
+                conv_beam,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -200,14 +232,23 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
 
     if let Some(log_path) = &args.log {
         use std::fmt::Write as _;
-        let mut out = String::from("# FileName OldBMAJ[deg] OldBMIN[deg] OldBPA[deg] TargetBMAJ[deg] TargetBMIN[deg] TargetBPA[deg] ConvBMAJ[deg] ConvBMIN[deg] ConvBPA[deg]\n");
+        let mut out = String::from(
+            "# FileName OldBMAJ[deg] OldBMIN[deg] OldBPA[deg] TargetBMAJ[deg] TargetBMIN[deg] TargetBPA[deg] ConvBMAJ[deg] ConvBMIN[deg] ConvBPA[deg]\n",
+        );
         for e in &results {
-            writeln!(out,
+            writeln!(
+                out,
                 "{} {} {} {} {} {} {} {} {} {}",
                 e.filename.display(),
-                e.old_beam.major_deg, e.old_beam.minor_deg, e.old_beam.pa_deg,
-                e.new_beam.major_deg, e.new_beam.minor_deg, e.new_beam.pa_deg,
-                e.conv_beam.major_deg, e.conv_beam.minor_deg, e.conv_beam.pa_deg,
+                e.old_beam.major_deg,
+                e.old_beam.minor_deg,
+                e.old_beam.pa_deg,
+                e.new_beam.major_deg,
+                e.new_beam.minor_deg,
+                e.new_beam.pa_deg,
+                e.conv_beam.major_deg,
+                e.conv_beam.minor_deg,
+                e.conv_beam.pa_deg,
             )?;
         }
         std::fs::write(log_path, out)?;
@@ -251,24 +292,37 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     let files = collect_files(&args.infile, args.listfile)?;
 
     info!("Reading cube metadata from {} file(s)", files.len());
-    let metas: Vec<CubeMeta> = files.iter()
-        .map(|f| cube_io::read_cube_meta(f)
-            .with_context(|| format!("reading metadata from {}", f.display())))
+    let metas: Vec<CubeMeta> = files
+        .iter()
+        .map(|f| {
+            cube_io::read_cube_meta(f)
+                .with_context(|| format!("reading metadata from {}", f.display()))
+        })
         .collect::<Result<_>>()?;
 
     let nfreq = metas[0].nfreq;
     for (f, m) in files.iter().zip(metas.iter()) {
-        anyhow::ensure!(m.nfreq == nfreq,
-            "{}: expected {} channels, got {}", f.display(), nfreq, m.nfreq);
+        anyhow::ensure!(
+            m.nfreq == nfreq,
+            "{}: expected {} channels, got {}",
+            f.display(),
+            nfreq,
+            m.nfreq
+        );
         if m.nstokes > 1 {
-            warn!("{}: NAXIS4={} — only Stokes 0 will be convolved", f.display(), m.nstokes);
+            warn!(
+                "{}: NAXIS4={} — only Stokes 0 will be convolved",
+                f.display(),
+                m.nstokes
+            );
         }
     }
 
     let target_beam = parse_target_beam(&args.shared)?;
 
     let target_beams: Vec<Option<Beam>> = if let Some(b) = target_beam {
-        let all_valid: Vec<Beam> = metas.iter()
+        let all_valid: Vec<Beam> = metas
+            .iter()
             .flat_map(|m| m.beams.iter())
             .filter_map(|b| *b)
             .filter(|b| b.is_finite() && !b.is_zero())
@@ -282,8 +336,15 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             ModeArg::Natural => CubeMode::Natural,
             ModeArg::Total => CubeMode::Total,
         };
-        compute_target_beams(&metas, mode, args.shared.cutoff, args.shared.circularise,
-                             args.shared.tolerance, args.shared.nsamps, args.shared.epsilon)?
+        compute_target_beams(
+            &metas,
+            mode,
+            args.shared.cutoff,
+            args.shared.circularise,
+            args.shared.tolerance,
+            args.shared.nsamps,
+            args.shared.epsilon,
+        )?
     };
 
     if let Some(b) = target_beams.iter().find_map(|b| *b) {
@@ -303,8 +364,12 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     let pb = progress_bar((files.len() * nfreq) as u64);
 
     for (file, meta) in files.iter().zip(metas.iter()) {
-        let out = output_path(file, Some(&args.shared.suffix),
-                              args.shared.prefix.as_deref(), args.shared.outdir.as_deref());
+        let out = output_path(
+            file,
+            Some(&args.shared.suffix),
+            args.shared.prefix.as_deref(),
+            args.shared.outdir.as_deref(),
+        );
 
         cube_io::init_output_cube(file, &out, &target_beams, cube_mode, meta)
             .with_context(|| format!("initialising output cube {}", out.display()))?;
@@ -315,17 +380,25 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             .map(|c| -> Result<Option<Array2<f32>>> {
                 let old_beam = match meta.beams[c] {
                     Some(b) => b,
-                    None => { pb.inc(1); return Ok(None); }
+                    None => {
+                        pb.inc(1);
+                        return Ok(None);
+                    }
                 };
                 let target = match target_beams[c] {
                     Some(b) => b,
-                    None => { pb.inc(1); return Ok(None); }
+                    None => {
+                        pb.inc(1);
+                        return Ok(None);
+                    }
                 };
 
                 if let Some(cutoff) = args.shared.cutoff {
                     if old_beam.major_arcsec() > cutoff {
-                        warn!("Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                              old_beam.major_arcsec());
+                        warn!(
+                            "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
+                            old_beam.major_arcsec()
+                        );
                         pb.inc(1);
                         return Ok(Some(Array2::from_elem((meta.ny, meta.nx), f32::NAN)));
                     }
@@ -333,9 +406,15 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
 
                 let plane = cube_io::read_channel(file, c, meta)
                     .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                let smoothed = smooth(&plane, &old_beam, &target, meta.dx_deg, meta.dy_deg,
-                                      args.shared.cutoff)
-                    .with_context(|| format!("smoothing channel {c}"))?;
+                let smoothed = smooth(
+                    &plane,
+                    &old_beam,
+                    &target,
+                    meta.dx_deg,
+                    meta.dy_deg,
+                    args.shared.cutoff,
+                )
+                .with_context(|| format!("smoothing channel {c}"))?;
                 pb.inc(1);
                 Ok(Some(smoothed))
             })
@@ -374,9 +453,10 @@ fn compute_target_beams(
 ) -> Result<Vec<Option<Beam>>> {
     let nfreq = metas[0].nfreq;
     match mode {
-        CubeMode::Natural => {
-            (0..nfreq).map(|c| {
-                let valid: Vec<Beam> = metas.iter()
+        CubeMode::Natural => (0..nfreq)
+            .map(|c| {
+                let valid: Vec<Beam> = metas
+                    .iter()
                     .filter_map(|m| m.beams[c])
                     .filter(|b| b.is_finite() && !b.is_zero())
                     .filter(|b| cutoff.is_none_or(|cut| b.major_arcsec() <= cut))
@@ -387,16 +467,20 @@ fn compute_target_beams(
                 let cb = common_beam(&valid, tolerance, nsamps, epsilon)
                     .with_context(|| format!("finding common beam for channel {c}"))?;
                 Ok(Some(apply_beam_rounding(cb, circularise)?))
-            }).collect()
-        }
+            })
+            .collect(),
         CubeMode::Total => {
-            let valid: Vec<Beam> = metas.iter()
+            let valid: Vec<Beam> = metas
+                .iter()
                 .flat_map(|m| m.beams.iter())
                 .filter_map(|b| *b)
                 .filter(|b| b.is_finite() && !b.is_zero())
                 .filter(|b| cutoff.is_none_or(|cut| b.major_arcsec() <= cut))
                 .collect();
-            anyhow::ensure!(!valid.is_empty(), "no valid beams found across all cubes/channels");
+            anyhow::ensure!(
+                !valid.is_empty(),
+                "no valid beams found across all cubes/channels"
+            );
             let cb = common_beam(&valid, tolerance, nsamps, epsilon)
                 .context("finding total common beam")?;
             let cb = apply_beam_rounding(cb, circularise)?;
@@ -413,7 +497,10 @@ fn init_logging(verbose: u8) {
         1 => tracing::Level::INFO,
         _ => tracing::Level::DEBUG,
     };
-    tracing_subscriber::fmt().with_max_level(level).with_target(false).init();
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_target(false)
+        .init();
 }
 
 fn collect_files(infile: &[PathBuf], listfile: bool) -> Result<Vec<PathBuf>> {
@@ -433,9 +520,9 @@ fn collect_files(infile: &[PathBuf], listfile: bool) -> Result<Vec<PathBuf>> {
 fn parse_target_beam(args: &SharedArgs) -> Result<Option<Beam>> {
     match (args.bmaj, args.bmin, args.bpa) {
         (None, None, None) => Ok(None),
-        (Some(bmaj), Some(bmin), Some(bpa)) => {
-            Ok(Some(Beam::from_arcsec(bmaj, bmin, bpa).context("invalid target beam")?))
-        }
+        (Some(bmaj), Some(bmin), Some(bpa)) => Ok(Some(
+            Beam::from_arcsec(bmaj, bmin, bpa).context("invalid target beam")?,
+        )),
         _ => bail!("--bmaj, --bmin, and --bpa must all be specified together"),
     }
 }
@@ -445,10 +532,10 @@ fn apply_beam_rounding(b: Beam, circularise: bool) -> Result<Beam> {
         ceil_to(b.major_arcsec(), 1),
         ceil_to(b.minor_arcsec(), 1),
         round_up(b.pa_deg, 2),
-    ).context("rounding common beam")?;
+    )
+    .context("rounding common beam")?;
     if circularise {
-        Beam::from_arcsec(b.major_arcsec(), b.major_arcsec(), 0.0)
-            .context("circularising beam")
+        Beam::from_arcsec(b.major_arcsec(), b.major_arcsec(), 0.0).context("circularising beam")
     } else {
         Ok(b)
     }

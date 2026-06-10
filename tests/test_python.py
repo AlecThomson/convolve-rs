@@ -1,8 +1,8 @@
-import pytest
-import numpy as np
 import astropy.units as u
-from astropy.io import fits
+import numpy as np
+import pytest
 import radio_beam as rb
+from astropy.io import fits
 
 from convolve_rs import Beam, common_beam
 
@@ -14,6 +14,7 @@ def _rb(major_as, minor_as, pa_deg):
 
 
 # ── Beam construction ─────────────────────────────────────────────────────────
+
 
 class TestBeamConstructor:
     def test_basic(self):
@@ -82,14 +83,19 @@ class TestBeamClassmethods:
 
 # ── Beam math vs radio_beam ───────────────────────────────────────────────────
 
+
 class TestBeamMath:
     def test_convolve_matches_radio_beam(self):
         b1 = Beam.from_arcsec(10.0, 8.0, 30.0)
         b2 = Beam.from_arcsec(12.0, 6.0, 60.0)
         ours = b1.convolve(b2)
         theirs = _rb(10.0, 8.0, 30.0).convolve(_rb(12.0, 6.0, 60.0))
-        assert ours.major_arcsec == pytest.approx(theirs.major.to(u.arcsec).value, rel=1e-6)
-        assert ours.minor_arcsec == pytest.approx(theirs.minor.to(u.arcsec).value, rel=1e-6)
+        assert ours.major_arcsec == pytest.approx(
+            theirs.major.to(u.arcsec).value, rel=1e-6
+        )
+        assert ours.minor_arcsec == pytest.approx(
+            theirs.minor.to(u.arcsec).value, rel=1e-6
+        )
         assert ours.pa_deg == pytest.approx(theirs.pa.to(u.deg).value, abs=1e-6)
 
     def test_deconvolve_matches_radio_beam(self):
@@ -97,8 +103,12 @@ class TestBeamMath:
         b2 = Beam.from_arcsec(10.0, 8.0, 30.0)
         ours = b1.deconvolve(b2)
         theirs = _rb(15.0, 10.0, 45.0).deconvolve(_rb(10.0, 8.0, 30.0))
-        assert ours.major_arcsec == pytest.approx(theirs.major.to(u.arcsec).value, rel=1e-5)
-        assert ours.minor_arcsec == pytest.approx(theirs.minor.to(u.arcsec).value, rel=1e-5)
+        assert ours.major_arcsec == pytest.approx(
+            theirs.major.to(u.arcsec).value, rel=1e-5
+        )
+        assert ours.minor_arcsec == pytest.approx(
+            theirs.minor.to(u.arcsec).value, rel=1e-5
+        )
 
     def test_deconvolve_fails_when_psf_larger(self):
         small = Beam.from_arcsec(5.0, 5.0, 0.0)
@@ -116,11 +126,12 @@ class TestBeamMath:
     def test_area_sr(self):
         b = Beam.from_arcsec(10.0, 10.0, 0.0)
         fwhm_rad = (10.0 * ARCSEC) * np.pi / 180.0
-        expected = np.pi / (4 * np.log(2)) * fwhm_rad ** 2
+        expected = np.pi / (4 * np.log(2)) * fwhm_rad**2
         assert b.area_sr() == pytest.approx(expected, rel=1e-10)
 
 
 # ── common_beam vs radio_beam ─────────────────────────────────────────────────
+
 
 class TestCommonBeam:
     def test_two_beams_matches_radio_beam(self):
@@ -128,11 +139,20 @@ class TestCommonBeam:
         beams = [Beam.from_arcsec(*p) for p in params]
         theirs = _rb(*params[0]).commonbeam_with(_rb(*params[1]))
         ours = common_beam(beams)
-        assert ours.major_arcsec == pytest.approx(theirs.major.to(u.arcsec).value, rel=1e-4)
-        assert ours.minor_arcsec == pytest.approx(theirs.minor.to(u.arcsec).value, rel=1e-4)
+        assert ours.major_arcsec == pytest.approx(
+            theirs.major.to(u.arcsec).value, rel=1e-4
+        )
+        assert ours.minor_arcsec == pytest.approx(
+            theirs.minor.to(u.arcsec).value, rel=1e-4
+        )
 
     def test_many_beams_matches_radio_beam(self):
-        params = [(10.0, 8.0, 30.0), (12.0, 6.0, 60.0), (11.0, 9.0, 45.0), (9.0, 7.0, 15.0)]
+        params = [
+            (10.0, 8.0, 30.0),
+            (12.0, 6.0, 60.0),
+            (11.0, 9.0, 45.0),
+            (9.0, 7.0, 15.0),
+        ]
         beams = [Beam.from_arcsec(*p) for p in params]
         rb_beams = rb.Beams(
             major=[p[0] for p in params] * u.arcsec,
@@ -141,8 +161,12 @@ class TestCommonBeam:
         )
         ours = common_beam(beams)
         theirs = rb_beams.common_beam()
-        assert ours.major_arcsec == pytest.approx(theirs.major.to(u.arcsec).value, rel=1e-3)
-        assert ours.minor_arcsec == pytest.approx(theirs.minor.to(u.arcsec).value, rel=1e-3)
+        assert ours.major_arcsec == pytest.approx(
+            theirs.major.to(u.arcsec).value, rel=1e-3
+        )
+        assert ours.minor_arcsec == pytest.approx(
+            theirs.minor.to(u.arcsec).value, rel=1e-3
+        )
 
     def test_identical_beams(self):
         b = Beam.from_arcsec(10.0, 8.0, 30.0)

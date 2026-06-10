@@ -4,7 +4,7 @@
 /// - `find_commonbeam_between`: analytic CASA algorithm for exactly 2 beams.
 /// - `common_manybeams_mve`: Khachiyan minimum-volume-enclosing-ellipsoid for N beams.
 /// - `common_beam`: dispatcher that picks the appropriate algorithm.
-use crate::beam::{deconvolve_deg, Beam, BeamError};
+use crate::beam::{Beam, BeamError, deconvolve_deg};
 use thiserror::Error;
 
 const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
@@ -102,7 +102,11 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
         } else {
             (small_major, large_major)
         };
-        let pa = if large_major >= small_major { large_beam.pa_deg } else { small_beam.pa_deg };
+        let pa = if large_major >= small_major {
+            large_beam.pa_deg
+        } else {
+            small_beam.pa_deg
+        };
         return Beam::from_arcsec(major, minor, pa).map_err(Into::into);
     }
 
@@ -111,9 +115,8 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
     let p = major_comb / large_major;
     let q = major_comb / large_minor;
 
-    let (trans_maj_sc, _trans_min_sc, trans_pa_sc) = transform_ellipse_arcsec(
-        small_major, small_beam.minor_arcsec(), pa_diff_rad, p, q,
-    );
+    let (trans_maj_sc, _trans_min_sc, trans_pa_sc) =
+        transform_ellipse_arcsec(small_major, small_beam.minor_arcsec(), pa_diff_rad, p, q);
 
     // Override the minor axis per the CASA algorithm.
     let trans_min_sc = major_comb;
@@ -125,11 +128,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
     let final_pa_deg = trans_pa_unsc.to_degrees() + large_beam.pa_deg;
 
     let eps = 100.0 * f64::EPSILON;
-    let beam = Beam::from_arcsec(
-        trans_maj_unsc + eps,
-        trans_min_unsc + eps,
-        final_pa_deg,
-    )?;
+    let beam = Beam::from_arcsec(trans_maj_unsc + eps, trans_min_unsc + eps, final_pa_deg)?;
 
     Ok(beam)
 }
@@ -208,7 +207,11 @@ pub fn common_manybeams_mve(
         // Rotation matrix convention from radio_beam:
         // ((sin θ, cos θ), (cos θ, -sin θ))
         let pa = (-rotation[0][0]).atan2(rotation[1][0]);
-        let pa = if pa == -std::f64::consts::PI || pa == std::f64::consts::PI { 0.0 } else { pa };
+        let pa = if pa == -std::f64::consts::PI || pa == std::f64::consts::PI {
+            0.0
+        } else {
+            pa
+        };
 
         let r0 = radii[0];
         let r1 = radii[1];
@@ -221,9 +224,9 @@ pub fn common_manybeams_mve(
         }
 
         if step == max_iter {
-            return Err(CommonBeamError::DeconvFailed(
-                format!("epsilon reached {eps:.2e} without finding valid solution"),
-            ));
+            return Err(CommonBeamError::DeconvFailed(format!(
+                "epsilon reached {eps:.2e} without finding valid solution"
+            )));
         }
 
         eps += (step as f64 + 1.0) * (max_epsilon - eps) / max_iter as f64;
@@ -271,11 +274,7 @@ fn convex_hull_2d(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
 
     let pivot_pt = pts[pivot];
 
-    let mut sorted: Vec<[f64; 2]> = pts
-        .iter()
-        .filter(|&&p| p != pivot_pt)
-        .cloned()
-        .collect();
+    let mut sorted: Vec<[f64; 2]> = pts.iter().filter(|&&p| p != pivot_pt).cloned().collect();
 
     sorted.sort_by(|a, b| {
         let angle_a = (a[1] - pivot_pt[1]).atan2(a[0] - pivot_pt[0]);
@@ -333,12 +332,22 @@ fn min_vol_ellipse(
         // M[i] = q[i].T * V_inv * q[i]
         let m: Vec<f64> = q.iter().map(|qi| quadratic_form_3(qi, &v_inv)).collect();
 
-        let j = m.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i).unwrap();
+        let j = m
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
         let maximum = m[j];
 
         let step = (maximum - d as f64 - 1.0) / ((d as f64 + 1.0) * (maximum - 1.0));
         let new_u: Vec<f64> = u.iter().map(|&ui| (1.0 - step) * ui).collect();
-        err = new_u.iter().zip(u.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt();
+        err = new_u
+            .iter()
+            .zip(u.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            .sqrt();
         u = new_u;
         u[j] += step;
 
@@ -350,14 +359,22 @@ fn min_vol_ellipse(
 
     // Center of ellipse
     let center = [
-        pts.iter().zip(u.iter()).map(|(p, &ui)| p[0] * ui).sum::<f64>(),
-        pts.iter().zip(u.iter()).map(|(p, &ui)| p[1] * ui).sum::<f64>(),
+        pts.iter()
+            .zip(u.iter())
+            .map(|(p, &ui)| p[0] * ui)
+            .sum::<f64>(),
+        pts.iter()
+            .zip(u.iter())
+            .map(|(p, &ui)| p[1] * ui)
+            .sum::<f64>(),
     ];
 
     // A = inv(P.T * diag(u) * P - center*center.T) / d  (2x2)
     let ptdp = matmul_pt_diag_p(pts, &u); // 2x2
-    let cc = [[center[0] * center[0], center[0] * center[1]],
-              [center[1] * center[0], center[1] * center[1]]];
+    let cc = [
+        [center[0] * center[0], center[0] * center[1]],
+        [center[1] * center[0], center[1] * center[1]],
+    ];
     let inner = [
         [ptdp[0][0] - cc[0][0], ptdp[0][1] - cc[0][1]],
         [ptdp[1][0] - cc[1][0], ptdp[1][1] - cc[1][1]],
@@ -498,7 +515,9 @@ fn symmetric_2x2_eig(m: [[f64; 2]; 2]) -> ([f64; 2], [[f64; 2]; 2]) {
 
 fn normalise(v: [f64; 2]) -> [f64; 2] {
     let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
-    if len < f64::EPSILON { return v; }
+    if len < f64::EPSILON {
+        return v;
+    }
     [v[0] / len, v[1] / len]
 }
 
@@ -515,10 +534,16 @@ pub fn largest_beam(beams: &[Beam]) -> Beam {
 /// True if all beams can be deconvolved from `large_beam`.
 pub fn fits_in_beam(beams: &[Beam], large_beam: &Beam) -> bool {
     beams.iter().all(|b| {
-        if b.approx_eq(large_beam) { return true; }
+        if b.approx_eq(large_beam) {
+            return true;
+        }
         let result = deconvolve_deg(
-            large_beam.major_deg, large_beam.minor_deg, large_beam.pa_deg,
-            b.major_deg, b.minor_deg, b.pa_deg,
+            large_beam.major_deg,
+            large_beam.minor_deg,
+            large_beam.pa_deg,
+            b.major_deg,
+            b.minor_deg,
+            b.pa_deg,
             true,
         );
         match result {
@@ -544,6 +569,8 @@ mod tests {
         let b1 = Beam::new(10.0 / 3600.0, 8.0 / 3600.0, 30.0).unwrap();
         let b2 = Beam::new(12.0 / 3600.0, 6.0 / 3600.0, 60.0).unwrap();
         let result = common_beam(&[b1, b2], 1e-4, 200, 5e-4).unwrap();
-        assert!(result.major_deg >= b1.major_deg.max(b2.major_deg) || fits_in_beam(&[b1, b2], &result));
+        assert!(
+            result.major_deg >= b1.major_deg.max(b2.major_deg) || fits_in_beam(&[b1, b2], &result)
+        );
     }
 }

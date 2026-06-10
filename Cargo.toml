@@ -19,7 +19,9 @@ python = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen"]
 pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 numpy = { version = "0.26", optional = true }
 pyo3-stub-gen = { version = "0.22.3", optional = true }
-fitsio = "0.21"
+# `fitsio-src` builds cfitsio from source (needs only a C compiler), so no
+# system cfitsio is required in CI or when building wheels.
+fitsio = { version = "0.21", features = ["fitsio-src"] }
 ndarray = "0.16"
 rustfft = "6"
 rayon = "1"

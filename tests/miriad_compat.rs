@@ -1,3 +1,4 @@
+use convolve_rs::cube_io;
 /// Integration tests for convolve-rs, validating against MIRIAD.
 ///
 /// The MIRIAD test (`test_smooth_matches_miriad`) mirrors the Python `test_2d.py`
@@ -6,9 +7,7 @@
 ///
 /// All other tests are pure-Rust algebraic invariant checks that do not require
 /// any external binaries.
-
-use convolve_rs::{Beam, common_beam, gaussft, fftfreq, smooth};
-use convolve_rs::cube_io;
+use convolve_rs::{Beam, common_beam, fftfreq, gaussft, smooth};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 use fitsio::tables::{ColumnDataType, ColumnDescription};
@@ -59,9 +58,13 @@ const NCOL: usize = 100;
 ///
 /// This matches the convention used by MIRIAD and astropy's Gaussian2DKernel
 /// via `theta = (90 − PA)°`.
-fn make_gaussian_image(nrow: usize, ncol: usize,
-    bmaj_pix: f64, bmin_pix: f64, pa_deg: f64) -> Array2<f32>
-{
+fn make_gaussian_image(
+    nrow: usize,
+    ncol: usize,
+    bmaj_pix: f64,
+    bmin_pix: f64,
+    pa_deg: f64,
+) -> Array2<f32> {
     let fwhm_to_sigma: f64 = 2.0 * (2.0_f64 * 2.0_f64.ln()).sqrt();
     let sigma_maj = bmaj_pix / fwhm_to_sigma;
     let sigma_min = bmin_pix / fwhm_to_sigma;
@@ -98,7 +101,7 @@ fn write_test_fits(
 
     let description = ImageDescription {
         data_type: ImageType::Float,
-        dimensions: &[nrows, ncols],   // C row-major: NAXIS1=ncols, NAXIS2=nrows
+        dimensions: &[nrows, ncols], // C row-major: NAXIS1=ncols, NAXIS2=nrows
     };
     let mut fptr = FitsFile::create(path.to_str().ok_or("non-UTF-8 path")?)
         .with_custom_primary(&description)
@@ -109,11 +112,11 @@ fn write_test_fits(
     // Beam keywords (degrees, FITS convention)
     hdu.write_key(&mut fptr, "BMAJ", beam.major_deg)?;
     hdu.write_key(&mut fptr, "BMIN", beam.minor_deg)?;
-    hdu.write_key(&mut fptr, "BPA",  beam.pa_deg)?;
+    hdu.write_key(&mut fptr, "BPA", beam.pa_deg)?;
 
     // Minimal WCS
-    hdu.write_key(&mut fptr, "CDELT1", -pix_deg)?;     // RA: negative
-    hdu.write_key(&mut fptr, "CDELT2",  pix_deg)?;
+    hdu.write_key(&mut fptr, "CDELT1", -pix_deg)?; // RA: negative
+    hdu.write_key(&mut fptr, "CDELT2", pix_deg)?;
     hdu.write_key(&mut fptr, "CRPIX1", (ncols / 2 + 1) as f64)?;
     hdu.write_key(&mut fptr, "CRPIX2", (nrows / 2 + 1) as f64)?;
     hdu.write_key(&mut fptr, "CRVAL1", 0.0_f64)?;
@@ -121,7 +124,7 @@ fn write_test_fits(
     hdu.write_key(&mut fptr, "CTYPE1", "RA---SIN")?;
     hdu.write_key(&mut fptr, "CTYPE2", "DEC--SIN")?;
     hdu.write_key(&mut fptr, "EQUINOX", 2000.0_f64)?;
-    hdu.write_key(&mut fptr, "BUNIT",  "Jy/beam")?;
+    hdu.write_key(&mut fptr, "BUNIT", "Jy/beam")?;
 
     let flat: Vec<f32> = image.iter().copied().collect();
     hdu.write_image(&mut fptr, &flat)?;
@@ -152,7 +155,7 @@ fn miriad_smooth(
     let mir_root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
 
     let tmpdir = output_fits.parent().unwrap();
-    let mir_in  = tmpdir.join("in.im");
+    let mir_in = tmpdir.join("in.im");
     let mir_out = tmpdir.join("sm.im");
 
     // FITS → MIRIAD
@@ -162,7 +165,9 @@ fn miriad_smooth(
         .arg(format!("in={}", input_fits.display()))
         .arg(format!("out={}", mir_in.display()))
         .status()?;
-    if !status.success() { return Err("fits op=xyin failed".into()); }
+    if !status.success() {
+        return Err("fits op=xyin failed".into());
+    }
 
     // Smooth
     let fwhm = format!(
@@ -179,7 +184,9 @@ fn miriad_smooth(
         .arg("options=final")
         .arg(format!("out={}", mir_out.display()))
         .status()?;
-    if !status.success() { return Err("convol failed".into()); }
+    if !status.success() {
+        return Err("convol failed".into());
+    }
 
     // MIRIAD → FITS
     let status = Command::new(bin_dir.join("fits"))
@@ -188,15 +195,16 @@ fn miriad_smooth(
         .arg(format!("in={}", mir_out.display()))
         .arg(format!("out={}", output_fits.display()))
         .status()?;
-    if !status.success() { return Err("fits op=xyout failed".into()); }
+    if !status.success() {
+        return Err("fits op=xyout failed".into());
+    }
 
     Ok(())
 }
 
 /// Create a unique temp directory for a test.
 fn test_tmpdir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join(format!("convolve_rs_{}_{}", std::process::id(), tag));
+    let dir = std::env::temp_dir().join(format!("convolve_rs_{}_{}", std::process::id(), tag));
     std::fs::create_dir_all(&dir).expect("failed to create tmpdir");
     dir
 }
@@ -208,8 +216,8 @@ fn test_tmpdir(tag: &str) -> PathBuf {
 fn test_beam_conv_deconv_roundtrip() {
     let test_cases = [
         ((20.0, 10.0, 10.0), (5.0, 4.0, 30.0)),
-        ((15.0, 15.0,  0.0), (8.0, 6.0, 45.0)),
-        ((12.0,  8.0, 90.0), (3.0, 3.0,  0.0)),
+        ((15.0, 15.0, 0.0), (8.0, 6.0, 45.0)),
+        ((12.0, 8.0, 90.0), (3.0, 3.0, 0.0)),
     ];
     for ((maj_a, min_a, pa_a), (maj_b, min_b, pa_b)) in test_cases {
         let a = Beam::from_arcsec(maj_a, min_a, pa_a).unwrap();
@@ -221,12 +229,14 @@ fn test_beam_conv_deconv_roundtrip() {
             (recovered.major_deg - b.major_deg).abs() < tol,
             "({maj_a}×{min_a}@{pa_a}) + ({maj_b}×{min_b}@{pa_b}): \
              major {:.10e} vs {:.10e}",
-            recovered.major_deg, b.major_deg,
+            recovered.major_deg,
+            b.major_deg,
         );
         assert!(
             (recovered.minor_deg - b.minor_deg).abs() < tol,
             "minor mismatch: {:.10e} vs {:.10e}",
-            recovered.minor_deg, b.minor_deg,
+            recovered.minor_deg,
+            b.minor_deg,
         );
     }
 }
@@ -234,7 +244,7 @@ fn test_beam_conv_deconv_roundtrip() {
 /// Test parameters from Python test_2d.py: old=20×10@10, target=40×40@0.
 #[test]
 fn test_beam_deconvolve_test_params() {
-    let old    = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
     let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
 
     let conv_beam = target.deconvolve(&old).unwrap();
@@ -245,12 +255,14 @@ fn test_beam_deconvolve_test_params() {
     assert!(
         (reconv.major_deg - target.major_deg).abs() < tol,
         "reconv.major={:.10e} target.major={:.10e}",
-        reconv.major_deg, target.major_deg,
+        reconv.major_deg,
+        target.major_deg,
     );
     assert!(
         (reconv.minor_deg - target.minor_deg).abs() < tol,
         "reconv.minor={:.10e} target.minor={:.10e}",
-        reconv.minor_deg, target.minor_deg,
+        reconv.minor_deg,
+        target.minor_deg,
     );
 
     // Sanity: convolving beam must fit inside the target beam
@@ -269,7 +281,7 @@ fn test_beam_deconvolve_test_params() {
 /// equals Ω_new / Ω_old — the correct ratio for Jy/beam units.
 #[test]
 fn test_gaussft_dc_equals_g_ratio() {
-    let old    = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
     let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
@@ -287,8 +299,8 @@ fn test_gaussft_dc_equals_g_ratio() {
 
     // g_ratio = sqrt(Ω_new / Ω_old); must be positive and > 1 when smoothing to larger beam
     assert!(g_ratio > 0.0, "g_ratio must be positive");
-    let omega_ratio = (TARGET_BMAJ * TARGET_BMIN) / (OLD_BMAJ * OLD_BMIN);  // = 8.0
-    let expected_g_ratio = omega_ratio.sqrt();  // = sqrt(8)
+    let omega_ratio = (TARGET_BMAJ * TARGET_BMIN) / (OLD_BMAJ * OLD_BMIN); // = 8.0
+    let expected_g_ratio = omega_ratio.sqrt(); // = sqrt(8)
     assert!(
         (g_ratio - expected_g_ratio).abs() < 1e-10,
         "g_ratio = {g_ratio:.10e}, expected sqrt(Ω_new/Ω_old) = {expected_g_ratio:.10e}",
@@ -296,20 +308,23 @@ fn test_gaussft_dc_equals_g_ratio() {
 
     // Filter must be real-valued (Gaussian FT has no imaginary component)
     let max_imag = g_final.iter().map(|c| c.im.abs()).fold(0.0_f64, f64::max);
-    assert!(max_imag < 1e-15, "g_final has non-zero imaginary parts: max|im|={max_imag:.2e}");
+    assert!(
+        max_imag < 1e-15,
+        "g_final has non-zero imaginary parts: max|im|={max_imag:.2e}"
+    );
 }
 
 /// gaussft values decrease monotonically from DC (Gaussian must attenuate high frequencies).
 #[test]
 fn test_gaussft_attenuates_high_freq() {
-    let old    = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
     let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
     // 1-D slice along u (v=0): check g_final[i, 0] decreases for positive u
     let n = 32usize;
     let u_freqs = fftfreq(n, pix_deg.to_radians());
-    let v_freqs = fftfreq(1, pix_deg.to_radians());  // single-element v
+    let v_freqs = fftfreq(1, pix_deg.to_radians()); // single-element v
 
     let (g_final, g_ratio) = gaussft(&old, &target, &u_freqs, &v_freqs);
 
@@ -317,9 +332,9 @@ fn test_gaussft_attenuates_high_freq() {
     assert!((dc - g_ratio).abs() < 1e-12);
 
     // Positive-frequency bins (indices 1..n/2) should be smaller than DC
-    let m = (n + 1) / 2;
-    for i in 1..m {
-        let val = g_final[i].re;
+    let m = n.div_ceil(2);
+    for (i, bin) in g_final.iter().enumerate().take(m).skip(1) {
+        let val = bin.re;
         assert!(
             val < dc,
             "g_final[{i}] = {val:.6e} should be < DC = {dc:.6e}",
@@ -338,7 +353,7 @@ fn test_gaussft_attenuates_high_freq() {
 /// The integrated flux density S = Σ * Ω_pix / Ω_beam is conserved.
 #[test]
 fn test_smooth_beam_area_ratio() {
-    let old    = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
     let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
@@ -348,14 +363,14 @@ fn test_smooth_beam_area_ratio() {
 
     let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
 
-    let sum_in: f64  = image.iter().map(|&x| x as f64).sum();
+    let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
     let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
 
     // Expected: Ω_new / Ω_old = (40*40) / (20*10) = 8
     let area_old = old.area_sr();
     let area_new = target.area_sr();
     let expected_ratio = area_new / area_old;
-    let actual_ratio   = sum_out / sum_in;
+    let actual_ratio = sum_out / sum_in;
 
     // Allow 1% tolerance (image is truncated, not an infinite Gaussian)
     assert!(
@@ -377,7 +392,7 @@ fn test_smooth_beam_area_ratio() {
 ///   • pixels well outside it (far from the NaN boundary) remain finite
 #[test]
 fn test_smooth_nan_propagation() {
-    let old    = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
     let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
@@ -441,7 +456,8 @@ fn test_common_beam_identical() {
     assert!(
         (result.major_deg - b.major_deg).abs() < tol,
         "major: {:.6} vs {:.6}",
-        result.major_arcsec(), b.major_arcsec(),
+        result.major_arcsec(),
+        b.major_arcsec(),
     );
 }
 
@@ -456,7 +472,8 @@ fn test_common_beam_two_circular() {
     assert!(
         (result.major_deg - large.major_deg).abs() < tol,
         "common beam should equal the larger beam; got {:.4}\" expected {:.4}\"",
-        result.major_arcsec(), large.major_arcsec(),
+        result.major_arcsec(),
+        large.major_arcsec(),
     );
 }
 
@@ -473,10 +490,10 @@ fn test_smooth_matches_miriad() {
     }
 
     let tmpdir = test_tmpdir("miriad");
-    let input_fits  = tmpdir.join("input.fits");
+    let input_fits = tmpdir.join("input.fits");
     let miriad_fits = tmpdir.join("miriad.fits");
 
-    let old    = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
     let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
@@ -486,30 +503,31 @@ fn test_smooth_matches_miriad() {
     let image = make_gaussian_image(NROW, NCOL, bmaj_pix, bmin_pix, OLD_BPA);
 
     // Write FITS
-    write_test_fits(&input_fits, &image, &old, PIX_ARCSEC)
-        .expect("write_test_fits failed");
+    write_test_fits(&input_fits, &image, &old, PIX_ARCSEC).expect("write_test_fits failed");
 
     // Run MIRIAD
-    miriad_smooth(&input_fits, &miriad_fits, &target)
-        .expect("MIRIAD smooth failed");
+    miriad_smooth(&input_fits, &miriad_fits, &target).expect("MIRIAD smooth failed");
 
     // Run Rust
-    let rust_result = smooth(&image, &old, &target, pix_deg, pix_deg, None)
-        .expect("Rust smooth failed");
+    let rust_result =
+        smooth(&image, &old, &target, pix_deg, pix_deg, None).expect("Rust smooth failed");
 
     // Read MIRIAD pixels
     let mir_pixels = read_fits_pixels(&miriad_fits);
     let rust_pixels: Vec<f32> = rust_result.into_raw_vec_and_offset().0;
 
     assert_eq!(
-        mir_pixels.len(), rust_pixels.len(),
+        mir_pixels.len(),
+        rust_pixels.len(),
         "pixel count mismatch: MIRIAD {} vs Rust {}",
-        mir_pixels.len(), rust_pixels.len(),
+        mir_pixels.len(),
+        rust_pixels.len(),
     );
 
     // Compare pixel-by-pixel
     let atol = 1e-3_f32;
-    let mismatches: Vec<(usize, f32, f32)> = mir_pixels.iter()
+    let mismatches: Vec<(usize, f32, f32)> = mir_pixels
+        .iter()
         .zip(rust_pixels.iter())
         .enumerate()
         .filter(|&(_, (m, r))| (m - r).abs() > atol)
@@ -535,9 +553,9 @@ fn test_smooth_matches_miriad() {
 /// Three different elliptical beams — common beam must enclose all three.
 #[test]
 fn test_common_beam_three_different() {
-    let b1 = Beam::from_arcsec(20.0, 10.0,  30.0).unwrap();
+    let b1 = Beam::from_arcsec(20.0, 10.0, 30.0).unwrap();
     let b2 = Beam::from_arcsec(18.0, 12.0, -20.0).unwrap();
-    let b3 = Beam::from_arcsec(15.0, 15.0,   0.0).unwrap();
+    let b3 = Beam::from_arcsec(15.0, 15.0, 0.0).unwrap();
     let result = common_beam(&[b1, b2, b3], 1e-4, 200, 5e-4).unwrap();
 
     // Must be at least as large as the largest input beam's major axis.
@@ -595,32 +613,33 @@ fn write_test_cube_casambm(
 
     // WCS
     hdu.write_key(&mut fptr, "CDELT1", -pix_deg)?;
-    hdu.write_key(&mut fptr, "CDELT2",  pix_deg)?;
-    hdu.write_key(&mut fptr, "CDELT3",  1.0e6_f64)?;
-    hdu.write_key(&mut fptr, "CDELT4",  1.0_f64)?;
+    hdu.write_key(&mut fptr, "CDELT2", pix_deg)?;
+    hdu.write_key(&mut fptr, "CDELT3", 1.0e6_f64)?;
+    hdu.write_key(&mut fptr, "CDELT4", 1.0_f64)?;
     hdu.write_key(&mut fptr, "CRPIX1", (nx / 2 + 1) as f64)?;
     hdu.write_key(&mut fptr, "CRPIX2", (ny / 2 + 1) as f64)?;
-    hdu.write_key(&mut fptr, "CRPIX3",  1.0_f64)?;
-    hdu.write_key(&mut fptr, "CRPIX4",  1.0_f64)?;
-    hdu.write_key(&mut fptr, "CRVAL1",  0.0_f64)?;
-    hdu.write_key(&mut fptr, "CRVAL2",  0.0_f64)?;
-    hdu.write_key(&mut fptr, "CRVAL3",  1.4e9_f64)?;
-    hdu.write_key(&mut fptr, "CRVAL4",  1.0_f64)?;
+    hdu.write_key(&mut fptr, "CRPIX3", 1.0_f64)?;
+    hdu.write_key(&mut fptr, "CRPIX4", 1.0_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL1", 0.0_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL2", 0.0_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL3", 1.4e9_f64)?;
+    hdu.write_key(&mut fptr, "CRVAL4", 1.0_f64)?;
     hdu.write_key(&mut fptr, "CTYPE1", "RA---SIN")?;
     hdu.write_key(&mut fptr, "CTYPE2", "DEC--SIN")?;
     hdu.write_key(&mut fptr, "CTYPE3", "FREQ")?;
     hdu.write_key(&mut fptr, "CTYPE4", "STOKES")?;
-    hdu.write_key(&mut fptr, "EQUINOX",  2000.0_f64)?;
-    hdu.write_key(&mut fptr, "BUNIT",   "Jy/beam")?;
+    hdu.write_key(&mut fptr, "EQUINOX", 2000.0_f64)?;
+    hdu.write_key(&mut fptr, "BUNIT", "Jy/beam")?;
     hdu.write_key(&mut fptr, "CASAMBM", "T")?;
 
     // Reference beam from channel 0 (CRPIX3=1 → 0-based index 0).
     hdu.write_key(&mut fptr, "BMAJ", beams[0].major_deg)?;
     hdu.write_key(&mut fptr, "BMIN", beams[0].minor_deg)?;
-    hdu.write_key(&mut fptr, "BPA",  beams[0].pa_deg)?;
+    hdu.write_key(&mut fptr, "BPA", beams[0].pa_deg)?;
 
     // Write all channel data as one flat C-order array.
-    let flat: Vec<f32> = channel_images.iter()
+    let flat: Vec<f32> = channel_images
+        .iter()
         .flat_map(|img| img.iter().copied())
         .collect();
     hdu.write_image(&mut fptr, &flat)?;
@@ -628,24 +647,34 @@ fn write_test_cube_casambm(
     // Append BEAMS binary-table extension.
     let bmaj_v: Vec<f32> = beams.iter().map(|b| b.major_arcsec() as f32).collect();
     let bmin_v: Vec<f32> = beams.iter().map(|b| b.minor_arcsec() as f32).collect();
-    let bpa_v:  Vec<f32> = beams.iter().map(|b| b.pa_deg as f32).collect();
-    let chan_v:  Vec<i32> = (0..nchan as i32).collect();
-    let pol_v:   Vec<i32> = vec![0; nchan];
+    let bpa_v: Vec<f32> = beams.iter().map(|b| b.pa_deg as f32).collect();
+    let chan_v: Vec<i32> = (0..nchan as i32).collect();
+    let pol_v: Vec<i32> = vec![0; nchan];
 
-    let col_bmaj = ColumnDescription::new("BMAJ").with_type(ColumnDataType::Float).create()?;
-    let col_bmin = ColumnDescription::new("BMIN").with_type(ColumnDataType::Float).create()?;
-    let col_bpa  = ColumnDescription::new("BPA") .with_type(ColumnDataType::Float).create()?;
-    let col_chan = ColumnDescription::new("CHAN") .with_type(ColumnDataType::Int)  .create()?;
-    let col_pol  = ColumnDescription::new("POL") .with_type(ColumnDataType::Int)  .create()?;
+    let col_bmaj = ColumnDescription::new("BMAJ")
+        .with_type(ColumnDataType::Float)
+        .create()?;
+    let col_bmin = ColumnDescription::new("BMIN")
+        .with_type(ColumnDataType::Float)
+        .create()?;
+    let col_bpa = ColumnDescription::new("BPA")
+        .with_type(ColumnDataType::Float)
+        .create()?;
+    let col_chan = ColumnDescription::new("CHAN")
+        .with_type(ColumnDataType::Int)
+        .create()?;
+    let col_pol = ColumnDescription::new("POL")
+        .with_type(ColumnDataType::Int)
+        .create()?;
 
     let tbl = fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
     tbl.write_col(&mut fptr, "BMAJ", &bmaj_v)?;
     tbl.write_col(&mut fptr, "BMIN", &bmin_v)?;
-    tbl.write_col(&mut fptr, "BPA",  &bpa_v)?;
+    tbl.write_col(&mut fptr, "BPA", &bpa_v)?;
     tbl.write_col(&mut fptr, "CHAN", &chan_v)?;
-    tbl.write_col(&mut fptr, "POL",  &pol_v)?;
+    tbl.write_col(&mut fptr, "POL", &pol_v)?;
     tbl.write_key(&mut fptr, "NCHAN", nchan as i64)?;
-    tbl.write_key(&mut fptr, "NPOL",  1i64)?;
+    tbl.write_key(&mut fptr, "NPOL", 1i64)?;
 
     Ok(())
 }
@@ -662,8 +691,10 @@ fn read_cube_flat(path: &Path, nchan: usize, ny: usize, nx: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(nchan * plane);
     for c in 0..nchan {
         let start = c * plane;
-        let end   = start + plane;
-        let pixels: Vec<f32> = hdu.read_section(&mut fptr, start, end).expect("read_section");
+        let end = start + plane;
+        let pixels: Vec<f32> = hdu
+            .read_section(&mut fptr, start, end)
+            .expect("read_section");
         out.extend_from_slice(&pixels);
     }
     out
@@ -682,34 +713,44 @@ fn miriad_smooth_cube(
     let bin_dir = find_miriad_bin_dir().ok_or("MIRIAD not found")?;
     let mir_root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
     let tmpdir = output_fits.parent().unwrap();
-    let mir_in  = tmpdir.join("cube_in.im");
+    let mir_in = tmpdir.join("cube_in.im");
     let mir_out = tmpdir.join("cube_sm.im");
 
     let status = Command::new(bin_dir.join("fits"))
         .env("MIR", &mir_root)
         .arg("op=xyin")
-        .arg(format!("in={}",  input_fits.display()))
+        .arg(format!("in={}", input_fits.display()))
         .arg(format!("out={}", mir_in.display()))
         .status()?;
-    if !status.success() { return Err("fits op=xyin failed".into()); }
+    if !status.success() {
+        return Err("fits op=xyin failed".into());
+    }
 
     let status = Command::new(bin_dir.join("convol"))
         .env("MIR", &mir_root)
         .arg(format!("map={}", mir_in.display()))
-        .arg(format!("fwhm={},{}", target.major_arcsec(), target.minor_arcsec()))
+        .arg(format!(
+            "fwhm={},{}",
+            target.major_arcsec(),
+            target.minor_arcsec()
+        ))
         .arg(format!("pa={}", target.pa_deg))
         .arg("options=cube")
         .arg(format!("out={}", mir_out.display()))
         .status()?;
-    if !status.success() { return Err("convol failed".into()); }
+    if !status.success() {
+        return Err("convol failed".into());
+    }
 
     let status = Command::new(bin_dir.join("fits"))
         .env("MIR", &mir_root)
         .arg("op=xyout")
-        .arg(format!("in={}",  mir_out.display()))
+        .arg(format!("in={}", mir_out.display()))
         .arg(format!("out={}", output_fits.display()))
         .status()?;
-    if !status.success() { return Err("fits op=xyout failed".into()); }
+    if !status.success() {
+        return Err("fits op=xyout failed".into());
+    }
 
     Ok(())
 }
@@ -772,12 +813,9 @@ fn test_cube_casambm_beams_roundtrip() {
     let beams_in: Vec<Beam> = (0..nchan)
         .map(|c| Beam::from_arcsec(20.0 + c as f64 * 5.0, 10.0, 0.0).unwrap())
         .collect();
-    let channels: Vec<Array2<f32>> = (0..nchan)
-        .map(|_| Array2::zeros((ny, nx)))
-        .collect();
+    let channels: Vec<Array2<f32>> = (0..nchan).map(|_| Array2::zeros((ny, nx))).collect();
 
-    write_test_cube_casambm(&path, &channels, &beams_in, PIX_ARCSEC)
-        .expect("write failed");
+    write_test_cube_casambm(&path, &channels, &beams_in, PIX_ARCSEC).expect("write failed");
 
     let meta = cube_io::read_cube_meta(&path).expect("read_cube_meta failed");
     assert_eq!(meta.beams.len(), nchan);
@@ -788,12 +826,14 @@ fn test_cube_casambm_beams_roundtrip() {
         assert!(
             (actual.major_arcsec() - expected.major_arcsec()).abs() < tol_as,
             "channel {c}: BMAJ {:.3}\" vs {:.3}\"",
-            actual.major_arcsec(), expected.major_arcsec(),
+            actual.major_arcsec(),
+            expected.major_arcsec(),
         );
         assert!(
             (actual.minor_arcsec() - expected.minor_arcsec()).abs() < tol_as,
             "channel {c}: BMIN {:.3}\" vs {:.3}\"",
-            actual.minor_arcsec(), expected.minor_arcsec(),
+            actual.minor_arcsec(),
+            expected.minor_arcsec(),
         );
     }
 
@@ -806,20 +846,19 @@ fn test_cube_casambm_beams_roundtrip() {
 /// This is the per-channel version of `test_smooth_beam_area_ratio`.
 #[test]
 fn test_cube_channel_beam_area_ratio() {
-    let old    = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
     let target = Beam::from_arcsec(CUBE_TARGET_BMAJ, CUBE_TARGET_BMIN, CUBE_TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
     let bmaj_pix = CUBE_OLD_BMAJ / PIX_ARCSEC;
     let bmin_pix = CUBE_OLD_BMIN / PIX_ARCSEC;
-    let expected_ratio = (target.major_deg * target.minor_deg)
-        / (old.major_deg * old.minor_deg);
+    let expected_ratio = (target.major_deg * target.minor_deg) / (old.major_deg * old.minor_deg);
 
     for c in 0..CUBE_NCHAN {
         let image = make_gaussian_image(CUBE_NY, CUBE_NX, bmaj_pix, bmin_pix, CUBE_OLD_BPA);
         let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
 
-        let sum_in:  f64 = image.iter().map(|&x| x as f64).sum();
+        let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
         let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
         let ratio = sum_out / sum_in;
 
@@ -841,15 +880,17 @@ fn test_cube_channel_beam_area_ratio() {
 #[test]
 fn test_cube_smoothed_matches_miriad_3d() {
     if !miriad_available() {
-        eprintln!("MIRIAD not found on PATH or MIRIAD_BIN, skipping test_cube_smoothed_matches_miriad_3d");
+        eprintln!(
+            "MIRIAD not found on PATH or MIRIAD_BIN, skipping test_cube_smoothed_matches_miriad_3d"
+        );
         return;
     }
 
     let tmpdir = test_tmpdir("cube_miriad3d");
-    let input_fits  = tmpdir.join("cube_input.fits");
+    let input_fits = tmpdir.join("cube_input.fits");
     let miriad_fits = tmpdir.join("cube_miriad.fits");
 
-    let old    = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
+    let old = Beam::from_arcsec(CUBE_OLD_BMAJ, CUBE_OLD_BMIN, CUBE_OLD_BPA).unwrap();
     let target = Beam::from_arcsec(CUBE_TARGET_BMAJ, CUBE_TARGET_BMIN, CUBE_TARGET_BPA).unwrap();
     let pix_deg = PIX_ARCSEC / 3600.0;
 
@@ -863,22 +904,22 @@ fn test_cube_smoothed_matches_miriad_3d() {
     write_test_cube_casambm(&input_fits, &channels, &beams, PIX_ARCSEC)
         .expect("write_test_cube_casambm failed");
 
-    miriad_smooth_cube(&input_fits, &miriad_fits, &target)
-        .expect("MIRIAD cube smooth failed");
+    miriad_smooth_cube(&input_fits, &miriad_fits, &target).expect("MIRIAD cube smooth failed");
 
     // Read the MIRIAD output pixels directly (may not have CASAMBM).
     let mir_flat = read_cube_flat(&miriad_fits, CUBE_NCHAN, CUBE_NY, CUBE_NX);
 
     let atol = 1e-3_f32;
     for c in 0..CUBE_NCHAN {
-        let rust_plane = smooth(&image, &old, &target, pix_deg, pix_deg, None)
-            .expect("smooth failed");
+        let rust_plane =
+            smooth(&image, &old, &target, pix_deg, pix_deg, None).expect("smooth failed");
         let rust_flat: Vec<f32> = rust_plane.into_raw_vec_and_offset().0;
 
         let plane_start = c * CUBE_NY * CUBE_NX;
         let mir_plane = &mir_flat[plane_start..plane_start + CUBE_NY * CUBE_NX];
 
-        let mismatches: Vec<(usize, f32, f32)> = mir_plane.iter()
+        let mismatches: Vec<(usize, f32, f32)> = mir_plane
+            .iter()
             .zip(rust_flat.iter())
             .enumerate()
             .filter(|&(_, (m, r))| (m - r).abs() > atol)

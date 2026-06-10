@@ -7,7 +7,10 @@
 ///   3. Single BMAJ/BMIN/BPA from the primary header (broadcast to all channels)
 use std::path::{Path, PathBuf};
 
-use fitsio::{FitsFile, tables::{ColumnDataType, ColumnDescription}};
+use fitsio::{
+    FitsFile,
+    tables::{ColumnDataType, ColumnDescription},
+};
 use ndarray::Array2;
 use thiserror::Error;
 
@@ -66,7 +69,7 @@ pub struct CubeMeta {
 impl CubeMeta {
     /// Beamlog path co-located with the FITS file.
     pub fn beamlog_path(&self) -> PathBuf {
-        let dir  = self.path.parent().unwrap_or(Path::new("."));
+        let dir = self.path.parent().unwrap_or(Path::new("."));
         let stem = self.path.file_stem().unwrap_or_default();
         dir.join(format!("beamlog.{}.txt", stem.to_string_lossy()))
     }
@@ -116,12 +119,17 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     } else {
         let beamlog = CubeMeta {
             path: path.to_path_buf(),
-            nx, ny, nfreq, nstokes,
-            dx_deg, dy_deg,
+            nx,
+            ny,
+            nfreq,
+            nstokes,
+            dx_deg,
+            dy_deg,
             crpix_freq,
             beams: vec![],
             is_4d,
-        }.beamlog_path();
+        }
+        .beamlog_path();
 
         if beamlog.exists() {
             let parsed = read_beamlog(&beamlog)?;
@@ -136,10 +144,11 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
             // Fall back to single header beam broadcast to all channels.
             let mut fptr2 = FitsFile::open(path.to_string_lossy().into_owned())?;
             let hdu2 = fptr2.primary_hdu()?;
-            let bmaj: f64 = hdu2.read_key(&mut fptr2, "BMAJ")
+            let bmaj: f64 = hdu2
+                .read_key(&mut fptr2, "BMAJ")
                 .map_err(|_| CubeError::NoBeans)?;
             let bmin: f64 = hdu2.read_key(&mut fptr2, "BMIN").unwrap_or(bmaj);
-            let bpa:  f64 = hdu2.read_key(&mut fptr2, "BPA").unwrap_or(0.0);
+            let bpa: f64 = hdu2.read_key(&mut fptr2, "BPA").unwrap_or(0.0);
             let b = Beam::new(bmaj, bmin, bpa)?;
             vec![Some(b); nfreq]
         }
@@ -147,8 +156,12 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
 
     Ok(CubeMeta {
         path: path.to_path_buf(),
-        nx, ny, nfreq, nstokes,
-        dx_deg, dy_deg,
+        nx,
+        ny,
+        nfreq,
+        nstokes,
+        dx_deg,
+        dy_deg,
         crpix_freq,
         beams,
         is_4d,
@@ -161,18 +174,26 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
 fn read_casambm_beams(path: &Path, nfreq: usize) -> Result<Vec<Option<Beam>>, CubeError> {
     let path_str = path.to_string_lossy().into_owned();
     let mut fptr = FitsFile::open(&path_str)?;
-    let hdu = fptr.hdu("BEAMS").map_err(|_| CubeError::MissingKeyword("BEAMS extension".into()))?;
+    let hdu = fptr
+        .hdu("BEAMS")
+        .map_err(|_| CubeError::MissingKeyword("BEAMS extension".into()))?;
 
     let bmaj: Vec<f32> = hdu.read_col(&mut fptr, "BMAJ")?;
     let bmin: Vec<f32> = hdu.read_col(&mut fptr, "BMIN")?;
-    let bpa:  Vec<f32> = hdu.read_col(&mut fptr, "BPA")?;
+    let bpa: Vec<f32> = hdu.read_col(&mut fptr, "BPA")?;
 
     if bmaj.len() != nfreq {
-        return Err(CubeError::BeamCountMismatch { expected: nfreq, got: bmaj.len() });
+        return Err(CubeError::BeamCountMismatch {
+            expected: nfreq,
+            got: bmaj.len(),
+        });
     }
 
     let tiny = f32::MIN_POSITIVE as f64;
-    let beams = bmaj.iter().zip(bmin.iter()).zip(bpa.iter())
+    let beams = bmaj
+        .iter()
+        .zip(bmin.iter())
+        .zip(bpa.iter())
         .map(|((&maj_as, &min_as), &pa_deg)| {
             let maj_deg = maj_as as f64 / 3600.0;
             let min_deg = min_as as f64 / 3600.0;
@@ -201,7 +222,7 @@ pub fn read_channel(path: &Path, chan: usize, meta: &CubeMeta) -> Result<Array2<
 
     let plane = meta.ny * meta.nx;
     let start = chan * plane;
-    let end   = start + plane;
+    let end = start + plane;
 
     let data: Vec<f32> = hdu.read_section(&mut fptr, start, end)?;
     Ok(Array2::from_shape_vec((meta.ny, meta.nx), data)?)
@@ -210,14 +231,19 @@ pub fn read_channel(path: &Path, chan: usize, meta: &CubeMeta) -> Result<Array2<
 /// Write a single frequency channel plane back into an existing FITS cube.
 ///
 /// The output cube must have already been initialised by `init_output_cube`.
-pub fn write_channel(path: &Path, chan: usize, data: &Array2<f32>, meta: &CubeMeta) -> Result<(), CubeError> {
+pub fn write_channel(
+    path: &Path,
+    chan: usize,
+    data: &Array2<f32>,
+    meta: &CubeMeta,
+) -> Result<(), CubeError> {
     let path_str = path.to_string_lossy().into_owned();
     let mut fptr = FitsFile::edit(&path_str)?;
     let hdu = fptr.primary_hdu()?;
 
     let plane = meta.ny * meta.nx;
     let start = chan * plane;
-    let end   = start + plane;
+    let end = start + plane;
 
     let flat: Vec<f32> = data.iter().copied().collect();
     hdu.write_section(&mut fptr, start, end, &flat)?;
@@ -266,7 +292,7 @@ pub fn init_output_cube(
         // Update primary header PSF.
         hdu.write_key(&mut fptr, "BMAJ", ref_beam.major_deg)?;
         hdu.write_key(&mut fptr, "BMIN", ref_beam.minor_deg)?;
-        hdu.write_key(&mut fptr, "BPA",  ref_beam.pa_deg)?;
+        hdu.write_key(&mut fptr, "BPA", ref_beam.pa_deg)?;
 
         if mode == CubeMode::Natural {
             hdu.write_key(&mut fptr, "CASAMBM", "T")?;
@@ -277,42 +303,53 @@ pub fn init_output_cube(
 
     if mode == CubeMode::Natural {
         // Build per-channel beam arrays (BMAJ/BMIN in arcsec, BPA in deg).
-        let bmaj: Vec<f32> = target_beams.iter()
+        let bmaj: Vec<f32> = target_beams
+            .iter()
             .map(|b| b.map_or(tiny as f32, |b| b.major_arcsec() as f32))
             .collect();
-        let bmin: Vec<f32> = target_beams.iter()
+        let bmin: Vec<f32> = target_beams
+            .iter()
             .map(|b| b.map_or(tiny as f32, |b| b.minor_arcsec() as f32))
             .collect();
-        let bpa: Vec<f32> = target_beams.iter()
+        let bpa: Vec<f32> = target_beams
+            .iter()
             .map(|b| b.map_or(tiny as f32, |b| b.pa_deg as f32))
             .collect();
         let chan: Vec<i32> = (0..meta.nfreq as i32).collect();
         let pol: Vec<i32> = vec![0i32; meta.nfreq];
 
-        let col_bmaj = ColumnDescription::new("BMAJ").with_type(ColumnDataType::Float).create()?;
-        let col_bmin = ColumnDescription::new("BMIN").with_type(ColumnDataType::Float).create()?;
-        let col_bpa  = ColumnDescription::new("BPA") .with_type(ColumnDataType::Float).create()?;
-        let col_chan = ColumnDescription::new("CHAN") .with_type(ColumnDataType::Int)  .create()?;
-        let col_pol  = ColumnDescription::new("POL") .with_type(ColumnDataType::Int)  .create()?;
+        let col_bmaj = ColumnDescription::new("BMAJ")
+            .with_type(ColumnDataType::Float)
+            .create()?;
+        let col_bmin = ColumnDescription::new("BMIN")
+            .with_type(ColumnDataType::Float)
+            .create()?;
+        let col_bpa = ColumnDescription::new("BPA")
+            .with_type(ColumnDataType::Float)
+            .create()?;
+        let col_chan = ColumnDescription::new("CHAN")
+            .with_type(ColumnDataType::Int)
+            .create()?;
+        let col_pol = ColumnDescription::new("POL")
+            .with_type(ColumnDataType::Int)
+            .create()?;
 
         let path_str = output_path.to_string_lossy().into_owned();
         let mut fptr = FitsFile::edit(&path_str)?;
 
-        let table_hdu = fptr.create_table(
-            "BEAMS",
-            &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol],
-        )?;
+        let table_hdu =
+            fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
         table_hdu.write_col(&mut fptr, "BMAJ", &bmaj)?;
         table_hdu.write_col(&mut fptr, "BMIN", &bmin)?;
-        table_hdu.write_col(&mut fptr, "BPA",  &bpa)?;
+        table_hdu.write_col(&mut fptr, "BPA", &bpa)?;
         table_hdu.write_col(&mut fptr, "CHAN", &chan)?;
-        table_hdu.write_col(&mut fptr, "POL",  &pol)?;
+        table_hdu.write_col(&mut fptr, "POL", &pol)?;
 
         // Set standard BEAMS extension keywords.
         let beam_hdu = fptr.hdu("BEAMS")?;
         beam_hdu.write_key(&mut fptr, "EXTNAME", "BEAMS")?;
         beam_hdu.write_key(&mut fptr, "NCHAN", meta.nfreq as i64)?;
-        beam_hdu.write_key(&mut fptr, "NPOL",  1i64)?;
+        beam_hdu.write_key(&mut fptr, "NPOL", 1i64)?;
     }
 
     Ok(())
@@ -375,9 +412,17 @@ pub fn write_beamlog(path: &Path, beams: &[Option<Beam>]) -> Result<(), CubeErro
     writeln!(out, "# Channel BMAJ[arcsec] BMIN[arcsec] BPA[deg]").unwrap();
     for (i, b) in beams.iter().enumerate() {
         match b {
-            Some(b) => writeln!(out, "{} {} {} {}", i, b.major_arcsec(), b.minor_arcsec(), b.pa_deg),
-            None    => writeln!(out, "{i} nan nan nan"),
-        }.unwrap();
+            Some(b) => writeln!(
+                out,
+                "{} {} {} {}",
+                i,
+                b.major_arcsec(),
+                b.minor_arcsec(),
+                b.pa_deg
+            ),
+            None => writeln!(out, "{i} nan nan nan"),
+        }
+        .unwrap();
     }
     std::fs::write(path, out)?;
     Ok(())
