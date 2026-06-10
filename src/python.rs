@@ -262,11 +262,28 @@ fn gauss_factor(
 
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
+#[pyfunction]
+fn _generate_stubs() -> PyResult<()> {
+    // CARGO_MANIFEST_DIR is only set by Cargo; fall back to cwd when called from Python
+    if std::env::var("CARGO_MANIFEST_DIR").is_err() {
+        let cwd = std::env::current_dir()
+            .map_err(|e| PyValueError::new_err(format!("cannot get cwd: {e}")))?;
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("CARGO_MANIFEST_DIR", cwd);
+        }
+    }
+    stub_info()
+        .and_then(|s| s.generate())
+        .map_err(|e| PyValueError::new_err(format!("stub generation failed: {e}")))
+}
+
 #[pymodule]
 pub fn _convolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBeam>()?;
     m.add_function(wrap_pyfunction!(common_beam, m)?)?;
     m.add_function(wrap_pyfunction!(smooth, m)?)?;
     m.add_function(wrap_pyfunction!(gauss_factor, m)?)?;
+    m.add_function(wrap_pyfunction!(_generate_stubs, m)?)?;
     Ok(())
 }

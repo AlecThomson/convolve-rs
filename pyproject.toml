@@ -17,3 +17,4 @@ testpaths = ["tests"]
 [tool.maturin]
 features = ["python"]
 module-name = "convolve_rs._convolve_rs"
+python-source = "."

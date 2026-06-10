@@ -1,0 +1,4 @@
+# Allow Python symbols to be resolved at runtime (required for pyo3 extension modules
+# and for the stub_gen binary, which uses pyo3 type info without calling Python).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

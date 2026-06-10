@@ -157,7 +157,7 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         None => {
             let valid: Vec<Beam> = all_beams.iter()
                 .filter(|b| b.is_finite() && !b.is_zero()
-                    && args.shared.cutoff.map_or(true, |c| b.major_arcsec() <= c))
+                    && args.shared.cutoff.is_none_or(|c| b.major_arcsec() <= c))
                 .cloned()
                 .collect();
             anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
@@ -379,7 +379,7 @@ fn compute_target_beams(
                 let valid: Vec<Beam> = metas.iter()
                     .filter_map(|m| m.beams[c])
                     .filter(|b| b.is_finite() && !b.is_zero())
-                    .filter(|b| cutoff.map_or(true, |cut| b.major_arcsec() <= cut))
+                    .filter(|b| cutoff.is_none_or(|cut| b.major_arcsec() <= cut))
                     .collect();
                 if valid.is_empty() {
                     return Ok(None);
@@ -394,7 +394,7 @@ fn compute_target_beams(
                 .flat_map(|m| m.beams.iter())
                 .filter_map(|b| *b)
                 .filter(|b| b.is_finite() && !b.is_zero())
-                .filter(|b| cutoff.map_or(true, |cut| b.major_arcsec() <= cut))
+                .filter(|b| cutoff.is_none_or(|cut| b.major_arcsec() <= cut))
                 .collect();
             anyhow::ensure!(!valid.is_empty(), "no valid beams found across all cubes/channels");
             let cb = common_beam(&valid, tolerance, nsamps, epsilon)

@@ -15,5 +15,3 @@ pub use fits_io::{read_fits, write_fits, output_path, FitsImageData, FitsError};
 mod python;
 #[cfg(feature = "python")]
 pub use python::_convolve_rs;
-#[cfg(feature = "python")]
-pub use python::stub_info;

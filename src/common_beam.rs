@@ -85,8 +85,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
 
     // If the small beam is circular the minor axis is the circle radius.
     if small_beam.is_circular(1e-6) {
-        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg)
-            .map_err(BeamError::from)?;
+        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg)?;
         return Ok(beam);
     }
 
@@ -105,9 +104,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
             (small_major, large_major)
         };
         let pa = if large_major >= small_major { large_beam.pa_deg } else { small_beam.pa_deg };
-        return Beam::from_arcsec(major, minor, pa)
-            .map_err(BeamError::from)
-            .map_err(Into::into);
+        return Beam::from_arcsec(major, minor, pa).map_err(Into::into);
     }
 
     // Transform to coordinate frame where large_beam is circular.
@@ -133,8 +130,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
         trans_maj_unsc + eps,
         trans_min_unsc + eps,
         final_pa_deg,
-    )
-    .map_err(BeamError::from)?;
+    )?;
 
     Ok(beam)
 }

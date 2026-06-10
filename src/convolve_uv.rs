@@ -196,7 +196,7 @@ pub fn gaussft(
 /// For even n the Nyquist bin (index n/2) is listed as negative, matching numpy.
 pub fn fftfreq(n: usize, d: f64) -> Vec<f64> {
     let val = 1.0 / (n as f64 * d);
-    let m = (n + 1) / 2; // ceiling(n/2): positive-frequency count
+    let m = n.div_ceil(2); // ceiling(n/2): positive-frequency count
     let mut freqs = vec![0.0_f64; n];
     for i in 0..m {
         freqs[i] = i as f64 * val;
