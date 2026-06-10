@@ -50,9 +50,8 @@ pub fn common_beam(
     }
 
     if beams.len() == 2 {
-        match find_commonbeam_between(&beams[0], &beams[1]) {
-            Ok(b) => return Ok(b),
-            Err(_) => {} // fall through to MVE
+        if let Ok(b) = find_commonbeam_between(&beams[0], &beams[1]) {
+            return Ok(b);
         }
     }
 
