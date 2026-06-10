@@ -317,7 +317,7 @@ fn irfft2(mut spectrum: Vec<Complex<f64>>, nrows: usize, ncols: usize) -> Vec<f6
     let mut scratch = c2r.make_scratch_vec();
     let mut inrow = c2r.make_input_vec();
     let mut out = vec![0.0_f64; nrows * ncols];
-    let even = ncols % 2 == 0;
+    let even = ncols.is_multiple_of(2);
     for i in 0..nrows {
         inrow.copy_from_slice(&spectrum[i * nhalf..(i + 1) * nhalf]);
         // c2r requires the DC (and, for even ncols, Nyquist) bins to be purely
