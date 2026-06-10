@@ -50,9 +50,8 @@ pub fn common_beam(
     }
 
     if beams.len() == 2 {
-        match find_commonbeam_between(&beams[0], &beams[1]) {
-            Ok(b) => return Ok(b),
-            Err(_) => {} // fall through to MVE
+        if let Ok(b) = find_commonbeam_between(&beams[0], &beams[1]) {
+            return Ok(b);
         }
     }
 
@@ -85,8 +84,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
 
     // If the small beam is circular the minor axis is the circle radius.
     if small_beam.is_circular(1e-6) {
-        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg)
-            .map_err(BeamError::from)?;
+        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg)?;
         return Ok(beam);
     }
 
@@ -105,9 +103,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
             (small_major, large_major)
         };
         let pa = if large_major >= small_major { large_beam.pa_deg } else { small_beam.pa_deg };
-        return Beam::from_arcsec(major, minor, pa)
-            .map_err(BeamError::from)
-            .map_err(Into::into);
+        return Beam::from_arcsec(major, minor, pa).map_err(Into::into);
     }
 
     // Transform to coordinate frame where large_beam is circular.
@@ -133,8 +129,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
         trans_maj_unsc + eps,
         trans_min_unsc + eps,
         final_pa_deg,
-    )
-    .map_err(BeamError::from)?;
+    )?;
 
     Ok(beam)
 }
@@ -358,14 +353,6 @@ fn min_vol_ellipse(
         pts.iter().zip(u.iter()).map(|(p, &ui)| p[0] * ui).sum::<f64>(),
         pts.iter().zip(u.iter()).map(|(p, &ui)| p[1] * ui).sum::<f64>(),
     ];
-
-    // Check centre is near zero (beams are centred at origin)
-    let center_sq = center[0] * center[0] + center[1] * center[1];
-    if center_sq > tolerance * tolerance {
-        return Err(CommonBeamError::DeconvFailed(
-            format!("MVE centre ({:.2e},{:.2e}) > tolerance", center[0], center[1]),
-        ));
-    }
 
     // A = inv(P.T * diag(u) * P - center*center.T) / d  (2x2)
     let ptdp = matmul_pt_diag_p(pts, &u); // 2x2

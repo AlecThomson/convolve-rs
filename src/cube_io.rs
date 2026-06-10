@@ -134,7 +134,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
             parsed.into_iter().map(Some).collect()
         } else {
             // Fall back to single header beam broadcast to all channels.
-            let mut fptr2 = FitsFile::open(&path.to_string_lossy().into_owned())?;
+            let mut fptr2 = FitsFile::open(path.to_string_lossy().into_owned())?;
             let hdu2 = fptr2.primary_hdu()?;
             let bmaj: f64 = hdu2.read_key(&mut fptr2, "BMAJ")
                 .map_err(|_| CubeError::NoBeans)?;
@@ -376,7 +376,7 @@ pub fn write_beamlog(path: &Path, beams: &[Option<Beam>]) -> Result<(), CubeErro
     for (i, b) in beams.iter().enumerate() {
         match b {
             Some(b) => writeln!(out, "{} {} {} {}", i, b.major_arcsec(), b.minor_arcsec(), b.pa_deg),
-            None    => writeln!(out, "{} nan nan nan", i),
+            None    => writeln!(out, "{i} nan nan nan"),
         }.unwrap();
     }
     std::fs::write(path, out)?;

@@ -103,7 +103,7 @@ pub fn convolve_uv(
             .collect();
         let mask_conv = ifft2(&mask_conv_f, nrows, ncols);
         im_conv_flat.iter().zip(mask_conv.iter())
-            .map(|(&v, &m)| if !(m + 1.0 < 2.0) { f32::NAN } else { v as f32 })
+            .map(|(&v, &m)| if m >= 1.0 { f32::NAN } else { v as f32 })
             .collect()
     } else {
         im_conv_flat.iter().map(|&v| v as f32).collect()
@@ -196,13 +196,13 @@ pub fn gaussft(
 /// For even n the Nyquist bin (index n/2) is listed as negative, matching numpy.
 pub fn fftfreq(n: usize, d: f64) -> Vec<f64> {
     let val = 1.0 / (n as f64 * d);
-    let m = (n + 1) / 2; // ceiling(n/2): positive-frequency count
+    let m = n.div_ceil(2); // ceiling(n/2): positive-frequency count
     let mut freqs = vec![0.0_f64; n];
-    for i in 0..m {
-        freqs[i] = i as f64 * val;
+    for (i, freq) in freqs.iter_mut().enumerate().take(m) {
+        *freq = i as f64 * val;
     }
-    for i in m..n {
-        freqs[i] = (i as f64 - n as f64) * val;
+    for (i, freq) in freqs.iter_mut().enumerate().take(n).skip(m) {
+        *freq = (i as f64 - n as f64) * val;
     }
     freqs
 }
