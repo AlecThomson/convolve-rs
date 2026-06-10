@@ -1,6 +1,9 @@
 [package]
 name = "convolve-rs"
-version = "0.1.0"
+# Placeholder: the real version is the git tag, injected at release time by the
+# CD workflow via `cargo set-version`. maturin reads this value, so the Python
+# wheel/sdist version follows automatically.
+version = "0.0.0"
 edition = "2024"
 
 [lib]
