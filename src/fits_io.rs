@@ -64,11 +64,11 @@ pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
     let dy_deg = cdelt2.abs();
 
     // Beam.
-    let bmaj: f64 = hdu.read_key(&mut fptr, "BMAJ")
+    let bmaj: f64 = hdu
+        .read_key(&mut fptr, "BMAJ")
         .map_err(|_| FitsError::MissingKeyword("BMAJ".into()))?;
-    let bmin: f64 = hdu.read_key(&mut fptr, "BMIN")
-        .unwrap_or(bmaj);
-    let bpa: f64  = hdu.read_key(&mut fptr, "BPA").unwrap_or(0.0);
+    let bmin: f64 = hdu.read_key(&mut fptr, "BMIN").unwrap_or(bmaj);
+    let bpa: f64 = hdu.read_key(&mut fptr, "BPA").unwrap_or(0.0);
 
     let beam = Beam::new(bmaj, bmin, bpa)
         .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
@@ -110,7 +110,7 @@ pub fn write_fits(
     // Update beam keywords.
     hdu.write_key(&mut fptr, "BMAJ", new_beam.major_deg)?;
     hdu.write_key(&mut fptr, "BMIN", new_beam.minor_deg)?;
-    hdu.write_key(&mut fptr, "BPA",  new_beam.pa_deg)?;
+    hdu.write_key(&mut fptr, "BPA", new_beam.pa_deg)?;
 
     Ok(())
 }
@@ -123,15 +123,15 @@ pub fn output_path(
     outdir: Option<&Path>,
 ) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    let ext  = input.extension().unwrap_or_default().to_string_lossy();
+    let ext = input.extension().unwrap_or_default().to_string_lossy();
 
     let filename = match suffix {
         Some(s) => format!("{stem}.{s}.{ext}"),
-        None    => format!("{stem}.{ext}"),
+        None => format!("{stem}.{ext}"),
     };
     let filename = match prefix {
         Some(p) => format!("{p}{filename}"),
-        None    => filename,
+        None => filename,
     };
 
     let dir = outdir.unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")));

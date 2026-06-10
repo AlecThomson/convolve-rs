@@ -1,0 +1,146 @@
+name: CD
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: 3
+
+jobs:
+  sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cargo-edit
+        if: github.event_name == 'release'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Pin version from release tag
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: cargo set-version "${RELEASE_TAG#v}"
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  wheels:
+    name: Wheels (${{ matrix.platform }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux, runner: ubuntu-latest, target: x86_64 }
+          - { platform: linux, runner: ubuntu-latest, target: aarch64 }
+          - { platform: macos, runner: macos-14, target: aarch64 }
+          # No Windows wheel: cfitsio can't be built from source under MSVC.
+          # Windows users can build from the sdist or use conda/WSL.
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cargo-edit
+        if: github.event_name == 'release'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Pin version from release tag
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: cargo set-version "${RELEASE_TAG#v}"
+
+      # cfitsio is compiled from source via the crate's `fitsio-src` feature,
+      # so the only build requirement is a C compiler, which every runner (and
+      # the manylinux container) already provides.
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # `auto` selects an appropriate manylinux image; maturin-action's
+          # cross images carry the aarch64 C toolchain needed to build cfitsio.
+          manylinux: auto
+          # `abi3` builds one stable-ABI wheel per platform (Python >=3.10) and
+          # lets maturin build without a (target) interpreter, needed for aarch64.
+          args: --release --out dist --features abi3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}-${{ matrix.target }}
+          path: dist/*.whl
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write       # trusted publishing
+      attestations: write
+      contents: read
+    if: github.event_name == 'release' && github.event.action == 'published'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*"
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [sdist, wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release' && github.event.action == 'published'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Pin version from release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: cargo set-version "${RELEASE_TAG#v}"
+
+      # --allow-dirty: `cargo set-version` leaves the manifest modified vs HEAD.
+      - name: Publish crate
+        run: cargo publish --allow-dirty --token ${{ secrets.CARGO_REGISTRY_TOKEN }}

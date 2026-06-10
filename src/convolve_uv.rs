@@ -37,15 +37,18 @@ pub fn convolve_uv(
     cutoff_arcsec: Option<f64>,
 ) -> Result<ConvolutionResult, ConvolveError> {
     // Cutoff check.
-    if let Some(cutoff) = cutoff_arcsec {
-        if old_beam.major_arcsec() > cutoff {
-            return Err(ConvolveError::AboveCutoff);
-        }
+    if let Some(cutoff) = cutoff_arcsec
+        && old_beam.major_arcsec() > cutoff
+    {
+        return Err(ConvolveError::AboveCutoff);
     }
 
     // Beams identical → no-op with unit scaling.
     if old_beam.approx_eq(new_beam) {
-        return Ok(ConvolutionResult { image: image.clone(), scaling_factor: 1.0 });
+        return Ok(ConvolutionResult {
+            image: image.clone(),
+            scaling_factor: 1.0,
+        });
     }
 
     // Compute the convolving beam (new² - old² in quadrature) and flux scaling.
@@ -59,7 +62,10 @@ pub fn convolve_uv(
 
     // All-NaN fast path.
     if image.iter().all(|x| x.is_nan()) {
-        return Ok(ConvolutionResult { image: image.clone(), scaling_factor: fac });
+        return Ok(ConvolutionResult {
+            image: image.clone(),
+            scaling_factor: fac,
+        });
     }
 
     let (nrows, ncols) = image.dim();
@@ -67,8 +73,14 @@ pub fn convolve_uv(
     // Handle NaNs: zero-fill and track a mask.
     let has_nan = image.iter().any(|x| x.is_nan());
     let (clean_image, nan_mask): (Vec<f64>, Option<Vec<f64>>) = if has_nan {
-        let vals: Vec<f64> = image.iter().map(|&x| if x.is_nan() { 0.0 } else { x as f64 }).collect();
-        let mask: Vec<f64> = image.iter().map(|&x| if x.is_nan() { 1.0 } else { 0.0 }).collect();
+        let vals: Vec<f64> = image
+            .iter()
+            .map(|&x| if x.is_nan() { 0.0 } else { x as f64 })
+            .collect();
+        let mask: Vec<f64> = image
+            .iter()
+            .map(|&x| if x.is_nan() { 1.0 } else { 0.0 })
+            .collect();
         (vals, Some(mask))
     } else {
         let vals: Vec<f64> = image.iter().map(|&x| x as f64).collect();
@@ -88,7 +100,9 @@ pub fn convolve_uv(
     let im_f = fft2(&clean_image, nrows, ncols);
 
     // Multiply element-wise.
-    let convolved_f: Vec<Complex<f64>> = im_f.iter().zip(g_final.iter())
+    let convolved_f: Vec<Complex<f64>> = im_f
+        .iter()
+        .zip(g_final.iter())
         .map(|(imf, gf)| imf * gf)
         .collect();
 
@@ -98,11 +112,15 @@ pub fn convolve_uv(
     // NaN propagation.
     let out_flat: Vec<f32> = if let Some(mask) = nan_mask {
         let mask_f = fft2(&mask, nrows, ncols);
-        let mask_conv_f: Vec<Complex<f64>> = mask_f.iter().zip(g_final.iter())
+        let mask_conv_f: Vec<Complex<f64>> = mask_f
+            .iter()
+            .zip(g_final.iter())
             .map(|(mf, gf)| mf * gf)
             .collect();
         let mask_conv = ifft2(&mask_conv_f, nrows, ncols);
-        im_conv_flat.iter().zip(mask_conv.iter())
+        im_conv_flat
+            .iter()
+            .zip(mask_conv.iter())
             .map(|(&v, &m)| if m >= 1.0 { f32::NAN } else { v as f32 })
             .collect()
     } else {
@@ -112,7 +130,10 @@ pub fn convolve_uv(
     let out = Array2::from_shape_vec((nrows, ncols), out_flat)
         .expect("shape mismatch in convolve_uv output");
 
-    Ok(ConvolutionResult { image: out, scaling_factor: g_ratio })
+    Ok(ConvolutionResult {
+        image: out,
+        scaling_factor: g_ratio,
+    })
 }
 
 // ── gaussft ───────────────────────────────────────────────────────────────────
@@ -136,21 +157,21 @@ pub fn gaussft(
     // New beam (target).
     let bmaj_rad = new_beam.major_deg * deg2rad;
     let bmin_rad = new_beam.minor_deg * deg2rad;
-    let bpa_rad  = new_beam.pa_deg * deg2rad;
+    let bpa_rad = new_beam.pa_deg * deg2rad;
     let sx = bmaj_rad / fwhm_to_sigma;
     let sy = bmin_rad / fwhm_to_sigma;
 
     // Old beam (input PSF).
     let bmaj_in_rad = old_beam.major_deg * deg2rad;
     let bmin_in_rad = old_beam.minor_deg * deg2rad;
-    let bpa_in_rad  = old_beam.pa_deg * deg2rad;
+    let bpa_in_rad = old_beam.pa_deg * deg2rad;
     let sx_in = bmaj_in_rad / fwhm_to_sigma;
     let sy_in = bmin_in_rad / fwhm_to_sigma;
 
     // Amplitude ratio (= flux scaling factor).
-    let g_amp    = (2.0 * std::f64::consts::PI * sx * sy).sqrt();
-    let dg_amp   = (2.0 * std::f64::consts::PI * sx_in * sy_in).sqrt();
-    let g_ratio  = g_amp / dg_amp;
+    let g_amp = (2.0 * std::f64::consts::PI * sx * sy).sqrt();
+    let dg_amp = (2.0 * std::f64::consts::PI * sx_in * sy_in).sqrt();
+    let g_ratio = g_amp / dg_amp;
 
     let pi2 = std::f64::consts::PI * std::f64::consts::PI;
     let nrows = u_freqs.len();
@@ -158,28 +179,52 @@ pub fn gaussft(
     let mut g_final = vec![Complex::<f64>::new(0.0, 0.0); nrows * ncols];
 
     // Pre-rotate u and v for new beam.
-    let u_cos = u_freqs.iter().map(|&u| u * bpa_rad.cos()).collect::<Vec<_>>();
-    let u_sin = u_freqs.iter().map(|&u| u * bpa_rad.sin()).collect::<Vec<_>>();
-    let v_cos = v_freqs.iter().map(|&v| v * bpa_rad.cos()).collect::<Vec<_>>();
-    let v_sin = v_freqs.iter().map(|&v| v * bpa_rad.sin()).collect::<Vec<_>>();
+    let u_cos = u_freqs
+        .iter()
+        .map(|&u| u * bpa_rad.cos())
+        .collect::<Vec<_>>();
+    let u_sin = u_freqs
+        .iter()
+        .map(|&u| u * bpa_rad.sin())
+        .collect::<Vec<_>>();
+    let v_cos = v_freqs
+        .iter()
+        .map(|&v| v * bpa_rad.cos())
+        .collect::<Vec<_>>();
+    let v_sin = v_freqs
+        .iter()
+        .map(|&v| v * bpa_rad.sin())
+        .collect::<Vec<_>>();
 
     // Pre-rotate u and v for old beam.
-    let u_cos_in = u_freqs.iter().map(|&u| u * bpa_in_rad.cos()).collect::<Vec<_>>();
-    let u_sin_in = u_freqs.iter().map(|&u| u * bpa_in_rad.sin()).collect::<Vec<_>>();
-    let v_cos_in = v_freqs.iter().map(|&v| v * bpa_in_rad.cos()).collect::<Vec<_>>();
-    let v_sin_in = v_freqs.iter().map(|&v| v * bpa_in_rad.sin()).collect::<Vec<_>>();
+    let u_cos_in = u_freqs
+        .iter()
+        .map(|&u| u * bpa_in_rad.cos())
+        .collect::<Vec<_>>();
+    let u_sin_in = u_freqs
+        .iter()
+        .map(|&u| u * bpa_in_rad.sin())
+        .collect::<Vec<_>>();
+    let v_cos_in = v_freqs
+        .iter()
+        .map(|&v| v * bpa_in_rad.cos())
+        .collect::<Vec<_>>();
+    let v_sin_in = v_freqs
+        .iter()
+        .map(|&v| v * bpa_in_rad.sin())
+        .collect::<Vec<_>>();
 
     for i in 0..nrows {
         for j in 0..ncols {
             // Rotated UV coordinates for new beam.
-            let ur    = u_cos[i] - v_sin[j];
-            let vr    = u_sin[i] + v_cos[j];
+            let ur = u_cos[i] - v_sin[j];
+            let vr = u_sin[i] + v_cos[j];
             // Rotated UV coordinates for old beam.
             let ur_in = u_cos_in[i] - v_sin_in[j];
             let vr_in = u_sin_in[i] + v_cos_in[j];
 
-            let g_arg   = -2.0 * pi2 * ((sx * ur).powi(2) + (sy * vr).powi(2));
-            let dg_arg  = -2.0 * pi2 * ((sx_in * ur_in).powi(2) + (sy_in * vr_in).powi(2));
+            let g_arg = -2.0 * pi2 * ((sx * ur).powi(2) + (sy * vr).powi(2));
+            let dg_arg = -2.0 * pi2 * ((sx_in * ur_in).powi(2) + (sy_in * vr_in).powi(2));
 
             let val = g_ratio * (g_arg - dg_arg).exp();
             g_final[i * ncols + j] = Complex::new(val, 0.0);

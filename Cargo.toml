@@ -1,6 +1,9 @@
 [package]
 name = "convolve-rs"
-version = "0.1.0"
+# Placeholder: the real version is the git tag, injected at release time by the
+# CD workflow via `cargo set-version`. maturin reads this value, so the Python
+# wheel/sdist version follows automatically.
+version = "0.0.0"
 edition = "2024"
 
 [lib]
@@ -13,13 +16,24 @@ name = "convolvers"
 path = "src/main.rs"
 
 [features]
-python = ["dep:pyo3", "dep:numpy", "dep:pyo3-stub-gen"]
+python = ["dep:pyo3", "dep:numpy"]
+# Stable-ABI build for distributable wheels: maturin builds a single
+# `cp310-abi3` wheel per platform (works on Python >=3.10) and can build
+# without a Python interpreter present, which cross-compiled (e.g. aarch64)
+# wheels require. Mutually exclusive with `stubgen` — pyo3-stub-gen references
+# datetime types that don't exist in the limited API.
+abi3 = ["python", "pyo3/abi3-py310"]
+# Regenerate the .pyi type stubs (dev only, e.g. `cargo build --features stubgen`).
+# Do NOT combine with `abi3`.
+stubgen = ["python", "dep:pyo3-stub-gen"]
 
 [dependencies]
 pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 numpy = { version = "0.26", optional = true }
 pyo3-stub-gen = { version = "0.22.3", optional = true }
-fitsio = "0.21"
+# `fitsio-src` builds cfitsio from source (needs only a C compiler), so no
+# system cfitsio is required in CI or when building wheels.
+fitsio = { version = "0.21", features = ["fitsio-src"] }
 ndarray = "0.16"
 rustfft = "6"
 rayon = "1"

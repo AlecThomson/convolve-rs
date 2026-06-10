@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Many color libraries just need this variable to be set to any value.
+  FORCE_COLOR: 3
+  CARGO_TERM_COLOR: always
+  # Bump this to invalidate the cached MIRIAD build.
+  MIRIAD_CACHE_VERSION: v1
+
+jobs:
+  lint:
+    name: Lint & format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        # Not --all-features: `abi3` and `stubgen` are mutually exclusive.
+        # `stubgen` pulls in the full Python module (it implies `python`).
+        run: cargo clippy --all-targets --features stubgen -- -D warnings
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: ruff check
+        run: uvx ruff check .
+
+      - name: ruff format
+        run: uvx ruff format --check .
+
+  rust-test:
+    name: Rust tests (vs MIRIAD)
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ── MIRIAD: build from source (csiro/miriad), aggressively cached ────────
+      - name: Cache MIRIAD install
+        id: miriad-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/miriad-install
+          key: miriad-${{ runner.os }}-${{ env.MIRIAD_CACHE_VERSION }}
+
+      - name: Install MIRIAD build dependencies
+        if: steps.miriad-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gfortran libx11-dev libpng-dev libreadline-dev cmake
+
+      - name: Build MIRIAD from source
+        if: steps.miriad-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/csiro/miriad.git /tmp/miriad-src
+          cmake -S /tmp/miriad-src -B /tmp/miriad-build \
+            -DCMAKE_INSTALL_PREFIX="$HOME/miriad-install"
+          cmake --build /tmp/miriad-build --target install -j"$(nproc)"
+
+      - name: Run Rust tests
+        run: |
+          # The MIRIAD comparison test reads MIRIAD_BIN and derives the rest of
+          # the runtime environment (catalogs, etc.) from the install prefix.
+          export MIRIAD_BIN="$HOME/miriad-install/bin"
+          # The integration tests exercise the pure-Rust API; no Python features.
+          cargo test
+
+  python-test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Builds the maturin extension module and installs the `test` extra
+      # (pytest, radio-beam, astropy). cfitsio is compiled from source via the
+      # crate's `fitsio-src` feature, so no system library is needed.
+      - name: Build extension and install test dependencies
+        run: uv sync --extra test
+
+      - name: Run pytest
+        run: uv run --no-sync pytest -ra --durations=20

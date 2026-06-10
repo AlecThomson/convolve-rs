@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, cast
 
-from convolve_rs._convolve_rs import Beam as _Beam, common_beam, smooth, gauss_factor
+from convolve_rs._convolve_rs import Beam as _Beam
+from convolve_rs._convolve_rs import common_beam, gauss_factor, smooth
 
 if TYPE_CHECKING:
     from astropy.io.fits import Header
@@ -58,7 +59,11 @@ class Beam(_Beam):
         >>> hdu = fits.open("image.fits")[0]
         >>> beam = Beam.from_fits_header(hdu.header)
         """
-        return cls(cast(float, header["BMAJ"]), cast(float, header["BMIN"]), cast(float, header.get("BPA", 0.0)))
+        return cls(
+            cast("float", header["BMAJ"]),
+            cast("float", header["BMIN"]),
+            cast("float", header.get("BPA", 0.0)),
+        )
 
     @classmethod
     def from_radio_beam(cls, rb: Any) -> Beam:
@@ -83,7 +88,8 @@ class Beam(_Beam):
         >>> rb = radio_beam.Beam(10 * u.arcsec, 8 * u.arcsec, 30 * u.deg)
         >>> beam = Beam.from_radio_beam(rb)
         """
-        import astropy.units as u
+        import astropy.units as u  # noqa: PLC0415  (optional dependency, imported lazily)
+
         return cls(
             rb.major.to(u.deg).value,
             rb.minor.to(u.deg).value,
@@ -91,4 +97,4 @@ class Beam(_Beam):
         )
 
 
-__all__ = ["Beam", "common_beam", "smooth", "gauss_factor"]
+__all__ = ["Beam", "common_beam", "gauss_factor", "smooth"]
