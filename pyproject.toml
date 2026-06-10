@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "convolve-rs"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["python"]
+module-name = "convolve_rs._convolve_rs"

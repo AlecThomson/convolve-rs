@@ -6,12 +6,18 @@ edition = "2024"
 [lib]
 name = "convolve_rs"
 path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "convolvers"
 path = "src/main.rs"
 
+[features]
+python = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
 fitsio = "0.21"
 ndarray = "0.16"
 rustfft = "6"
