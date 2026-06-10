@@ -7,7 +7,7 @@ use convolve_rs::cube_io;
 ///
 /// All other tests are pure-Rust algebraic invariant checks that do not require
 /// any external binaries.
-use convolve_rs::{Beam, common_beam, fftfreq, gaussft, smooth};
+use convolve_rs::{Beam, BrightnessUnit, common_beam, fftfreq, gaussft, smooth};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 use fitsio::tables::{ColumnDataType, ColumnDescription};
@@ -95,6 +95,7 @@ fn write_test_fits(
     image: &Array2<f32>,
     beam: &Beam,
     pix_arcsec: f64,
+    bunit: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (nrows, ncols) = image.dim();
     let pix_deg = pix_arcsec / 3600.0;
@@ -124,7 +125,7 @@ fn write_test_fits(
     hdu.write_key(&mut fptr, "CTYPE1", "RA---SIN")?;
     hdu.write_key(&mut fptr, "CTYPE2", "DEC--SIN")?;
     hdu.write_key(&mut fptr, "EQUINOX", 2000.0_f64)?;
-    hdu.write_key(&mut fptr, "BUNIT", "Jy/beam")?;
+    hdu.write_key(&mut fptr, "BUNIT", bunit)?;
 
     let flat: Vec<f32> = image.iter().copied().collect();
     hdu.write_image(&mut fptr, &flat)?;
@@ -361,7 +362,16 @@ fn test_smooth_beam_area_ratio() {
     let bmin_pix = OLD_BMIN / PIX_ARCSEC;
     let image = make_gaussian_image(NROW, NCOL, bmaj_pix, bmin_pix, OLD_BPA);
 
-    let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+    let smoothed = smooth(
+        &image,
+        &old,
+        &target,
+        pix_deg,
+        pix_deg,
+        None,
+        BrightnessUnit::JyPerBeam,
+    )
+    .unwrap();
 
     let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
     let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
@@ -408,7 +418,16 @@ fn test_smooth_nan_propagation() {
         }
     }
 
-    let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+    let smoothed = smooth(
+        &image,
+        &old,
+        &target,
+        pix_deg,
+        pix_deg,
+        None,
+        BrightnessUnit::JyPerBeam,
+    )
+    .unwrap();
 
     // Pixels deep inside the NaN region (far from the valid boundary) must be NaN.
     // We check row 10 (40 pixels from the NaN/valid boundary at row 50).
@@ -503,14 +522,23 @@ fn test_smooth_matches_miriad() {
     let image = make_gaussian_image(NROW, NCOL, bmaj_pix, bmin_pix, OLD_BPA);
 
     // Write FITS
-    write_test_fits(&input_fits, &image, &old, PIX_ARCSEC).expect("write_test_fits failed");
+    write_test_fits(&input_fits, &image, &old, PIX_ARCSEC, "Jy/beam")
+        .expect("write_test_fits failed");
 
     // Run MIRIAD
     miriad_smooth(&input_fits, &miriad_fits, &target).expect("MIRIAD smooth failed");
 
     // Run Rust
-    let rust_result =
-        smooth(&image, &old, &target, pix_deg, pix_deg, None).expect("Rust smooth failed");
+    let rust_result = smooth(
+        &image,
+        &old,
+        &target,
+        pix_deg,
+        pix_deg,
+        None,
+        BrightnessUnit::JyPerBeam,
+    )
+    .expect("Rust smooth failed");
 
     // Read MIRIAD pixels
     let mir_pixels = read_fits_pixels(&miriad_fits);
@@ -545,6 +573,80 @@ fn test_smooth_matches_miriad() {
     }
 
     // Clean up
+    let _ = std::fs::remove_dir_all(&tmpdir);
+}
+
+/// Compare our Kelvin (brightness-temperature) smoothing against MIRIAD,
+/// natively: the input FITS is written with `BUNIT=K`, so MIRIAD `convol`
+/// performs a straight (surface-brightness-preserving) convolution with no
+/// Jy/beam flux scaling — exactly what [`BrightnessUnit::Kelvin`] does.
+///
+/// Skips automatically if the MIRIAD binaries are not present on the system.
+#[test]
+fn test_kelvin_matches_miriad() {
+    if !miriad_available() {
+        eprintln!("MIRIAD not found on PATH or MIRIAD_BIN, skipping test_kelvin_matches_miriad");
+        return;
+    }
+
+    let tmpdir = test_tmpdir("miriad_kelvin");
+    let input_fits = tmpdir.join("input.fits");
+    let miriad_fits = tmpdir.join("miriad.fits");
+
+    let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
+    let target = Beam::from_arcsec(TARGET_BMAJ, TARGET_BMIN, TARGET_BPA).unwrap();
+    let pix_deg = PIX_ARCSEC / 3600.0;
+
+    let bmaj_pix = OLD_BMAJ / PIX_ARCSEC;
+    let bmin_pix = OLD_BMIN / PIX_ARCSEC;
+    let image = make_gaussian_image(NROW, NCOL, bmaj_pix, bmin_pix, OLD_BPA);
+
+    // Write the image in Kelvin so MIRIAD skips its Jy/beam scaling.
+    write_test_fits(&input_fits, &image, &old, PIX_ARCSEC, "K").expect("write_test_fits failed");
+    miriad_smooth(&input_fits, &miriad_fits, &target).expect("MIRIAD smooth failed");
+
+    // Rust Kelvin smoothing: surface-brightness preserving (no flux scaling).
+    let rust_result = smooth(
+        &image,
+        &old,
+        &target,
+        pix_deg,
+        pix_deg,
+        None,
+        BrightnessUnit::Kelvin,
+    )
+    .expect("Rust smooth failed");
+
+    let mir_pixels = read_fits_pixels(&miriad_fits);
+    let rust_pixels: Vec<f32> = rust_result.into_raw_vec_and_offset().0;
+
+    assert_eq!(
+        mir_pixels.len(),
+        rust_pixels.len(),
+        "pixel count mismatch: MIRIAD {} vs Rust {}",
+        mir_pixels.len(),
+        rust_pixels.len(),
+    );
+
+    let atol = 1e-3_f32;
+    let mismatches: Vec<(usize, f32, f32)> = mir_pixels
+        .iter()
+        .zip(rust_pixels.iter())
+        .enumerate()
+        .filter(|&(_, (m, r))| (m - r).abs() > atol)
+        .map(|(i, (m, r))| (i, *m, *r))
+        .collect();
+
+    if !mismatches.is_empty() {
+        let n = mismatches.len();
+        let (idx0, m0, r0) = mismatches[0];
+        panic!(
+            "{n} pixel(s) differ by > {atol}: first at index {idx0}: \
+             MIRIAD(K)={m0:.6e} Rust(K)={r0:.6e} diff={:.6e}",
+            (m0 - r0).abs(),
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&tmpdir);
 }
 
@@ -856,7 +958,16 @@ fn test_cube_channel_beam_area_ratio() {
 
     for c in 0..CUBE_NCHAN {
         let image = make_gaussian_image(CUBE_NY, CUBE_NX, bmaj_pix, bmin_pix, CUBE_OLD_BPA);
-        let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+        let smoothed = smooth(
+            &image,
+            &old,
+            &target,
+            pix_deg,
+            pix_deg,
+            None,
+            BrightnessUnit::JyPerBeam,
+        )
+        .unwrap();
 
         let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
         let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
@@ -911,8 +1022,16 @@ fn test_cube_smoothed_matches_miriad_3d() {
 
     let atol = 1e-3_f32;
     for c in 0..CUBE_NCHAN {
-        let rust_plane =
-            smooth(&image, &old, &target, pix_deg, pix_deg, None).expect("smooth failed");
+        let rust_plane = smooth(
+            &image,
+            &old,
+            &target,
+            pix_deg,
+            pix_deg,
+            None,
+            BrightnessUnit::JyPerBeam,
+        )
+        .expect("smooth failed");
         let rust_flat: Vec<f32> = rust_plane.into_raw_vec_and_offset().0;
 
         let plane_start = c * CUBE_NY * CUBE_NX;

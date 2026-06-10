@@ -9,7 +9,7 @@ pub use beam::{Beam, BeamError, gauss_factor};
 pub use common_beam::{CommonBeamError, common_beam, find_commonbeam_between};
 pub use convolve_uv::{ConvolutionResult, ConvolveError, convolve_uv, fftfreq, gaussft};
 pub use fits_io::{FitsError, FitsImageData, output_path, read_fits, write_fits};
-pub use smooth::{SmoothError, smooth};
+pub use smooth::{BrightnessUnit, SmoothError, smooth};
 
 #[cfg(feature = "python")]
 mod python;

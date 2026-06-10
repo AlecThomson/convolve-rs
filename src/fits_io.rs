@@ -9,6 +9,7 @@ use ndarray::Array2;
 use thiserror::Error;
 
 use crate::beam::Beam;
+use crate::smooth::BrightnessUnit;
 
 #[derive(Debug, Error)]
 pub enum FitsError {
@@ -31,6 +32,8 @@ pub struct FitsImageData {
     /// |CDELT2| in degrees (y / Dec pixel size)
     pub dy_deg: f64,
     pub beam: Beam,
+    /// Brightness unit from BUNIT (defaults to Jy/beam if absent).
+    pub unit: BrightnessUnit,
     /// Full header keyword list (key, value strings) for re-writing.
     pub header_cards: Vec<(String, String)>,
 }
@@ -73,6 +76,18 @@ pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
     let beam = Beam::new(bmaj, bmin, bpa)
         .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
 
+    // Brightness unit (BUNIT); warn and default to Jy/beam when absent.
+    let unit = match hdu.read_key::<String>(&mut fptr, "BUNIT") {
+        Ok(s) => BrightnessUnit::from_bunit(&s),
+        Err(_) => {
+            tracing::warn!(
+                "No BUNIT keyword in {}; assuming Jy/beam (flux scaling applied).",
+                path.display()
+            );
+            BrightnessUnit::default()
+        }
+    };
+
     Ok(FitsImageData {
         path: path.to_path_buf(),
         image,
@@ -80,6 +95,7 @@ pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
         dx_deg,
         dy_deg,
         beam,
+        unit,
         header_cards: vec![],
     })
 }

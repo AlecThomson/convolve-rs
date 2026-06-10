@@ -7,6 +7,11 @@ name = "convolve-rs"
 requires-python = ">=3.10"
 dependencies = ["numpy"]
 dynamic = ["version"]
+authors = [{ name = "Alec Thomson" }]
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "NOTICE.md"]
+description = "Rust port of beamcon from RACS-tools: smooth FITS images and cubes to a common beam via UV-plane (FFT) convolution"
+readme = "README.md"
 
 [project.optional-dependencies]
 test = ["pytest", "radio-beam", "astropy"]

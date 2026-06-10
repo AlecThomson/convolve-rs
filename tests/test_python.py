@@ -4,7 +4,7 @@ import pytest
 import radio_beam as rb
 from astropy.io import fits
 
-from convolve_rs import Beam, common_beam
+from convolve_rs import Beam, common_beam, smooth
 
 ARCSEC = 1.0 / 3600.0  # degrees
 
@@ -203,3 +203,50 @@ class TestCommonBeam:
     def test_empty_raises(self):
         with pytest.raises(ValueError):
             common_beam([])
+
+
+# ── smooth ────────────────────────────────────────────────────────────────────
+
+
+class TestSmooth:
+    """Flux-scaling behaviour of smooth() for different brightness units."""
+
+    OLD = Beam(10 * ARCSEC, 10 * ARCSEC, 0.0)
+    NEW = Beam(20 * ARCSEC, 20 * ARCSEC, 0.0)
+    PIX = 2.5 * ARCSEC
+
+    def _flat(self):
+        return np.ones((32, 32), dtype=np.float32)
+
+    def test_default_is_jy_per_beam(self):
+        # Convolving a flat Jy/beam image scales it by Ω_new/Ω_old = 4.
+        out = smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX)
+        assert out[16, 16] == pytest.approx(4.0, abs=1e-3)
+
+    def test_explicit_jy_per_beam(self):
+        out = smooth(
+            self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="Jy/beam"
+        )
+        assert out[16, 16] == pytest.approx(4.0, abs=1e-3)
+
+    def test_kelvin_conserves_surface_brightness(self):
+        # Brightness temperature: a flat image stays flat (no flux scaling).
+        out = smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="K")
+        assert out[16, 16] == pytest.approx(1.0, abs=1e-3)
+
+    def test_unrecognised_bunit_warns_and_assumes_jy_per_beam(self):
+        with pytest.warns(UserWarning, match="Could not determine brightness unit"):
+            out = smooth(
+                self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="furlongs"
+            )
+        assert out[16, 16] == pytest.approx(4.0, abs=1e-3)
+
+    def test_recognised_bunit_does_not_warn(self):
+        import warnings  # noqa: PLC0415
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="K")
+            smooth(
+                self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="Jy/beam"
+            )

@@ -5,6 +5,11 @@ name = "convolve-rs"
 # wheel/sdist version follows automatically.
 version = "0.0.0"
 edition = "2024"
+authors = ["Alec Thomson"]
+license = "BSD-3-Clause"
+description = "Rust port of beamcon from RACS-tools: smooth FITS images and cubes to a common beam via UV-plane (FFT) convolution"
+repository = "https://github.com/alecthomson/convolve-rs"
+readme = "README.md"
 
 [lib]
 name = "convolve_rs"
