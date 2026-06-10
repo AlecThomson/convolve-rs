@@ -20,7 +20,8 @@ use convolve_rs::{
 #[derive(Parser)]
 #[command(
     name = "convolvers",
-    about = "Convolve FITS images/cubes to a common beam"
+    about = "Convolve FITS images/cubes to a common beam",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
