@@ -4,6 +4,7 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods, gen_stub_pyfunction};
 
 use crate::beam::{gauss_factor as rust_gauss_factor, Beam};
 use crate::common_beam::common_beam as rust_common_beam;
@@ -26,12 +27,14 @@ use crate::smooth::smooth as rust_smooth;
 ///     Beam.from_arcsec: Construct from arcsecond axes.
 ///     Beam.from_fits_header: Construct from an astropy FITS header.
 ///     Beam.from_radio_beam: Construct from a ``radio_beam.Beam`` object.
+#[gen_stub_pyclass]
 #[pyclass(name = "Beam", subclass)]
 #[derive(Clone)]
 pub struct PyBeam {
     pub inner: Beam,
 }
 
+#[gen_stub_pymethods]
 #[pymethods]
 impl PyBeam {
     #[new]
@@ -171,6 +174,7 @@ impl PyBeam {
 ///
 /// Raises:
 ///     ValueError: If ``beams`` is empty or no valid common beam is found.
+#[gen_stub_pyfunction]
 #[pyfunction]
 #[pyo3(signature = (beams, tolerance=1e-4, nsamps=200, epsilon=5e-4))]
 fn common_beam(
@@ -210,6 +214,7 @@ fn common_beam(
 /// Raises:
 ///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
 ///         are NaN, or the kernel exceeds ``cutoff_arcsec``.
+#[gen_stub_pyfunction]
 #[pyfunction]
 #[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None))]
 fn smooth<'py>(
@@ -223,7 +228,7 @@ fn smooth<'py>(
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let owned = image.as_array().to_owned();
     rust_smooth(&owned, &old_beam.inner, &new_beam.inner, dx_deg, dy_deg, cutoff_arcsec)
-        .map(|arr| arr.into_pyarray_bound(py))
+        .map(|arr| arr.into_pyarray(py))
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
@@ -244,6 +249,7 @@ fn smooth<'py>(
 ///         ``fac`` is the pixel scaling factor, ``amp`` is the Gaussian kernel
 ///         integral, and the remaining three are the output beam parameters
 ///         (major/minor FWHM in arcseconds, PA in degrees).
+#[gen_stub_pyfunction]
 #[pyfunction]
 fn gauss_factor(
     conv_beam: &PyBeam,
@@ -253,6 +259,8 @@ fn gauss_factor(
 ) -> (f64, f64, f64, f64, f64) {
     rust_gauss_factor(&conv_beam.inner, &orig_beam.inner, dx_arcsec, dy_arcsec)
 }
+
+pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
 #[pymodule]
 pub fn _convolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
