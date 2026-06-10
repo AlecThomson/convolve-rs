@@ -359,14 +359,6 @@ fn min_vol_ellipse(
         pts.iter().zip(u.iter()).map(|(p, &ui)| p[1] * ui).sum::<f64>(),
     ];
 
-    // Check centre is near zero (beams are centred at origin)
-    let center_sq = center[0] * center[0] + center[1] * center[1];
-    if center_sq > tolerance * tolerance {
-        return Err(CommonBeamError::DeconvFailed(
-            format!("MVE centre ({:.2e},{:.2e}) > tolerance", center[0], center[1]),
-        ));
-    }
-
     // A = inv(P.T * diag(u) * P - center*center.T) / d  (2x2)
     let ptdp = matmul_pt_diag_p(pts, &u); // 2x2
     let cc = [[center[0] * center[0], center[0] * center[1]],

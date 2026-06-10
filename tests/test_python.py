@@ -163,6 +163,19 @@ class TestCommonBeam:
         for b in beams:
             result.deconvolve(b)  # must not raise
 
+    def test_circular_plus_symmetric_elongated(self):
+        # Circular beam + two elongated beams at equal and opposite PAs.
+        # Both implementations find a valid common beam but the iterative MVE
+        # algorithm can converge to slightly different solutions, so we check
+        # correctness properties rather than exact numerical agreement.
+        beams = [Beam(10, 10, 0), Beam(20, 10, 30), Beam(20, 10, -30)]
+        result = common_beam(beams)
+        # Must be larger than the largest input beam
+        assert result.major_deg >= max(b.major_deg for b in beams)
+        # Must contain every input beam
+        for b in beams:
+            result.deconvolve(b)  # must not raise
+
     def test_empty_raises(self):
         with pytest.raises(ValueError):
             common_beam([])
