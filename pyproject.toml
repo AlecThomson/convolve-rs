@@ -80,6 +80,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests deliberately assert on broad ValueError raised from the Rust layer.
 "tests/**" = ["PT011"]
+"scripts/**" = ["T201", ]
 
 [tool.maturin]
 features = ["python"]

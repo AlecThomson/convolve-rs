@@ -8,6 +8,7 @@ Gaussian noise so the convolution does real work.
 Usage:
     python make_dummy_fits.py --n 20 --size 2048 --outdir bench_data
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,19 +19,20 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 
-def make_header(size: int, pix_deg: float, bmaj_deg: float,
-                bmin_deg: float, bpa_deg: float) -> fits.Header:
+def make_header(
+    size: int, pix_deg: float, bmaj_deg: float, bmin_deg: float, bpa_deg: float
+) -> fits.Header:
     w = WCS(naxis=2)
     w.wcs.crpix = [size / 2, size / 2]
-    w.wcs.cdelt = [-pix_deg, pix_deg]          # RA decreases with x
-    w.wcs.crval = [180.0, -45.0]               # arbitrary field centre
+    w.wcs.cdelt = [-pix_deg, pix_deg]  # RA decreases with x
+    w.wcs.crval = [180.0, -45.0]  # arbitrary field centre
     w.wcs.ctype = ["RA---SIN", "DEC--SIN"]
     w.wcs.cunit = ["deg", "deg"]
     hdr = w.to_header()
     hdr["BUNIT"] = "Jy/beam"
-    hdr["BMAJ"] = bmaj_deg                      # degrees, FITS convention
+    hdr["BMAJ"] = bmaj_deg  # degrees, FITS convention
     hdr["BMIN"] = bmin_deg
-    hdr["BPA"] = bpa_deg                        # degrees
+    hdr["BPA"] = bpa_deg  # degrees
     return hdr
 
 
@@ -39,7 +41,7 @@ def make_data(size: int, n_sources: int, rng: np.random.Generator) -> np.ndarray
     ys = rng.integers(0, size, n_sources)
     xs = rng.integers(0, size, n_sources)
     amps = rng.uniform(0.1, 10.0, n_sources).astype(np.float32)
-    data[ys, xs] += amps                        # delta-function point sources
+    data[ys, xs] += amps  # delta-function point sources
     return data
 
 
@@ -67,10 +69,14 @@ def main() -> None:
         data = make_data(args.size, args.sources, rng)
         path = args.outdir / f"dummy_{i:04d}.fits"
         fits.writeto(path, data, hdr, overwrite=True)
-        print(f"wrote {path}  bmaj={bmaj*3600:.2f}\" bmin={bmin*3600:.2f}\" bpa={bpa:.1f}")
+        print(
+            f'wrote {path}  bmaj={bmaj * 3600:.2f}" bmin={bmin * 3600:.2f}" bpa={bpa:.1f}'
+        )
 
     total_mb = args.n * args.size * args.size * 4 / 1e6
-    print(f"\n{args.n} images, {args.size}x{args.size}, ~{total_mb:.0f} MB total in {args.outdir}/")
+    print(
+        f"\n{args.n} images, {args.size}x{args.size}, ~{total_mb:.0f} MB total in {args.outdir}/"
+    )
 
 
 if __name__ == "__main__":

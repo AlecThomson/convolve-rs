@@ -269,9 +269,12 @@ fn rfft2(data: &[f64], nrows: usize, ncols: usize) -> Vec<Complex<f64>> {
     let mut spectrum = vec![Complex::new(0.0, 0.0); nrows * nhalf];
     for (i, chunk) in data.chunks(ncols).enumerate() {
         inrow.copy_from_slice(chunk);
-        r2c.process_with_scratch(&mut inrow, &mut spectrum[i * nhalf..(i + 1) * nhalf],
-                                 &mut scratch)
-            .expect("r2c FFT");
+        r2c.process_with_scratch(
+            &mut inrow,
+            &mut spectrum[i * nhalf..(i + 1) * nhalf],
+            &mut scratch,
+        )
+        .expect("r2c FFT");
     }
 
     // Column-wise complex FFT over the `nhalf` columns (gather, process, scatter).
@@ -323,9 +326,12 @@ fn irfft2(mut spectrum: Vec<Complex<f64>>, nrows: usize, ncols: usize) -> Vec<f6
         if even {
             inrow[nhalf - 1].im = 0.0;
         }
-        c2r.process_with_scratch(&mut inrow, &mut out[i * ncols..(i + 1) * ncols],
-                                 &mut scratch)
-            .expect("c2r FFT");
+        c2r.process_with_scratch(
+            &mut inrow,
+            &mut out[i * ncols..(i + 1) * ncols],
+            &mut scratch,
+        )
+        .expect("c2r FFT");
     }
 
     let norm = (nrows * ncols) as f64;
@@ -353,8 +359,10 @@ mod tests {
     #[test]
     fn test_rfft2_irfft2_roundtrip() {
         // Use even dimensions to exercise the Nyquist handling in irfft2.
-        let data = vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
-                        9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
+        let data = vec![
+            1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ];
         let (nrows, ncols) = (4, 4);
         let spectrum = rfft2(&data, nrows, ncols);
         let recovered = irfft2(spectrum, nrows, ncols);
