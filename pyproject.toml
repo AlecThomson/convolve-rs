@@ -8,6 +8,12 @@ requires-python = ">=3.9"
 dependencies = ["numpy"]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+test = ["pytest", "radio-beam", "astropy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.maturin]
 features = ["python"]
 module-name = "convolve_rs._convolve_rs"
