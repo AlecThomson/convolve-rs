@@ -17,7 +17,7 @@ pip install convolve-rs
 Requires [Rust](https://rustup.rs/) 1.85+.
 
 ```sh
-cargo install --path .
+cargo install convolve-rs
 ```
 
 ## Python usage
