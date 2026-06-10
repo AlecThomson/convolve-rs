@@ -140,15 +140,15 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         .iter()
         .map(|f| {
             let data = read_fits(f).with_context(|| format!("reading {}", f.display()))?;
-            if let Some(cutoff) = args.shared.cutoff {
-                if data.beam.major_arcsec() > cutoff {
-                    warn!(
-                        "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
-                        f.display(),
-                        data.beam.major_arcsec(),
-                        cutoff
-                    );
-                }
+            if let Some(cutoff) = args.shared.cutoff
+                && data.beam.major_arcsec() > cutoff
+            {
+                warn!(
+                    "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
+                    f.display(),
+                    data.beam.major_arcsec(),
+                    cutoff
+                );
             }
             Ok(data.beam)
         })
@@ -393,15 +393,15 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                     }
                 };
 
-                if let Some(cutoff) = args.shared.cutoff {
-                    if old_beam.major_arcsec() > cutoff {
-                        warn!(
-                            "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                            old_beam.major_arcsec()
-                        );
-                        pb.inc(1);
-                        return Ok(Some(Array2::from_elem((meta.ny, meta.nx), f32::NAN)));
-                    }
+                if let Some(cutoff) = args.shared.cutoff
+                    && old_beam.major_arcsec() > cutoff
+                {
+                    warn!(
+                        "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
+                        old_beam.major_arcsec()
+                    );
+                    pb.inc(1);
+                    return Ok(Some(Array2::from_elem((meta.ny, meta.nx), f32::NAN)));
                 }
 
                 let plane = cube_io::read_channel(file, c, meta)

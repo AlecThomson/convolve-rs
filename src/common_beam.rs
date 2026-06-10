@@ -49,10 +49,10 @@ pub fn common_beam(
         return Ok(largest);
     }
 
-    if beams.len() == 2 {
-        if let Ok(b) = find_commonbeam_between(&beams[0], &beams[1]) {
-            return Ok(b);
-        }
+    if beams.len() == 2
+        && let Ok(b) = find_commonbeam_between(&beams[0], &beams[1])
+    {
+        return Ok(b);
     }
 
     common_manybeams_mve(beams, tolerance, nsamps, epsilon)

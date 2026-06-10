@@ -37,10 +37,10 @@ pub fn convolve_uv(
     cutoff_arcsec: Option<f64>,
 ) -> Result<ConvolutionResult, ConvolveError> {
     // Cutoff check.
-    if let Some(cutoff) = cutoff_arcsec {
-        if old_beam.major_arcsec() > cutoff {
-            return Err(ConvolveError::AboveCutoff);
-        }
+    if let Some(cutoff) = cutoff_arcsec
+        && old_beam.major_arcsec() > cutoff
+    {
+        return Err(ConvolveError::AboveCutoff);
     }
 
     // Beams identical → no-op with unit scaling.
