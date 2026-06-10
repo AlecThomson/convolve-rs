@@ -1,12 +1,29 @@
-/// Radio astronomy beam (PSF) represented as a 2D Gaussian.
-///
-/// All stored values use FITS conventions: major/minor FWHM in degrees, PA in degrees.
-/// The MIRIAD gaupar.for algorithms are used for deconvolution and convolution.
+//! Radio astronomy beam (PSF) represented as a 2D elliptical Gaussian.
+//!
+//! All stored values use FITS conventions: major/minor FWHM in degrees, PA in
+//! degrees East of North.
+//!
+//! The beam algebra (convolution, deconvolution, and the Jy/beam flux-scaling
+//! factor) is implemented here from the standard second-moment / covariance
+//! formulation of an elliptical Gaussian:
+//!
+//!   * An elliptical Gaussian is described by a symmetric 2×2 covariance matrix
+//!     `C` in (East, North) axes. Its eigenvalues are the squared axis lengths
+//!     and its eigenvectors give the orientation.
+//!   * Convolving two Gaussians **adds** their covariance matrices; deconvolving
+//!     **subtracts** them (valid only while the residual stays positive-definite).
+//!   * The integral of a 2D Gaussian is proportional to `sqrt(det C)`, which
+//!     yields the peak-amplitude / flux-rescaling factor as a ratio of
+//!     determinants.
+//!
+//! These are textbook results for combining Gaussian point-spread functions (see
+//! Wild 1970, *Aust. J. Phys.* 23, 113, for the radio-astronomy form). The same
+//! standard formulae underpin `radio_beam` and RACS-tools; this module is an
+//! independent implementation in terms of the covariance matrix and its
+//! eigendecomposition.
 use std::fmt;
 
 use thiserror::Error;
-
-const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Beam {
@@ -26,6 +43,86 @@ pub enum BeamError {
     InvalidAxes { major: f64, minor: f64 },
     #[error("beam is not finite (NaN or infinite values)")]
     NotFinite,
+}
+
+/// Symmetric 2×2 covariance matrix `[[xx, xy], [xy, yy]]` of an elliptical
+/// Gaussian, expressed in (East = x, North = y) axes.
+///
+/// The matrix entries carry units of (axis length)², so a beam given in degrees
+/// produces a covariance in deg² and one given in arcsec produces arcsec². Beam
+/// operations are linear in this representation: convolution is matrix addition,
+/// deconvolution is subtraction, and the axis lengths / position angle are the
+/// eigen-pairs.
+#[derive(Debug, Clone, Copy)]
+struct Cov {
+    xx: f64,
+    yy: f64,
+    xy: f64,
+}
+
+impl Cov {
+    /// Build the covariance of a Gaussian with the given FWHM axes and position
+    /// angle (radians, East of North). The major axis points along
+    /// `(sin θ, cos θ)` and the minor along `(cos θ, −sin θ)`.
+    fn from_axes(major: f64, minor: f64, pa_rad: f64) -> Self {
+        let (sin, cos) = pa_rad.sin_cos();
+        let a2 = major * major;
+        let b2 = minor * minor;
+        Self {
+            xx: a2 * sin * sin + b2 * cos * cos,
+            yy: a2 * cos * cos + b2 * sin * sin,
+            xy: (a2 - b2) * sin * cos,
+        }
+    }
+
+    fn add(&self, other: &Cov) -> Cov {
+        Cov {
+            xx: self.xx + other.xx,
+            yy: self.yy + other.yy,
+            xy: self.xy + other.xy,
+        }
+    }
+
+    fn sub(&self, other: &Cov) -> Cov {
+        Cov {
+            xx: self.xx - other.xx,
+            yy: self.yy - other.yy,
+            xy: self.xy - other.xy,
+        }
+    }
+
+    fn det(&self) -> f64 {
+        self.xx * self.yy - self.xy * self.xy
+    }
+
+    /// Eigenvalues `(larger, smaller)` — the squared major and minor axis lengths.
+    fn eigenvalues(&self) -> (f64, f64) {
+        let mean = 0.5 * (self.xx + self.yy);
+        // Half the spread of the eigenvalues about their mean.
+        let radius = 0.5 * (self.xx - self.yy).hypot(2.0 * self.xy);
+        (mean + radius, mean - radius)
+    }
+
+    /// Position angle of the major axis in radians, East of North, folded into
+    /// `(−π/2, π/2]`. A circular (degenerate) covariance has no defined
+    /// orientation and returns 0.
+    fn position_angle(&self) -> f64 {
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let off_diag = self.xx - self.yy;
+        let two_xy = 2.0 * self.xy;
+        // Circular to machine precision → orientation undefined.
+        if off_diag.hypot(two_xy) <= f64::EPSILON * (self.xx + self.yy).abs() {
+            return 0.0;
+        }
+        // Principal-axis angle. The eigenvector of the larger eigenvalue makes
+        // angle ½·atan2(2·xy, xx−yy) with the East (x) axis; converting to a
+        // North-referenced PA gives π/2 minus that.
+        let mut pa = FRAC_PI_2 - 0.5 * two_xy.atan2(off_diag);
+        if pa > FRAC_PI_2 {
+            pa -= PI;
+        }
+        pa
+    }
 }
 
 impl Beam {
@@ -92,10 +189,16 @@ impl Beam {
         self.major_deg.to_radians() * self.minor_deg.to_radians() * fwhm_to_area
     }
 
+    /// Covariance matrix of this beam (entries in deg²).
+    fn cov_deg(&self) -> Cov {
+        Cov::from_axes(self.major_deg, self.minor_deg, self.pa_deg.to_radians())
+    }
+
     /// Deconvolve `other` from `self` (i.e. `self` = result ⊛ `other`).
     ///
-    /// Implements MIRIAD gaupar.for GauDfac by R. Sault.
-    /// Inputs/outputs in degrees. PA returned in radians, then converted.
+    /// Subtracts the covariance of `other` from that of `self` and reads off the
+    /// residual ellipse. Fails if the residual is not positive-definite (the
+    /// source beam is not larger than the PSF). Inputs/outputs in degrees.
     pub fn deconvolve(&self, other: &Beam) -> Result<Beam, BeamError> {
         let (new_major, new_minor, new_pa_rad) = deconvolve_deg(
             self.major_deg,
@@ -106,11 +209,10 @@ impl Beam {
             other.pa_deg,
             false,
         )?;
-        let pa_deg = new_pa_rad.to_degrees();
         Ok(Beam {
             major_deg: new_major,
             minor_deg: new_minor,
-            pa_deg,
+            pa_deg: new_pa_rad.to_degrees(),
         })
     }
 
@@ -122,41 +224,15 @@ impl Beam {
         }
     }
 
-    /// Convolve `self` with `other`. Implements MIRIAD gaupar.for GauCvl.
+    /// Convolve `self` with `other`: sum the covariance matrices and read off the
+    /// resulting ellipse.
     pub fn convolve(&self, other: &Beam) -> Beam {
-        let pa1 = self.pa_deg * DEG2RAD;
-        let pa2 = other.pa_deg * DEG2RAD;
-
-        let alpha = (self.major_deg * pa1.cos()).powi(2)
-            + (self.minor_deg * pa1.sin()).powi(2)
-            + (other.major_deg * pa2.cos()).powi(2)
-            + (other.minor_deg * pa2.sin()).powi(2);
-
-        let beta = (self.major_deg * pa1.sin()).powi(2)
-            + (self.minor_deg * pa1.cos()).powi(2)
-            + (other.major_deg * pa2.sin()).powi(2)
-            + (other.minor_deg * pa2.cos()).powi(2);
-
-        let gamma = 2.0
-            * ((self.minor_deg.powi(2) - self.major_deg.powi(2)) * pa1.sin() * pa1.cos()
-                + (other.minor_deg.powi(2) - other.major_deg.powi(2)) * pa2.sin() * pa2.cos());
-
-        let s = alpha + beta;
-        let t = ((alpha - beta).powi(2) + gamma.powi(2)).sqrt();
-
-        let new_major = (0.5 * (s + t)).sqrt();
-        let new_minor = (0.5 * (s - t).max(0.0)).sqrt();
-
-        let pa_rad = if (gamma.abs() + (alpha - beta).abs()).sqrt() < 1e-7 / 3600.0 {
-            0.0_f64
-        } else {
-            0.5 * (-gamma).atan2(alpha - beta)
-        };
-
+        let combined = self.cov_deg().add(&other.cov_deg());
+        let (lam_major, lam_minor) = combined.eigenvalues();
         Beam {
-            major_deg: new_major,
-            minor_deg: new_minor,
-            pa_deg: pa_rad.to_degrees(),
+            major_deg: lam_major.max(0.0).sqrt(),
+            minor_deg: lam_minor.max(0.0).sqrt(),
+            pa_deg: combined.position_angle().to_degrees(),
         }
     }
 
@@ -194,9 +270,13 @@ impl PartialEq for Beam {
     }
 }
 
-/// MIRIAD GauDfac: deconvolve beam2 from beam1 (all params in degrees, PA returns radians).
+/// Deconvolve beam 2 from beam 1 by subtracting covariance matrices.
 ///
-/// Returns `(new_major_deg, new_minor_deg, new_pa_rad)`.
+/// All axis inputs in degrees, PAs in degrees; the returned PA is in radians.
+/// Returns `(new_major_deg, new_minor_deg, new_pa_rad)`. If the residual
+/// covariance is not positive-definite the beams cannot be deconvolved: this is
+/// either a `DeconvolveFailed` error or, when `failure_returns_zero` is set, a
+/// zero result.
 pub(crate) fn deconvolve_deg(
     maj1: f64,
     min1: f64,
@@ -206,103 +286,67 @@ pub(crate) fn deconvolve_deg(
     pa2_deg: f64,
     failure_returns_zero: bool,
 ) -> Result<(f64, f64, f64), BeamError> {
-    let pa1 = pa1_deg * DEG2RAD;
-    let pa2 = pa2_deg * DEG2RAD;
+    let residual = Cov::from_axes(maj1, min1, pa1_deg.to_radians())
+        .sub(&Cov::from_axes(maj2, min2, pa2_deg.to_radians()));
+    let (lam_major, lam_minor) = residual.eigenvalues();
 
-    let alpha = (maj1 * pa1.cos()).powi(2) + (min1 * pa1.sin()).powi(2)
-        - (maj2 * pa2.cos()).powi(2)
-        - (min2 * pa2.sin()).powi(2);
-
-    let beta = (maj1 * pa1.sin()).powi(2) + (min1 * pa1.cos()).powi(2)
-        - (maj2 * pa2.sin()).powi(2)
-        - (min2 * pa2.cos()).powi(2);
-
-    let gamma = 2.0
-        * ((min1.powi(2) - maj1.powi(2)) * pa1.sin() * pa1.cos()
-            - (min2.powi(2) - maj2.powi(2)) * pa2.sin() * pa2.cos());
-
-    let s = alpha + beta;
-    let t = ((alpha - beta).powi(2) + gamma.powi(2)).sqrt();
-
-    let atol_t = f64::EPSILON / 3600.0_f64.powi(2);
-    let alpha_fail = alpha + f64::EPSILON < 0.0;
-    let beta_fail = beta + f64::EPSILON < 0.0;
-    let st_fail = s < t + atol_t;
-
-    if alpha_fail || beta_fail || st_fail {
+    // The residual must be positive-(semi)definite to correspond to a real
+    // ellipse: both diagonal variances and the smaller eigenvalue stay ≥ 0. The
+    // floor on the smaller eigenvalue also rejects the point-source limit
+    // (deconvolving a beam from itself).
+    let eps = f64::EPSILON;
+    let lam_floor = eps / (2.0 * 3600.0_f64.powi(2));
+    if residual.xx + eps < 0.0 || residual.yy + eps < 0.0 || lam_minor < lam_floor {
         if failure_returns_zero {
             return Ok((0.0, 0.0, 0.0));
         }
         return Err(BeamError::DeconvolveFailed);
     }
 
-    let new_major = (0.5 * (s + t)).sqrt() + f64::EPSILON;
-    let new_minor = (0.5 * (s - t)).sqrt() + f64::EPSILON;
-
-    let atol = 1e-7 / 3600.0;
-    let new_pa = if (gamma.abs() + (alpha - beta).abs()).sqrt() < atol {
-        0.0_f64
-    } else {
-        0.5 * (-gamma).atan2(alpha - beta)
-    };
-
-    Ok((new_major, new_minor, new_pa))
+    Ok((
+        lam_major.sqrt(),
+        lam_minor.max(0.0).sqrt(),
+        residual.position_angle(),
+    ))
 }
 
-/// MIRIAD gaufac: scaling factor for Jy/beam images after convolution.
+/// Flux-scaling factor for Jy/beam images after convolution to a larger beam.
 ///
-/// `conv_beam` and `orig_beam` axes in arcsec, PA in degrees.
-/// `dx_arcsec`, `dy_arcsec` are pixel sizes in arcsec.
+/// `conv_beam` is the convolving (difference) beam and `orig_beam` the original
+/// restoring beam; both axes in arcsec, PA in degrees. `dx_arcsec`, `dy_arcsec`
+/// are the pixel sizes in arcsec.
 ///
-/// Returns `(fac, amp, result_bmaj, result_bmin, result_bpa_deg)`.
+/// The peak amplitude of the convolving Gaussian needed to preserve Jy/beam
+/// units is `π/(4 ln 2) · √(det C_orig · det C_conv / det(C_orig + C_conv))`,
+/// since the integral of a 2D Gaussian scales as `√det` of its covariance. The
+/// returned factor rescales pixel values by the pixel area over that amplitude.
+///
+/// Returns `(fac, amp, result_bmaj_arcsec, result_bmin_arcsec, result_bpa_deg)`.
 pub fn gauss_factor(
     conv_beam: &Beam,
     orig_beam: &Beam,
     dx_arcsec: f64,
     dy_arcsec: f64,
 ) -> (f64, f64, f64, f64, f64) {
-    let bmaj2 = conv_beam.major_arcsec();
-    let bmin2 = conv_beam.minor_arcsec();
-    let bpa2 = conv_beam.pa_deg * DEG2RAD;
+    let c_orig = Cov::from_axes(
+        orig_beam.major_arcsec(),
+        orig_beam.minor_arcsec(),
+        orig_beam.pa_deg.to_radians(),
+    );
+    let c_conv = Cov::from_axes(
+        conv_beam.major_arcsec(),
+        conv_beam.minor_arcsec(),
+        conv_beam.pa_deg.to_radians(),
+    );
+    let combined = c_orig.add(&c_conv);
 
-    let bmaj1 = orig_beam.major_arcsec();
-    let bmin1 = orig_beam.minor_arcsec();
-    let bpa1 = orig_beam.pa_deg * DEG2RAD;
+    let (lam_major, lam_minor) = combined.eigenvalues();
+    let bmaj_out = lam_major.max(0.0).sqrt();
+    let bmin_out = lam_minor.max(0.0).sqrt();
+    let bpa_out_rad = combined.position_angle();
 
-    let cospa1 = bpa1.cos();
-    let sinpa1 = bpa1.sin();
-    let cospa2 = bpa2.cos();
-    let sinpa2 = bpa2.sin();
-
-    let alpha = (bmaj1 * cospa1).powi(2)
-        + (bmin1 * sinpa1).powi(2)
-        + (bmaj2 * cospa2).powi(2)
-        + (bmin2 * sinpa2).powi(2);
-
-    let beta = (bmaj1 * sinpa1).powi(2)
-        + (bmin1 * cospa1).powi(2)
-        + (bmaj2 * sinpa2).powi(2)
-        + (bmin2 * cospa2).powi(2);
-
-    let gamma = 2.0
-        * ((bmin1.powi(2) - bmaj1.powi(2)) * sinpa1 * cospa1
-            + (bmin2.powi(2) - bmaj2.powi(2)) * sinpa2 * cospa2);
-
-    let s = alpha + beta;
-    let t = ((alpha - beta).powi(2) + gamma.powi(2)).sqrt();
-
-    let bmaj_out = (0.5 * (s + t)).sqrt();
-    let bmin_out = (0.5 * (s - t).max(0.0)).sqrt();
-
-    let bpa_out_rad = if (gamma.abs() + (alpha - beta).abs()) == 0.0 {
-        0.0_f64
-    } else {
-        0.5 * (-gamma).atan2(alpha - beta)
-    };
-
-    let denom = (alpha * beta - 0.25 * gamma.powi(2)).sqrt();
-    let amp = std::f64::consts::PI / (4.0 * 2_f64.ln()) * bmaj1 * bmin1 * bmaj2 * bmin2 / denom;
-
+    let amp = std::f64::consts::PI / (4.0 * 2_f64.ln())
+        * (c_orig.det() * c_conv.det() / combined.det()).sqrt();
     let fac = dx_arcsec.abs() * dy_arcsec.abs() / amp;
 
     (fac, amp, bmaj_out, bmin_out, bpa_out_rad.to_degrees())
