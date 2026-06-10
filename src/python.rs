@@ -111,7 +111,8 @@ impl PyBeam {
 
     /// Deconvolve ``other`` from ``self`` (i.e. ``self`` = result ⊛ ``other``).
     ///
-    /// Uses the MIRIAD GauDfac algorithm (R. Sault).
+    /// Subtracts the Gaussian covariance matrices and reads off the residual
+    /// ellipse (Wild 1970).
     ///
     /// Args:
     ///     other (Beam): The PSF to deconvolve from this beam.
@@ -131,7 +132,8 @@ impl PyBeam {
 
     /// Convolve ``self`` with ``other``.
     ///
-    /// Uses the MIRIAD GauCvl algorithm (R. Sault).
+    /// Adds the Gaussian covariance matrices and reads off the resulting
+    /// ellipse (Wild 1970).
     ///
     /// Args:
     ///     other (Beam): The beam to convolve with.
@@ -242,7 +244,7 @@ fn smooth<'py>(
     .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Compute the MIRIAD ``gaufac`` flux-scaling factor for a Jy/beam convolution.
+/// Compute the flux-scaling factor for a Jy/beam convolution.
 ///
 /// Returns the factor by which pixel values must be multiplied after
 /// convolving a Jy/beam image from ``orig_beam`` to ``conv_beam``.

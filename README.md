@@ -64,3 +64,14 @@ uv run python -c "from convolve_rs._convolve_rs import _generate_stubs; _generat
 ```
 
 This overwrites `convolve_rs/_convolve_rs.pyi` from the Rust annotations and docstrings. Commit the result alongside any API changes.
+
+## License
+
+convolve-rs is released under the [BSD 3-Clause License](LICENSE).
+
+It draws on prior work in the radio-astronomy community: the UV-plane convolution
+and cube handling are ported from [RACS-tools](https://github.com/alecthomson/RACS-tools)
+(BSD), and the common-beam computation follows [radio_beam](https://github.com/radio-astro-tools/radio-beam)
+(BSD). The Gaussian beam algebra is an independent implementation of standard
+formulae (Wild 1970) — [MIRIAD](https://github.com/csiro/miriad) is used only as a validation reference in the test suite. See
+[NOTICE.md](NOTICE.md) for full attributions.
