@@ -162,15 +162,18 @@ def gauss_factor(conv_beam: Beam, orig_beam: Beam, dx_arcsec: builtins.float, dy
             (major/minor FWHM in arcseconds, PA in degrees).
     """
 
-def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None) -> numpy.typing.NDArray[numpy.float32]:
+def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> numpy.typing.NDArray[numpy.float32]:
     r"""
-    Smooth a Jy/beam image from ``old_beam`` to ``new_beam``.
+    Smooth an image from ``old_beam`` to ``new_beam``.
     
-    Convolves ``image`` in the UV plane and applies the Jy/beam flux scaling
-    factor so that the output is in the same units as the input.
+    Convolves ``image`` in the UV plane and applies the flux scaling
+    appropriate for ``bunit`` so that the output is in the same units as the
+    input: Jy/beam images get the Gaussian beam-area factor, Kelvin
+    (brightness temperature) images conserve surface brightness and are left
+    unscaled.
     
     Args:
-        image (numpy.ndarray): Input image in Jy/beam, shape ``(ny, nx)``,
+        image (numpy.ndarray): Input image, shape ``(ny, nx)``,
             dtype ``float32``.
         old_beam (Beam): Current (input) restoring beam.
         new_beam (Beam): Target (output) restoring beam. Must be larger than
@@ -181,13 +184,21 @@ def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam:
             (FITS CDELT2).
         cutoff_arcsec (float, optional): If given, raise ``ValueError`` if the
             deconvolved kernel FWHM exceeds this value in arcseconds.
+        bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
+            Kelvin (e.g. ``"K"``), surface brightness is conserved and no flux
+            scaling is applied; if it denotes Jy/beam, the Gaussian
+            flux-scaling factor is applied. An unrecognised string emits a
+            ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
     
     Returns:
-        numpy.ndarray: Smoothed image in Jy/beam, shape ``(ny, nx)``,
-            dtype ``float32``.
+        numpy.ndarray: Smoothed image, shape ``(ny, nx)``, dtype ``float32``.
     
     Raises:
         ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
             are NaN, or the kernel exceeds ``cutoff_arcsec``.
+    
+    Warns:
+        UserWarning: If ``bunit`` is given but not recognised as either a
+            Kelvin or Jy/beam unit (Jy/beam is then assumed).
     """
 

@@ -1,7 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 #[cfg(feature = "stubgen")]
@@ -194,13 +194,16 @@ fn common_beam(
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-/// Smooth a Jy/beam image from ``old_beam`` to ``new_beam``.
+/// Smooth an image from ``old_beam`` to ``new_beam``.
 ///
-/// Convolves ``image`` in the UV plane and applies the Jy/beam flux scaling
-/// factor so that the output is in the same units as the input.
+/// Convolves ``image`` in the UV plane and applies the flux scaling
+/// appropriate for ``bunit`` so that the output is in the same units as the
+/// input: Jy/beam images get the Gaussian beam-area factor, Kelvin
+/// (brightness temperature) images conserve surface brightness and are left
+/// unscaled.
 ///
 /// Args:
-///     image (numpy.ndarray): Input image in Jy/beam, shape ``(ny, nx)``,
+///     image (numpy.ndarray): Input image, shape ``(ny, nx)``,
 ///         dtype ``float32``.
 ///     old_beam (Beam): Current (input) restoring beam.
 ///     new_beam (Beam): Target (output) restoring beam. Must be larger than
@@ -212,9 +215,10 @@ fn common_beam(
 ///     cutoff_arcsec (float, optional): If given, raise ``ValueError`` if the
 ///         deconvolved kernel FWHM exceeds this value in arcseconds.
 ///     bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
-///         Kelvin (brightness temperature), the flux-scaling factor is 1 and
-///         the data is left unscaled; otherwise Jy/beam scaling is applied.
-///         Defaults to Jy/beam.
+///         Kelvin (e.g. ``"K"``), surface brightness is conserved and no flux
+///         scaling is applied; if it denotes Jy/beam, the Gaussian
+///         flux-scaling factor is applied. An unrecognised string emits a
+///         ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
 ///
 /// Returns:
 ///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, dtype ``float32``.
@@ -222,9 +226,14 @@ fn common_beam(
 /// Raises:
 ///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
 ///         are NaN, or the kernel exceeds ``cutoff_arcsec``.
+///
+/// Warns:
+///     UserWarning: If ``bunit`` is given but not recognised as either a
+///         Kelvin or Jy/beam unit (Jy/beam is then assumed).
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None, bunit=None))]
+#[allow(clippy::too_many_arguments)]
 fn smooth<'py>(
     py: Python<'py>,
     image: PyReadonlyArray2<'py, f32>,
@@ -236,7 +245,21 @@ fn smooth<'py>(
     bunit: Option<&str>,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let owned = image.as_array().to_owned();
-    let unit = bunit.map(BrightnessUnit::from_bunit).unwrap_or_default();
+    let unit = match bunit {
+        Some(s) => match BrightnessUnit::parse(s) {
+            Some(unit) => unit,
+            None => {
+                let msg = std::ffi::CString::new(format!(
+                    "Could not determine brightness unit from bunit={s:?}; \
+                     assuming Jy/beam (flux scaling applied). Pass a recognised \
+                     unit (e.g. 'Jy/beam' or 'K') to silence this warning."
+                ))?;
+                PyErr::warn(py, &py.get_type::<PyUserWarning>(), &msg, 2)?;
+                BrightnessUnit::JyPerBeam
+            }
+        },
+        None => BrightnessUnit::default(),
+    };
     rust_smooth(
         &owned,
         &old_beam.inner,
