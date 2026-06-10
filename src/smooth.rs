@@ -93,7 +93,10 @@ mod tests {
         assert_eq!(BrightnessUnit::parse("K"), Some(BrightnessUnit::Kelvin));
         assert_eq!(BrightnessUnit::parse(" k "), Some(BrightnessUnit::Kelvin));
         assert_eq!(BrightnessUnit::parse("'K'"), Some(BrightnessUnit::Kelvin));
-        assert_eq!(BrightnessUnit::parse("Kelvin"), Some(BrightnessUnit::Kelvin));
+        assert_eq!(
+            BrightnessUnit::parse("Kelvin"),
+            Some(BrightnessUnit::Kelvin)
+        );
         assert_eq!(
             BrightnessUnit::parse("Jy/beam"),
             Some(BrightnessUnit::JyPerBeam)
@@ -121,10 +124,7 @@ mod tests {
             BrightnessUnit::from_bunit("Jy/beam"),
             BrightnessUnit::JyPerBeam
         );
-        assert_eq!(
-            BrightnessUnit::from_bunit("wat"),
-            BrightnessUnit::JyPerBeam
-        );
+        assert_eq!(BrightnessUnit::from_bunit("wat"), BrightnessUnit::JyPerBeam);
     }
 
     #[test]
@@ -141,6 +141,10 @@ mod tests {
         let center = (16, 16);
         assert!(jy[center] > k[center] * 1.5, "Jy/beam should be scaled up");
         // Kelvin output is the pure convolution: a flat image stays ~1.
-        assert!((k[center] - 1.0).abs() < 1e-3, "Kelvin center = {}", k[center]);
+        assert!(
+            (k[center] - 1.0).abs() < 1e-3,
+            "Kelvin center = {}",
+            k[center]
+        );
     }
 }

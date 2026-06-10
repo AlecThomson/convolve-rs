@@ -286,8 +286,11 @@ pub(crate) fn deconvolve_deg(
     pa2_deg: f64,
     failure_returns_zero: bool,
 ) -> Result<(f64, f64, f64), BeamError> {
-    let residual = Cov::from_axes(maj1, min1, pa1_deg.to_radians())
-        .sub(&Cov::from_axes(maj2, min2, pa2_deg.to_radians()));
+    let residual = Cov::from_axes(maj1, min1, pa1_deg.to_radians()).sub(&Cov::from_axes(
+        maj2,
+        min2,
+        pa2_deg.to_radians(),
+    ));
     let (lam_major, lam_minor) = residual.eigenvalues();
 
     // The residual must be positive-(semi)definite to correspond to a real
