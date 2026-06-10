@@ -57,9 +57,9 @@ jobs:
         include:
           - { platform: linux, runner: ubuntu-latest, target: x86_64 }
           - { platform: linux, runner: ubuntu-latest, target: aarch64 }
-          - { platform: macos, runner: macos-13, target: x86_64 }
           - { platform: macos, runner: macos-14, target: aarch64 }
-          - { platform: windows, runner: windows-latest, target: x64 }
+          # No Windows wheel: cfitsio can't be built from source under MSVC.
+          # Windows users can build from the sdist or use conda/WSL.
     steps:
       - uses: actions/checkout@v6
 
@@ -86,7 +86,9 @@ jobs:
           # `auto` selects an appropriate manylinux image; maturin-action's
           # cross images carry the aarch64 C toolchain needed to build cfitsio.
           manylinux: auto
-          args: --release --out dist
+          # `abi3` builds one stable-ABI wheel per platform (Python >=3.10) and
+          # lets maturin build without a (target) interpreter, needed for aarch64.
+          args: --release --out dist --features abi3
 
       - uses: actions/upload-artifact@v4
         with:

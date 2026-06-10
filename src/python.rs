@@ -4,6 +4,7 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyType;
+#[cfg(feature = "stubgen")]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
@@ -27,14 +28,14 @@ use crate::smooth::smooth as rust_smooth;
 ///     Beam.from_arcsec: Construct from arcsecond axes.
 ///     Beam.from_fits_header: Construct from an astropy FITS header.
 ///     Beam.from_radio_beam: Construct from a ``radio_beam.Beam`` object.
-#[gen_stub_pyclass]
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass(name = "Beam", subclass)]
 #[derive(Clone)]
 pub struct PyBeam {
     pub inner: Beam,
 }
 
-#[gen_stub_pymethods]
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
 impl PyBeam {
     #[new]
@@ -176,7 +177,7 @@ impl PyBeam {
 ///
 /// Raises:
 ///     ValueError: If ``beams`` is empty or no valid common beam is found.
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (beams, tolerance=1e-4, nsamps=200, epsilon=5e-4))]
 fn common_beam(
@@ -216,7 +217,7 @@ fn common_beam(
 /// Raises:
 ///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
 ///         are NaN, or the kernel exceeds ``cutoff_arcsec``.
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None))]
 fn smooth<'py>(
@@ -258,7 +259,7 @@ fn smooth<'py>(
 ///         ``fac`` is the pixel scaling factor, ``amp`` is the Gaussian kernel
 ///         integral, and the remaining three are the output beam parameters
 ///         (major/minor FWHM in arcseconds, PA in degrees).
-#[gen_stub_pyfunction]
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 fn gauss_factor(
     conv_beam: &PyBeam,
@@ -269,8 +270,10 @@ fn gauss_factor(
     rust_gauss_factor(&conv_beam.inner, &orig_beam.inner, dx_arcsec, dy_arcsec)
 }
 
+#[cfg(feature = "stubgen")]
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
+#[cfg(feature = "stubgen")]
 #[pyfunction]
 fn _generate_stubs() -> PyResult<()> {
     // CARGO_MANIFEST_DIR is only set by Cargo; fall back to cwd when called from Python
@@ -293,6 +296,7 @@ pub fn _convolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(common_beam, m)?)?;
     m.add_function(wrap_pyfunction!(smooth, m)?)?;
     m.add_function(wrap_pyfunction!(gauss_factor, m)?)?;
+    #[cfg(feature = "stubgen")]
     m.add_function(wrap_pyfunction!(_generate_stubs, m)?)?;
     Ok(())
 }

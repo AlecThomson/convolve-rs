@@ -36,7 +36,9 @@ jobs:
         run: cargo fmt --all --check
 
       - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Not --all-features: `abi3` and `stubgen` are mutually exclusive.
+        # `stubgen` pulls in the full Python module (it implies `python`).
+        run: cargo clippy --all-targets --features stubgen -- -D warnings
 
       - uses: astral-sh/setup-uv@v7
 
@@ -86,7 +88,8 @@ jobs:
           # The MIRIAD comparison test reads MIRIAD_BIN and derives the rest of
           # the runtime environment (catalogs, etc.) from the install prefix.
           export MIRIAD_BIN="$HOME/miriad-install/bin"
-          cargo test --all-features
+          # The integration tests exercise the pure-Rust API; no Python features.
+          cargo test
 
   python-test:
     name: Python ${{ matrix.python-version }}
