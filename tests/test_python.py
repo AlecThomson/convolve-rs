@@ -242,7 +242,7 @@ class TestSmooth:
         assert out[16, 16] == pytest.approx(4.0, abs=1e-3)
 
     def test_recognised_bunit_does_not_warn(self):
-        import warnings
+        import warnings  # noqa: PLC0415
 
         with warnings.catch_warnings():
             warnings.simplefilter("error")
