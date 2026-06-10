@@ -15,6 +15,7 @@ use ndarray::Array2;
 use thiserror::Error;
 
 use crate::beam::{Beam, BeamError};
+use crate::smooth::BrightnessUnit;
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,8 @@ pub struct CubeMeta {
     pub beams: Vec<Option<Beam>>,
     /// True for 4D input (has a Stokes axis in the header).
     pub is_4d: bool,
+    /// Brightness unit from BUNIT (defaults to Jy/beam if absent).
+    pub unit: BrightnessUnit,
 }
 
 impl CubeMeta {
@@ -110,6 +113,18 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     // Reference channel for the spectral axis (CRPIX3 for 3D, CRPIX3 for 4D where freq=axis 3)
     let crpix_freq: i64 = hdu.read_key(&mut fptr, "CRPIX3").unwrap_or(1);
 
+    // Brightness unit (BUNIT); warn and default to Jy/beam when absent.
+    let unit = match hdu.read_key::<String>(&mut fptr, "BUNIT") {
+        Ok(s) => BrightnessUnit::from_bunit(&s),
+        Err(_) => {
+            tracing::warn!(
+                "No BUNIT keyword in {}; assuming Jy/beam (flux scaling applied).",
+                path.display()
+            );
+            BrightnessUnit::default()
+        }
+    };
+
     // Check for CASAMBM
     let casambm: String = hdu.read_key(&mut fptr, "CASAMBM").unwrap_or_default();
     drop(fptr); // close for next reads
@@ -128,6 +143,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
             crpix_freq,
             beams: vec![],
             is_4d,
+            unit,
         }
         .beamlog_path();
 
@@ -165,6 +181,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
         crpix_freq,
         beams,
         is_4d,
+        unit,
     })
 }
 

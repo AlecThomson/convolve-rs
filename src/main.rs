@@ -213,6 +213,7 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 data.dx_deg,
                 data.dy_deg,
                 args.shared.cutoff,
+                data.unit,
             )
             .with_context(|| format!("smoothing {}", file.display()))?;
             write_fits(&smoothed, &out, file, &common, data.is_4d)
@@ -413,6 +414,7 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                     meta.dx_deg,
                     meta.dy_deg,
                     args.shared.cutoff,
+                    meta.unit,
                 )
                 .with_context(|| format!("smoothing channel {c}"))?;
                 pb.inc(1);

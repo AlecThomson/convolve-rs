@@ -7,7 +7,7 @@ use convolve_rs::cube_io;
 ///
 /// All other tests are pure-Rust algebraic invariant checks that do not require
 /// any external binaries.
-use convolve_rs::{Beam, common_beam, fftfreq, gaussft, smooth};
+use convolve_rs::{Beam, BrightnessUnit, common_beam, fftfreq, gaussft, smooth};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 use fitsio::tables::{ColumnDataType, ColumnDescription};
@@ -361,7 +361,7 @@ fn test_smooth_beam_area_ratio() {
     let bmin_pix = OLD_BMIN / PIX_ARCSEC;
     let image = make_gaussian_image(NROW, NCOL, bmaj_pix, bmin_pix, OLD_BPA);
 
-    let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+    let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None, BrightnessUnit::JyPerBeam).unwrap();
 
     let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
     let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
@@ -408,7 +408,7 @@ fn test_smooth_nan_propagation() {
         }
     }
 
-    let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+    let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None, BrightnessUnit::JyPerBeam).unwrap();
 
     // Pixels deep inside the NaN region (far from the valid boundary) must be NaN.
     // We check row 10 (40 pixels from the NaN/valid boundary at row 50).
@@ -510,7 +510,7 @@ fn test_smooth_matches_miriad() {
 
     // Run Rust
     let rust_result =
-        smooth(&image, &old, &target, pix_deg, pix_deg, None).expect("Rust smooth failed");
+        smooth(&image, &old, &target, pix_deg, pix_deg, None, BrightnessUnit::JyPerBeam).expect("Rust smooth failed");
 
     // Read MIRIAD pixels
     let mir_pixels = read_fits_pixels(&miriad_fits);
@@ -856,7 +856,7 @@ fn test_cube_channel_beam_area_ratio() {
 
     for c in 0..CUBE_NCHAN {
         let image = make_gaussian_image(CUBE_NY, CUBE_NX, bmaj_pix, bmin_pix, CUBE_OLD_BPA);
-        let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None).unwrap();
+        let smoothed = smooth(&image, &old, &target, pix_deg, pix_deg, None, BrightnessUnit::JyPerBeam).unwrap();
 
         let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
         let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
@@ -912,7 +912,7 @@ fn test_cube_smoothed_matches_miriad_3d() {
     let atol = 1e-3_f32;
     for c in 0..CUBE_NCHAN {
         let rust_plane =
-            smooth(&image, &old, &target, pix_deg, pix_deg, None).expect("smooth failed");
+            smooth(&image, &old, &target, pix_deg, pix_deg, None, BrightnessUnit::JyPerBeam).expect("smooth failed");
         let rust_flat: Vec<f32> = rust_plane.into_raw_vec_and_offset().0;
 
         let plane_start = c * CUBE_NY * CUBE_NX;

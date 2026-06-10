@@ -9,7 +9,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
-use crate::smooth::smooth as rust_smooth;
+use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
 
 /// A 2-D Gaussian representation of a radio telescope's PSF (beam).
 ///
@@ -211,17 +211,20 @@ fn common_beam(
 ///         (FITS CDELT2).
 ///     cutoff_arcsec (float, optional): If given, raise ``ValueError`` if the
 ///         deconvolved kernel FWHM exceeds this value in arcseconds.
+///     bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
+///         Kelvin (brightness temperature), the flux-scaling factor is 1 and
+///         the data is left unscaled; otherwise Jy/beam scaling is applied.
+///         Defaults to Jy/beam.
 ///
 /// Returns:
-///     numpy.ndarray: Smoothed image in Jy/beam, shape ``(ny, nx)``,
-///         dtype ``float32``.
+///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, dtype ``float32``.
 ///
 /// Raises:
 ///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
 ///         are NaN, or the kernel exceeds ``cutoff_arcsec``.
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None))]
+#[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None, bunit=None))]
 fn smooth<'py>(
     py: Python<'py>,
     image: PyReadonlyArray2<'py, f32>,
@@ -230,8 +233,10 @@ fn smooth<'py>(
     dx_deg: f64,
     dy_deg: f64,
     cutoff_arcsec: Option<f64>,
+    bunit: Option<&str>,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let owned = image.as_array().to_owned();
+    let unit = bunit.map(BrightnessUnit::from_bunit).unwrap_or_default();
     rust_smooth(
         &owned,
         &old_beam.inner,
@@ -239,6 +244,7 @@ fn smooth<'py>(
         dx_deg,
         dy_deg,
         cutoff_arcsec,
+        unit,
     )
     .map(|arr| arr.into_pyarray(py))
     .map_err(|e| PyValueError::new_err(e.to_string()))
