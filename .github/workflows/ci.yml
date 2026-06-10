@@ -32,21 +32,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: rustfmt
-        run: cargo fmt --all --check
-
-      - name: clippy
-        # Not --all-features: `abi3` and `stubgen` are mutually exclusive.
-        # `stubgen` pulls in the full Python module (it implies `python`).
-        run: cargo clippy --all-targets --features stubgen -- -D warnings
-
       - uses: astral-sh/setup-uv@v7
 
-      - name: ruff check
-        run: uvx ruff check .
+      # ty type-checks against installed deps (numpy, astropy, ...), so build
+      # the extension and populate .venv first; ty auto-discovers ./.venv.
+      - name: Build extension and install deps
+        run: uv sync --extra test --extra dev
 
-      - name: ruff format
-        run: uvx ruff format --check .
+      # Single source of truth: the same hooks developers run locally
+      # (.pre-commit-config.yaml) — ruff, ty, cargo fmt, clippy. prek exits
+      # nonzero if any autofix hook had to change a file, so this fails CI
+      # exactly like the `--check` variants did.
+      - name: prek (lint, format, type check)
+        run: uvx prek run --all-files --show-diff-on-failure
 
   rust-test:
     name: Rust tests (vs MIRIAD)

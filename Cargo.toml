@@ -41,6 +41,7 @@ pyo3-stub-gen = { version = "0.22.3", optional = true }
 fitsio = { version = "0.21", features = ["fitsio-src"] }
 ndarray = "0.16"
 rustfft = "6"
+realfft = "3"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "1"

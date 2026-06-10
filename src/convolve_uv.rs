@@ -4,6 +4,7 @@
 /// The "robust" mode is implemented: the FT of the convolving Gaussian is computed
 /// analytically at each UV point (no kernel image needed), which handles NaNs gracefully.
 use ndarray::Array2;
+use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
 use thiserror::Error;
 
@@ -88,36 +89,35 @@ pub fn convolve_uv(
     };
 
     // UV coordinates: fftfreq(n, d_rad) where d_rad = pixel_size_in_radians.
+    // The data is real, so we use a real-input FFT: the column (ncols) axis only
+    // needs its non-negative half, `nhalf = ncols/2 + 1` bins. We slice the full
+    // `fftfreq` rather than using `rfftfreq` so the filter is evaluated at exactly
+    // the frequencies the equivalent full FFT assigns to bins 0..nhalf (incl. the
+    // signed Nyquist), keeping results bit-for-bit aligned with the full-FFT port.
+    let nhalf = ncols / 2 + 1;
     let dx_rad = dx_deg.to_radians();
     let dy_rad = dy_deg.to_radians();
     let u_freqs = fftfreq(nrows, dx_rad); // shape (nrows,)
-    let v_freqs = fftfreq(ncols, dy_rad); // shape (ncols,)
+    let v_freqs_full = fftfreq(ncols, dy_rad);
+    let v_freqs = &v_freqs_full[..nhalf]; // half spectrum
 
-    // Compute the UV-plane filter g_final[i, j] (shape nrows × ncols).
-    let (g_final, g_ratio) = gaussft(old_beam, new_beam, &u_freqs, &v_freqs);
+    // UV-plane filter on the half spectrum (shape nrows × nhalf), real-valued.
+    let (g_final, g_ratio) = gaussft(old_beam, new_beam, &u_freqs, v_freqs);
 
-    // FFT the image.
-    let im_f = fft2(&clean_image, nrows, ncols);
-
-    // Multiply element-wise.
-    let convolved_f: Vec<Complex<f64>> = im_f
-        .iter()
-        .zip(g_final.iter())
-        .map(|(imf, gf)| imf * gf)
-        .collect();
-
-    // Inverse FFT and take real part.
-    let im_conv_flat = ifft2(&convolved_f, nrows, ncols);
+    // Forward real FFT, apply the filter in place, inverse real FFT.
+    let mut im_f = rfft2(&clean_image, nrows, ncols);
+    for (s, &g) in im_f.iter_mut().zip(g_final.iter()) {
+        *s *= g;
+    }
+    let im_conv_flat = irfft2(im_f, nrows, ncols);
 
     // NaN propagation.
     let out_flat: Vec<f32> = if let Some(mask) = nan_mask {
-        let mask_f = fft2(&mask, nrows, ncols);
-        let mask_conv_f: Vec<Complex<f64>> = mask_f
-            .iter()
-            .zip(g_final.iter())
-            .map(|(mf, gf)| mf * gf)
-            .collect();
-        let mask_conv = ifft2(&mask_conv_f, nrows, ncols);
+        let mut mask_f = rfft2(&mask, nrows, ncols);
+        for (s, &g) in mask_f.iter_mut().zip(g_final.iter()) {
+            *s *= g;
+        }
+        let mask_conv = irfft2(mask_f, nrows, ncols);
         im_conv_flat
             .iter()
             .zip(mask_conv.iter())
@@ -141,15 +141,15 @@ pub fn convolve_uv(
 /// Compute the UV-plane filter that deconvolves `old_beam` and re-convolves with
 /// `new_beam`. Direct port of `racs_tools.gaussft.gaussft`.
 ///
-/// `u_freqs` has length `nrows`, `v_freqs` has length `ncols`.
-/// Returns `(g_final, g_ratio)` where `g_final` has length `nrows * ncols`
-/// stored in row-major order.
+/// `u_freqs` has length `nrows`, `v_freqs` has length `ncols` (or `nhalf` for a
+/// half-spectrum / real-FFT layout). The filter is real-valued, so it is returned
+/// as `Vec<f64>` of length `nrows * v_freqs.len()` in row-major order.
 pub fn gaussft(
     old_beam: &Beam,
     new_beam: &Beam,
     u_freqs: &[f64],
     v_freqs: &[f64],
-) -> (Vec<Complex<f64>>, f64) {
+) -> (Vec<f64>, f64) {
     let deg2rad = std::f64::consts::PI / 180.0;
     let two_ln2 = 2.0 * 2_f64.ln();
     let fwhm_to_sigma = 2.0 * two_ln2.sqrt(); // = 2*sqrt(2*ln2)
@@ -176,7 +176,7 @@ pub fn gaussft(
     let pi2 = std::f64::consts::PI * std::f64::consts::PI;
     let nrows = u_freqs.len();
     let ncols = v_freqs.len();
-    let mut g_final = vec![Complex::<f64>::new(0.0, 0.0); nrows * ncols];
+    let mut g_final = vec![0.0_f64; nrows * ncols];
 
     // Pre-rotate u and v for new beam.
     let u_cos = u_freqs
@@ -226,8 +226,7 @@ pub fn gaussft(
             let g_arg = -2.0 * pi2 * ((sx * ur).powi(2) + (sy * vr).powi(2));
             let dg_arg = -2.0 * pi2 * ((sx_in * ur_in).powi(2) + (sy_in * vr_in).powi(2));
 
-            let val = g_ratio * (g_arg - dg_arg).exp();
-            g_final[i * ncols + j] = Complex::new(val, 0.0);
+            g_final[i * ncols + j] = g_ratio * (g_arg - dg_arg).exp();
         }
     }
 
@@ -253,62 +252,93 @@ pub fn fftfreq(n: usize, d: f64) -> Vec<f64> {
 }
 
 /// 2D forward FFT of real-valued data stored row-major in `data` (shape nrows×ncols).
-/// Returns complex spectrum in the same layout.
-fn fft2(data: &[f64], nrows: usize, ncols: usize) -> Vec<Complex<f64>> {
-    let mut buf: Vec<Complex<f64>> = data.iter().map(|&x| Complex::new(x, 0.0)).collect();
+///
+/// Uses a real-input FFT along the contiguous (ncols) axis, so only the
+/// non-negative half of that axis is kept: the returned spectrum is
+/// `nrows × nhalf` (`nhalf = ncols/2 + 1`) complex values, row-major. This roughly
+/// halves the spectrum memory versus a full complex FFT — the dominant cost at
+/// large image sizes.
+fn rfft2(data: &[f64], nrows: usize, ncols: usize) -> Vec<Complex<f64>> {
+    let nhalf = ncols / 2 + 1;
 
-    let mut planner = FftPlanner::new();
-
-    // Row-wise FFT.
-    let row_fft = planner.plan_fft_forward(ncols);
-    for row in buf.chunks_mut(ncols) {
-        row_fft.process(row);
+    // Row-wise real→complex FFT.
+    let mut rplanner = RealFftPlanner::<f64>::new();
+    let r2c = rplanner.plan_fft_forward(ncols);
+    let mut scratch = r2c.make_scratch_vec();
+    let mut inrow = r2c.make_input_vec();
+    let mut spectrum = vec![Complex::new(0.0, 0.0); nrows * nhalf];
+    for (i, chunk) in data.chunks(ncols).enumerate() {
+        inrow.copy_from_slice(chunk);
+        r2c.process_with_scratch(
+            &mut inrow,
+            &mut spectrum[i * nhalf..(i + 1) * nhalf],
+            &mut scratch,
+        )
+        .expect("r2c FFT");
     }
 
-    // Column-wise FFT (gather, process, scatter).
-    let col_fft = planner.plan_fft_forward(nrows);
+    // Column-wise complex FFT over the `nhalf` columns (gather, process, scatter).
+    let col_fft = FftPlanner::new().plan_fft_forward(nrows);
     let mut col_buf = vec![Complex::new(0.0, 0.0); nrows];
-    for j in 0..ncols {
+    for j in 0..nhalf {
         for i in 0..nrows {
-            col_buf[i] = buf[i * ncols + j];
+            col_buf[i] = spectrum[i * nhalf + j];
         }
         col_fft.process(&mut col_buf);
         for i in 0..nrows {
-            buf[i * ncols + j] = col_buf[i];
+            spectrum[i * nhalf + j] = col_buf[i];
         }
     }
 
-    buf
+    spectrum
 }
 
-/// 2D inverse FFT (un-normalised → divide by N = nrows*ncols).
-/// Returns the real part of the result.
-fn ifft2(spectrum: &[Complex<f64>], nrows: usize, ncols: usize) -> Vec<f64> {
-    let mut buf = spectrum.to_vec();
+/// 2D inverse of [`rfft2`] (un-normalised → divide by N = nrows*ncols).
+/// Consumes the half `nrows × nhalf` spectrum and returns the real nrows×ncols image.
+fn irfft2(mut spectrum: Vec<Complex<f64>>, nrows: usize, ncols: usize) -> Vec<f64> {
+    let nhalf = ncols / 2 + 1;
 
-    let mut planner = FftPlanner::new();
-
-    // Row-wise inverse FFT.
-    let row_ifft = planner.plan_fft_inverse(ncols);
-    for row in buf.chunks_mut(ncols) {
-        row_ifft.process(row);
-    }
-
-    // Column-wise inverse FFT.
-    let col_ifft = planner.plan_fft_inverse(nrows);
+    // Column-wise inverse complex FFT over the `nhalf` columns.
+    let col_ifft = FftPlanner::new().plan_fft_inverse(nrows);
     let mut col_buf = vec![Complex::new(0.0, 0.0); nrows];
-    for j in 0..ncols {
+    for j in 0..nhalf {
         for i in 0..nrows {
-            col_buf[i] = buf[i * ncols + j];
+            col_buf[i] = spectrum[i * nhalf + j];
         }
         col_ifft.process(&mut col_buf);
         for i in 0..nrows {
-            buf[i * ncols + j] = col_buf[i];
+            spectrum[i * nhalf + j] = col_buf[i];
         }
     }
 
+    // Row-wise complex→real FFT.
+    let mut rplanner = RealFftPlanner::<f64>::new();
+    let c2r = rplanner.plan_fft_inverse(ncols);
+    let mut scratch = c2r.make_scratch_vec();
+    let mut inrow = c2r.make_input_vec();
+    let mut out = vec![0.0_f64; nrows * ncols];
+    let even = ncols.is_multiple_of(2);
+    for i in 0..nrows {
+        inrow.copy_from_slice(&spectrum[i * nhalf..(i + 1) * nhalf]);
+        // c2r requires the DC (and, for even ncols, Nyquist) bins to be purely
+        // real; they are up to rounding, so zero the imaginary parts explicitly.
+        inrow[0].im = 0.0;
+        if even {
+            inrow[nhalf - 1].im = 0.0;
+        }
+        c2r.process_with_scratch(
+            &mut inrow,
+            &mut out[i * ncols..(i + 1) * ncols],
+            &mut scratch,
+        )
+        .expect("c2r FFT");
+    }
+
     let norm = (nrows * ncols) as f64;
-    buf.iter().map(|c| c.re / norm).collect()
+    for v in out.iter_mut() {
+        *v /= norm;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -327,11 +357,15 @@ mod tests {
     }
 
     #[test]
-    fn test_fft2_ifft2_roundtrip() {
-        let data = vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
-        let (nrows, ncols) = (3, 3);
-        let spectrum = fft2(&data, nrows, ncols);
-        let recovered = ifft2(&spectrum, nrows, ncols);
+    fn test_rfft2_irfft2_roundtrip() {
+        // Use even dimensions to exercise the Nyquist handling in irfft2.
+        let data = vec![
+            1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ];
+        let (nrows, ncols) = (4, 4);
+        let spectrum = rfft2(&data, nrows, ncols);
+        let recovered = irfft2(spectrum, nrows, ncols);
         for (a, b) in data.iter().zip(recovered.iter()) {
             assert!((a - b).abs() < 1e-10, "roundtrip failed: {a} vs {b}");
         }

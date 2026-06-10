@@ -71,6 +71,20 @@ uv run --no-sync python -c "from convolve_rs._convolve_rs import _generate_stubs
 
 This overwrites `convolve_rs/_convolve_rs.pyi` from the Rust annotations and docstrings. Commit the result alongside any API changes.
 
+### Pre-commit hooks
+
+Formatters and linters run via [prek](https://github.com/j178/prek), a fast
+drop-in [pre-commit](https://pre-commit.com) reimplementation. The hooks
+(`.pre-commit-config.yaml`) are the same checks CI enforces: `ruff` lint +
+format, [`ty`](https://github.com/astral-sh/ty) type checking, `cargo fmt`, and
+`cargo clippy`.
+
+```sh
+uv sync --extra dev   # installs prek + ty into the venv
+uvx prek install      # install the git hook (runs on every commit)
+uvx prek run --all-files   # run all hooks manually
+```
+
 ## License
 
 convolve-rs is released under the [BSD 3-Clause License](LICENSE).

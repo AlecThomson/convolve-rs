@@ -15,6 +15,15 @@ readme = "README.md"
 
 [project.optional-dependencies]
 test = ["pytest", "radio-beam", "astropy"]
+dev = ["prek", "ty"]
+benchmark = [
+    "astropy>=6.1.7",
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.10.9",
+    "nbconvert>=7.17.1",
+    "nbformat>=5.10.4",
+    "pandas>=2.3.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -72,6 +81,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests deliberately assert on broad ValueError raised from the Rust layer.
 "tests/**" = ["PT011"]
+"scripts/**" = ["T201", ]
+
+[tool.ty.src]
+# The benchmark notebook imports a sibling script by path and leans on runtime
+# invariants ty can't see; it's throwaway perf tooling, not shipped code.
+exclude = ["scripts/benchmark.ipynb"]
 
 [tool.maturin]
 features = ["python"]

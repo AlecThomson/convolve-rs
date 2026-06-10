@@ -292,7 +292,7 @@ fn test_gaussft_dc_equals_g_ratio() {
     let (g_final, g_ratio) = gaussft(&old, &target, &u_freqs, &v_freqs);
 
     // DC component is at index [0, 0] in row-major layout
-    let dc = g_final[0].re;
+    let dc = g_final[0];
     assert!(
         (dc - g_ratio).abs() < 1e-12,
         "g_final[DC] = {dc:.10e}, g_ratio = {g_ratio:.10e}",
@@ -305,13 +305,6 @@ fn test_gaussft_dc_equals_g_ratio() {
     assert!(
         (g_ratio - expected_g_ratio).abs() < 1e-10,
         "g_ratio = {g_ratio:.10e}, expected sqrt(Ω_new/Ω_old) = {expected_g_ratio:.10e}",
-    );
-
-    // Filter must be real-valued (Gaussian FT has no imaginary component)
-    let max_imag = g_final.iter().map(|c| c.im.abs()).fold(0.0_f64, f64::max);
-    assert!(
-        max_imag < 1e-15,
-        "g_final has non-zero imaginary parts: max|im|={max_imag:.2e}"
     );
 }
 
@@ -329,13 +322,13 @@ fn test_gaussft_attenuates_high_freq() {
 
     let (g_final, g_ratio) = gaussft(&old, &target, &u_freqs, &v_freqs);
 
-    let dc = g_final[0].re;
+    let dc = g_final[0];
     assert!((dc - g_ratio).abs() < 1e-12);
 
     // Positive-frequency bins (indices 1..n/2) should be smaller than DC
     let m = n.div_ceil(2);
     for (i, bin) in g_final.iter().enumerate().take(m).skip(1) {
-        let val = bin.re;
+        let val = *bin;
         assert!(
             val < dc,
             "g_final[{i}] = {val:.6e} should be < DC = {dc:.6e}",
