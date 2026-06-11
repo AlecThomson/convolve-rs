@@ -411,23 +411,51 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         cube_io::init_output_cube(file, &out, &target_beams, cube_mode, meta)
             .with_context(|| format!("initialising output cube {}", out.display()))?;
 
-        // Process channels in parallel, write sequentially.
-        pb.set_message("smoothing");
-        let channel_results: Vec<Option<Array2<f32>>> = (0..nfreq)
-            .into_par_iter()
-            .map(|c| -> Result<Option<Array2<f32>>> {
+        // Stream channels through a bounded pipeline instead of materialising the
+        // whole cube in RAM: rayon convolves planes in parallel (CPU- and
+        // memory-bandwidth bound) and sends each finished plane to a single writer
+        // thread that owns the output cube and writes sequentially (cfitsio is not
+        // thread-safe).  The bounded channel caps peak memory to the in-flight
+        // planes — not the entire output cube — and overlaps convolution with disk
+        // IO.  Threading (not async) fits: the work is CPU-bound and FITS IO is
+        // blocking, so an async runtime would buy nothing.
+        pb.set_message("processing");
+
+        let cap = (rayon::current_num_threads() * 2).max(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<f32>)>(cap);
+
+        let writer_out = out.clone();
+        let writer_meta = meta; // copy of the &CubeMeta for the writer thread
+
+        let result: Result<()> = std::thread::scope(|s| {
+            // Single writer thread — owns the output FITS handle.  `FitsFile` holds
+            // a raw cfitsio pointer and is not `Send`, so it is opened *on* this
+            // thread and never crosses a thread boundary.
+            let writer_handle = s.spawn(move || -> Result<()> {
+                let mut writer = cube_io::CubeWriter::open(&writer_out)
+                    .with_context(|| format!("opening output cube {}", writer_out.display()))?;
+                for (c, plane) in rx {
+                    writer.write_channel(c, &plane, writer_meta).with_context(|| {
+                        format!("writing channel {c} to {}", writer_out.display())
+                    })?;
+                }
+                Ok(())
+            });
+
+            // Parallel producers — convolve and stream finished planes to the writer.
+            let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
                 let old_beam = match meta.beams[c] {
                     Some(b) => b,
                     None => {
                         pb.inc(1);
-                        return Ok(None);
+                        return Ok(());
                     }
                 };
                 let target = match target_beams[c] {
                     Some(b) => b,
                     None => {
                         pb.inc(1);
-                        return Ok(None);
+                        return Ok(());
                     }
                 };
 
@@ -439,7 +467,7 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                     debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
                 });
 
-                if let Some(cutoff) = args.shared.cutoff
+                let plane = if let Some(cutoff) = args.shared.cutoff
                     && old_beam.major_arcsec() > cutoff
                 {
                     pb.suspend(|| {
@@ -448,36 +476,40 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                             old_beam.major_arcsec()
                         )
                     });
-                    pb.inc(1);
-                    return Ok(Some(Array2::from_elem((meta.ny, meta.nx), f32::NAN)));
-                }
+                    Array2::from_elem((meta.ny, meta.nx), f32::NAN)
+                } else {
+                    let raw = cube_io::read_channel(file, c, meta)
+                        .with_context(|| format!("reading channel {c} from {}", file.display()))?;
+                    smooth(
+                        &raw,
+                        &old_beam,
+                        &target,
+                        meta.dx_deg,
+                        meta.dy_deg,
+                        args.shared.cutoff,
+                        meta.unit,
+                    )
+                    .with_context(|| format!("smoothing channel {c}"))?
+                };
 
-                let plane = cube_io::read_channel(file, c, meta)
-                    .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                let smoothed = smooth(
-                    &plane,
-                    &old_beam,
-                    &target,
-                    meta.dx_deg,
-                    meta.dy_deg,
-                    args.shared.cutoff,
-                    meta.unit,
-                )
-                .with_context(|| format!("smoothing channel {c}"))?;
+                // Hand the plane to the writer; a send error means the writer thread
+                // already exited (i.e. a write failed) — surface that below.
+                tx.send((c, plane))
+                    .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
                 pb.inc(1);
-                Ok(Some(smoothed))
-            })
-            .collect::<Result<_>>()?;
+                Ok(())
+            });
 
-        // Writing planes back is sequential disk IO; show it as a distinct phase.
-        pb.set_message("writing");
-        for (c, maybe_plane) in channel_results.into_iter().enumerate() {
-            if let Some(plane) = maybe_plane {
-                pb.suspend(|| debug!("Writing channel {c} to {}", out.display()));
-                cube_io::write_channel(&out, c, &plane, meta)
-                    .with_context(|| format!("writing channel {c} to {}", out.display()))?;
-            }
-        }
+            // Close the channel so the writer loop ends, then join it.  Prefer the
+            // writer's error (the real cause) over the producers' generic
+            // "writer stopped" when both fail.
+            drop(tx);
+            let writer_result = writer_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+            writer_result.and(produce)
+        });
+        result?;
 
         let beamlog = {
             let dir = out.parent().unwrap_or(Path::new("."));

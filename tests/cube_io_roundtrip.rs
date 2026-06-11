@@ -194,6 +194,15 @@ fn cli_total_mode_smooths_cube() {
     let common = meta.beams[0].expect("common beam");
     assert!(common.major_arcsec() >= 16.0 + (NFREQ as f64 - 1.0));
 
+    // Every channel the streaming writer produced must hold real, finite pixels
+    // (a point source convolved to a Gaussian) — not zeros or NaNs.
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel(&out, c, &meta).unwrap();
+        assert!(plane.iter().all(|v| v.is_finite()), "channel {c} has non-finite pixels");
+        let peak = plane.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
+    }
+
     // Beamlog should be written alongside the output.
     assert!(dir.join("beamlog.in.sm.txt").exists(), "beamlog missing:\n{log}");
 }

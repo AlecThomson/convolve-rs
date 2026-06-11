@@ -267,6 +267,42 @@ pub fn write_channel(
     Ok(())
 }
 
+/// A streaming writer that holds an initialised output cube open for the lifetime
+/// of a processing run, so channels can be written one at a time without the
+/// per-call file open/close overhead of [`write_channel`].
+///
+/// cfitsio drives a single file through one internal cursor and is **not**
+/// thread-safe, so a `CubeWriter` must be owned and driven by a single thread
+/// (the consumer end of the streaming pipeline in `main`).
+pub struct CubeWriter {
+    fptr: FitsFile,
+}
+
+impl CubeWriter {
+    /// Open an already-initialised output cube (see [`init_output_cube`]) for
+    /// sequential channel writes.
+    pub fn open(path: &Path) -> Result<Self, CubeError> {
+        let fptr = FitsFile::edit(path.to_string_lossy().into_owned())?;
+        Ok(Self { fptr })
+    }
+
+    /// Write one frequency channel plane into the open cube.
+    pub fn write_channel(
+        &mut self,
+        chan: usize,
+        data: &Array2<f32>,
+        meta: &CubeMeta,
+    ) -> Result<(), CubeError> {
+        let hdu = self.fptr.primary_hdu()?;
+        let plane = meta.ny * meta.nx;
+        let start = chan * plane;
+        let end = start + plane;
+        let flat: Vec<f32> = data.iter().copied().collect();
+        hdu.write_section(&mut self.fptr, start, end, &flat)?;
+        Ok(())
+    }
+}
+
 // ── Output cube initialisation ────────────────────────────────────────────────
 
 /// Mode for common-beam determination.
