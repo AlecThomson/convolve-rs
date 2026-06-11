@@ -35,17 +35,33 @@ fn make_cube(path: &std::path::Path) {
     hdu.write_key(&mut f, "CASAMBM", "T").unwrap();
 
     let cols = vec![
-        ColumnDescription::new("BMAJ").with_type(ColumnDataType::Float).create().unwrap(),
-        ColumnDescription::new("BMIN").with_type(ColumnDataType::Float).create().unwrap(),
-        ColumnDescription::new("BPA").with_type(ColumnDataType::Float).create().unwrap(),
-        ColumnDescription::new("CHAN").with_type(ColumnDataType::Int).create().unwrap(),
-        ColumnDescription::new("POL").with_type(ColumnDataType::Int).create().unwrap(),
+        ColumnDescription::new("BMAJ")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BMIN")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BPA")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("CHAN")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("POL")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
     ];
     let t = f.create_table("BEAMS", &cols).unwrap();
     t.write_col(&mut f, "BMAJ", &[20.0f32; NFREQ]).unwrap();
     t.write_col(&mut f, "BMIN", &[15.0f32; NFREQ]).unwrap();
     t.write_col(&mut f, "BPA", &[0.0f32; NFREQ]).unwrap();
-    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>()).unwrap();
+    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>())
+        .unwrap();
     t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
 }
 
@@ -156,7 +172,10 @@ fn casambm_is_logical_not_string() {
         let u1: String = beams.read_key(&mut f, "TUNIT1").unwrap();
         let u2: String = beams.read_key(&mut f, "TUNIT2").unwrap();
         let u3: String = beams.read_key(&mut f, "TUNIT3").unwrap();
-        assert_eq!((u1.trim(), u2.trim(), u3.trim()), ("arcsec", "arcsec", "deg"));
+        assert_eq!(
+            (u1.trim(), u2.trim(), u3.trim()),
+            ("arcsec", "arcsec", "deg")
+        );
     }
 }
 
@@ -194,17 +213,33 @@ fn make_varied_cube(path: &std::path::Path) {
     let bmin: Vec<f32> = (0..NFREQ).map(|c| 12.0 + c as f32).collect();
     let bpa: Vec<f32> = (0..NFREQ).map(|c| c as f32 * 5.0).collect();
     let cols = vec![
-        ColumnDescription::new("BMAJ").with_type(ColumnDataType::Float).create().unwrap(),
-        ColumnDescription::new("BMIN").with_type(ColumnDataType::Float).create().unwrap(),
-        ColumnDescription::new("BPA").with_type(ColumnDataType::Float).create().unwrap(),
-        ColumnDescription::new("CHAN").with_type(ColumnDataType::Int).create().unwrap(),
-        ColumnDescription::new("POL").with_type(ColumnDataType::Int).create().unwrap(),
+        ColumnDescription::new("BMAJ")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BMIN")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BPA")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("CHAN")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("POL")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
     ];
     let t = f.create_table("BEAMS", &cols).unwrap();
     t.write_col(&mut f, "BMAJ", &bmaj).unwrap();
     t.write_col(&mut f, "BMIN", &bmin).unwrap();
     t.write_col(&mut f, "BPA", &bpa).unwrap();
-    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>()).unwrap();
+    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>())
+        .unwrap();
     t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
 }
 
@@ -240,13 +275,19 @@ fn cli_total_mode_smooths_cube() {
     // (a point source convolved to a Gaussian) — not zeros or NaNs.
     for c in 0..NFREQ {
         let plane = cube_io::read_channel(&out, c, &meta).unwrap();
-        assert!(plane.iter().all(|v| v.is_finite()), "channel {c} has non-finite pixels");
+        assert!(
+            plane.iter().all(|v| v.is_finite()),
+            "channel {c} has non-finite pixels"
+        );
         let peak = plane.iter().cloned().fold(f32::MIN, f32::max);
         assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
     }
 
     // Beamlog should be written alongside the output.
-    assert!(dir.join("beamlog.in.sm.txt").exists(), "beamlog missing:\n{log}");
+    assert!(
+        dir.join("beamlog.in.sm.txt").exists(),
+        "beamlog missing:\n{log}"
+    );
 }
 
 #[test]
@@ -281,5 +322,8 @@ fn cli_verbose_logs_per_channel_beams() {
             "missing per-channel beam log for channel {c}:\n{log}"
         );
     }
-    assert!(log.contains("Initialising output cube"), "missing init log:\n{log}");
+    assert!(
+        log.contains("Initialising output cube"),
+        "missing init log:\n{log}"
+    );
 }

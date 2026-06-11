@@ -137,7 +137,10 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     let files = collect_files(&args.infile, args.listfile)?;
     let target_beam = parse_target_beam(&args.shared)?;
 
-    let sp = spinner(format!("Reading beam parameters from {} file(s)…", files.len()));
+    let sp = spinner(format!(
+        "Reading beam parameters from {} file(s)…",
+        files.len()
+    ));
     let all_beams: Vec<Beam> = files
         .iter()
         .map(|f| {
@@ -215,7 +218,10 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             );
             let conv_beam = common.deconvolve_or_zero(old_beam);
             pb.suspend(|| {
-                debug!("{}: current {old_beam} | target {common} | kernel {conv_beam}", file.display())
+                debug!(
+                    "{}: current {old_beam} | target {common} | kernel {conv_beam}",
+                    file.display()
+                )
             });
             let smoothed = smooth(
                 &data.image,
@@ -452,9 +458,11 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                 let mut writer = cube_io::CubeWriter::open(&writer_out)
                     .with_context(|| format!("opening output cube {}", writer_out.display()))?;
                 for (c, plane) in rx {
-                    writer.write_channel(c, &plane, writer_meta).with_context(|| {
-                        format!("writing channel {c} to {}", writer_out.display())
-                    })?;
+                    writer
+                        .write_channel(c, &plane, writer_meta)
+                        .with_context(|| {
+                            format!("writing channel {c} to {}", writer_out.display())
+                        })?;
                 }
                 Ok(())
             });
