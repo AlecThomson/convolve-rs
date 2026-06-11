@@ -13,9 +13,12 @@ documentation = "https://docs.rs/convolve-rs"
 readme = "README.md"
 
 [package.metadata.docs.rs]
-# Build API docs with default features only: the optional `python`/`abi3`
-# features need a Python toolchain and add nothing to the Rust API docs.
-no-default-features = false
+# docs.rs runs build scripts on a read-only source tree, so the default
+# `fitsio-src` feature (cfitsio compiled from source via autotools) fails
+# there. Its build image ships libcfitsio-dev, so link the system library
+# instead. The optional `python`/`abi3` features need a Python toolchain and
+# add nothing to the Rust API docs.
+no-default-features = true
 features = []
 
 [lib]
@@ -28,6 +31,11 @@ name = "convolvers"
 path = "src/main.rs"
 
 [features]
+# Build cfitsio from source (needs only a C compiler), so no system cfitsio is
+# required in CI or when building wheels. On by default; disable
+# (--no-default-features) to link a system cfitsio instead, as docs.rs does.
+default = ["fitsio-src"]
+fitsio-src = ["fitsio/fitsio-src"]
 python = ["dep:pyo3", "dep:numpy"]
 # Stable-ABI build for distributable wheels: maturin builds a single
 # `cp310-abi3` wheel per platform (works on Python >=3.10) and can build
@@ -43,9 +51,9 @@ stubgen = ["python", "dep:pyo3-stub-gen"]
 pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 numpy = { version = "0.26", optional = true }
 pyo3-stub-gen = { version = "0.22.3", optional = true }
-# `fitsio-src` builds cfitsio from source (needs only a C compiler), so no
-# system cfitsio is required in CI or when building wheels.
-fitsio = { version = "0.21", features = ["fitsio-src"] }
+# cfitsio linkage is controlled by the crate-level `fitsio-src` feature (see
+# [features] above).
+fitsio = { version = "0.21" }
 ndarray = "0.16"
 rustfft = "6"
 realfft = "3"
