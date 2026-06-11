@@ -278,6 +278,25 @@ pub enum CubeMode {
     Total,
 }
 
+/// Create `output` containing only the primary-HDU header of `input` — no pixel data.
+///
+/// Uses cfitsio `fits_copy_header` (ffcphd): the output data unit is defined by the
+/// copied NAXIS keywords and zero-filled (sparsely) when the file is closed.  This is
+/// far cheaper than `std::fs::copy` for large cubes because the input pixel data is
+/// never read or written.
+fn copy_header_only(input: &Path, output: &Path) -> Result<(), CubeError> {
+    let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
+    in_fptr.primary_hdu()?; // position at the primary HDU to copy
+    let mut out_fptr = FitsFile::create(output).overwrite().open()?;
+
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffcphd(in_fptr.as_raw(), out_fptr.as_raw(), &mut status);
+    }
+    fitsio::errors::check_status(status)?;
+    Ok(())
+}
+
 /// Initialise an output cube by copying the input, then updating the beam headers.
 ///
 /// For `Natural` mode a BEAMS binary-table extension is appended.
@@ -289,8 +308,12 @@ pub fn init_output_cube(
     mode: CubeMode,
     meta: &CubeMeta,
 ) -> Result<(), CubeError> {
-    // Copy file, preserving all existing data and header.
-    std::fs::copy(input_path, output_path)?;
+    // Initialise the output on disk cheaply: copy only the primary-HDU header
+    // from the input (NAXIS/WCS/HISTORY/etc.), not the pixel data.  cfitsio
+    // defines the data unit from the copied NAXIS keywords and zero-fills it
+    // (sparsely) on close, so we never read the multi-GB input cube — every
+    // plane is overwritten by `write_channel` anyway.
+    copy_header_only(input_path, output_path)?;
 
     // Reference channel: CRPIX3 (1-based) → 0-based index clamped to valid range.
     let ref_idx = ((meta.crpix_freq - 1) as usize).min(meta.nfreq.saturating_sub(1));
