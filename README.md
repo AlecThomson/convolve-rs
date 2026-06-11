@@ -71,6 +71,27 @@ uv run --no-sync python -c "from convolve_rs._convolve_rs import _generate_stubs
 
 This overwrites `convolve_rs/_convolve_rs.pyi` from the Rust annotations and docstrings. Commit the result alongside any API changes.
 
+### Running tests
+
+**Python** tests need the compiled extension and the `test` extra (`pytest`,
+`radio-beam`, `astropy`). `uv sync` builds the maturin extension into `.venv`,
+so a plain `uvx pytest` won't work — it runs in an isolated env with neither the
+module nor the deps:
+
+```sh
+uv sync --extra test       # builds the extension + installs test deps
+uv run --no-sync pytest
+```
+
+**Rust** tests run with `cargo test`. One integration test compares output
+against [MIRIAD](https://github.com/csiro/miriad); point `MIRIAD_BIN` at a
+MIRIAD `bin` directory to enable it (it is skipped when unset):
+
+```sh
+cargo test
+MIRIAD_BIN=/path/to/miriad/bin cargo test   # include the MIRIAD comparison
+```
+
 ### Pre-commit hooks
 
 Formatters and linters run via [prek](https://github.com/j178/prek), a fast

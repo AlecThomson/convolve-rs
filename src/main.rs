@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use convolve_rs::{
     beam::Beam,
@@ -136,7 +137,10 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     let files = collect_files(&args.infile, args.listfile)?;
     let target_beam = parse_target_beam(&args.shared)?;
 
-    info!("Reading beam parameters from {} files", files.len());
+    let sp = spinner(format!(
+        "Reading beam parameters from {} file(s)…",
+        files.len()
+    ));
     let all_beams: Vec<Beam> = files
         .iter()
         .map(|f| {
@@ -144,16 +148,19 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             if let Some(cutoff) = args.shared.cutoff
                 && data.beam.major_arcsec() > cutoff
             {
-                warn!(
-                    "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
-                    f.display(),
-                    data.beam.major_arcsec(),
-                    cutoff
-                );
+                sp.suspend(|| {
+                    warn!(
+                        "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
+                        f.display(),
+                        data.beam.major_arcsec(),
+                        cutoff
+                    )
+                });
             }
             Ok(data.beam)
         })
         .collect::<Result<Vec<_>>>()?;
+    sp.finish_and_clear();
 
     let mut common = match target_beam {
         Some(b) => {
@@ -173,23 +180,25 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 .cloned()
                 .collect();
             anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
-            common_beam(
+            let sp = spinner("Solving for the common beam…");
+            let cb = common_beam(
                 &valid,
                 args.shared.tolerance,
                 args.shared.nsamps,
                 args.shared.epsilon,
             )
-            .context("could not find common beam")?
+            .context("could not find common beam")?;
+            sp.finish_and_clear();
+            cb
         }
     };
 
     common = apply_beam_rounding(common, args.shared.circularise)?;
 
     info!("Common beam: {common}");
-    println!("Common beam: {common}");
 
     if args.shared.dryrun {
-        println!("Dry run — no files written.");
+        info!("Dry run — no files written.");
         return Ok(());
     }
 
@@ -199,6 +208,7 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         .par_iter()
         .zip(all_beams.par_iter())
         .map(|(file, old_beam)| {
+            pb.suspend(|| debug!("Reading {}", file.display()));
             let data = read_fits(file).with_context(|| format!("reading {}", file.display()))?;
             let out = output_path(
                 file,
@@ -207,6 +217,12 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 args.shared.outdir.as_deref(),
             );
             let conv_beam = common.deconvolve_or_zero(old_beam);
+            pb.suspend(|| {
+                debug!(
+                    "{}: current {old_beam} | target {common} | kernel {conv_beam}",
+                    file.display()
+                )
+            });
             let smoothed = smooth(
                 &data.image,
                 old_beam,
@@ -217,9 +233,10 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 data.unit,
             )
             .with_context(|| format!("smoothing {}", file.display()))?;
+            pb.suspend(|| debug!("Writing {}", out.display()));
             write_fits(&smoothed, &out, file, &common, data.is_4d)
                 .with_context(|| format!("writing {}", out.display()))?;
-            info!("{} → {}", file.display(), out.display());
+            pb.suspend(|| info!("{} → {}", file.display(), out.display()));
             pb.inc(1);
             Ok(BeamLogEntry2D {
                 filename: out,
@@ -293,14 +310,28 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
 
     let files = collect_files(&args.infile, args.listfile)?;
 
-    info!("Reading cube metadata from {} file(s)", files.len());
+    let sp = spinner(format!("Reading metadata from {} cube(s)…", files.len()));
     let metas: Vec<CubeMeta> = files
         .iter()
         .map(|f| {
-            cube_io::read_cube_meta(f)
-                .with_context(|| format!("reading metadata from {}", f.display()))
+            sp.suspend(|| debug!("Reading metadata + per-channel beams from {}", f.display()));
+            let m = cube_io::read_cube_meta(f)
+                .with_context(|| format!("reading metadata from {}", f.display()))?;
+            sp.suspend(|| {
+                debug!(
+                    "{}: {}×{} px, {} channels, {} Stokes",
+                    f.display(),
+                    m.nx,
+                    m.ny,
+                    m.nfreq,
+                    m.nstokes
+                )
+            });
+            Ok(m)
         })
         .collect::<Result<_>>()?;
+    sp.finish_and_clear();
+    info!("Read metadata from {} cube(s)", files.len());
 
     let nfreq = metas[0].nfreq;
     for (f, m) in files.iter().zip(metas.iter()) {
@@ -338,7 +369,11 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             ModeArg::Natural => CubeMode::Natural,
             ModeArg::Total => CubeMode::Total,
         };
-        compute_target_beams(
+        let sp = spinner(match mode {
+            CubeMode::Natural => "Solving for per-channel common beams…".to_string(),
+            CubeMode::Total => "Solving for the common beam across all channels…".to_string(),
+        });
+        let beams = compute_target_beams(
             &metas,
             mode,
             args.shared.cutoff,
@@ -346,15 +381,33 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             args.shared.tolerance,
             args.shared.nsamps,
             args.shared.epsilon,
-        )?
+        )?;
+        sp.finish_and_clear();
+        beams
     };
 
-    if let Some(b) = target_beams.iter().find_map(|b| *b) {
-        println!("Target beam (first valid channel): {b}");
+    // Report the target beam(s).  In `total` mode (or with an explicit target) all
+    // channels share one beam, so print it directly.  In `natural` mode every channel
+    // has its own target, so summarise the count and defer the per-channel detail to
+    // verbose logging in the processing loop below.
+    let n_valid = target_beams.iter().filter(|b| b.is_some()).count();
+    let all_same = target_beams
+        .iter()
+        .filter_map(|b| *b)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .all(|w| w[0] == w[1]);
+    match target_beams.iter().find_map(|b| *b) {
+        Some(b) if all_same => info!("Target beam (all channels): {b}"),
+        Some(b) => {
+            info!("Target beam varies per channel ({n_valid} valid channels); e.g. channel 0: {b}");
+            info!("Run with -v to log the current/target/kernel beam for every channel.");
+        }
+        None => {}
     }
 
     if args.shared.dryrun {
-        println!("Dry run — no files written.");
+        info!("Dry run — no files written.");
         return Ok(());
     }
 
@@ -373,62 +426,115 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             args.shared.outdir.as_deref(),
         );
 
+        // Cube initialisation copies the full primary header and (in natural mode)
+        // writes the BEAMS table — a potentially slow IO step on large cubes, so
+        // announce it.  `pb.suspend` keeps the log line from clobbering the bar.
+        pb.suspend(|| info!("Initialising output cube {} …", out.display()));
+        pb.set_message("initialising");
         cube_io::init_output_cube(file, &out, &target_beams, cube_mode, meta)
             .with_context(|| format!("initialising output cube {}", out.display()))?;
 
-        // Process channels in parallel, write sequentially.
-        let channel_results: Vec<Option<Array2<f32>>> = (0..nfreq)
-            .into_par_iter()
-            .map(|c| -> Result<Option<Array2<f32>>> {
+        // Stream channels through a bounded pipeline instead of materialising the
+        // whole cube in RAM: rayon convolves planes in parallel (CPU- and
+        // memory-bandwidth bound) and sends each finished plane to a single writer
+        // thread that owns the output cube and writes sequentially (cfitsio is not
+        // thread-safe).  The bounded channel caps peak memory to the in-flight
+        // planes — not the entire output cube — and overlaps convolution with disk
+        // IO.  Threading (not async) fits: the work is CPU-bound and FITS IO is
+        // blocking, so an async runtime would buy nothing.
+        pb.set_message("processing");
+
+        let cap = (rayon::current_num_threads() * 2).max(4);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<f32>)>(cap);
+
+        let writer_out = out.clone();
+        let writer_meta = meta; // copy of the &CubeMeta for the writer thread
+
+        let result: Result<()> = std::thread::scope(|s| {
+            // Single writer thread — owns the output FITS handle.  `FitsFile` holds
+            // a raw cfitsio pointer and is not `Send`, so it is opened *on* this
+            // thread and never crosses a thread boundary.
+            let writer_handle = s.spawn(move || -> Result<()> {
+                let mut writer = cube_io::CubeWriter::open(&writer_out)
+                    .with_context(|| format!("opening output cube {}", writer_out.display()))?;
+                for (c, plane) in rx {
+                    writer
+                        .write_channel(c, &plane, writer_meta)
+                        .with_context(|| {
+                            format!("writing channel {c} to {}", writer_out.display())
+                        })?;
+                }
+                Ok(())
+            });
+
+            // Parallel producers — convolve and stream finished planes to the writer.
+            let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
                 let old_beam = match meta.beams[c] {
                     Some(b) => b,
                     None => {
                         pb.inc(1);
-                        return Ok(None);
+                        return Ok(());
                     }
                 };
                 let target = match target_beams[c] {
                     Some(b) => b,
                     None => {
                         pb.inc(1);
-                        return Ok(None);
+                        return Ok(());
                     }
                 };
 
-                if let Some(cutoff) = args.shared.cutoff
+                // Verbose (-v) per-channel beam report: current, target, and the
+                // convolving kernel (target deconvolved from the current beam).
+                // Route through `pb.suspend` so the log never corrupts the live bar.
+                let kernel = target.deconvolve_or_zero(&old_beam);
+                pb.suspend(|| {
+                    debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
+                });
+
+                let plane = if let Some(cutoff) = args.shared.cutoff
                     && old_beam.major_arcsec() > cutoff
                 {
-                    warn!(
-                        "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                        old_beam.major_arcsec()
-                    );
-                    pb.inc(1);
-                    return Ok(Some(Array2::from_elem((meta.ny, meta.nx), f32::NAN)));
-                }
+                    pb.suspend(|| {
+                        warn!(
+                            "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
+                            old_beam.major_arcsec()
+                        )
+                    });
+                    Array2::from_elem((meta.ny, meta.nx), f32::NAN)
+                } else {
+                    let raw = cube_io::read_channel(file, c, meta)
+                        .with_context(|| format!("reading channel {c} from {}", file.display()))?;
+                    smooth(
+                        &raw,
+                        &old_beam,
+                        &target,
+                        meta.dx_deg,
+                        meta.dy_deg,
+                        args.shared.cutoff,
+                        meta.unit,
+                    )
+                    .with_context(|| format!("smoothing channel {c}"))?
+                };
 
-                let plane = cube_io::read_channel(file, c, meta)
-                    .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                let smoothed = smooth(
-                    &plane,
-                    &old_beam,
-                    &target,
-                    meta.dx_deg,
-                    meta.dy_deg,
-                    args.shared.cutoff,
-                    meta.unit,
-                )
-                .with_context(|| format!("smoothing channel {c}"))?;
+                // Hand the plane to the writer; a send error means the writer thread
+                // already exited (i.e. a write failed) — surface that below.
+                tx.send((c, plane))
+                    .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
                 pb.inc(1);
-                Ok(Some(smoothed))
-            })
-            .collect::<Result<_>>()?;
+                Ok(())
+            });
 
-        for (c, maybe_plane) in channel_results.into_iter().enumerate() {
-            if let Some(plane) = maybe_plane {
-                cube_io::write_channel(&out, c, &plane, meta)
-                    .with_context(|| format!("writing channel {c} to {}", out.display()))?;
-            }
-        }
+            // Close the channel so the writer loop ends, then join it.  Prefer the
+            // writer's error (the real cause) over the producers' generic
+            // "writer stopped" when both fail.
+            drop(tx);
+            let writer_result = writer_handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+            writer_result.and(produce)
+        });
+        result?;
 
         let beamlog = {
             let dir = out.parent().unwrap_or(Path::new("."));
@@ -437,8 +543,9 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         };
         cube_io::write_beamlog(&beamlog, &target_beams)
             .with_context(|| format!("writing beamlog {}", beamlog.display()))?;
+        pb.suspend(|| debug!("Beamlog written to {}", beamlog.display()));
 
-        info!("{} → {}", file.display(), out.display());
+        pb.suspend(|| info!("{} → {}", file.display(), out.display()));
     }
 
     pb.finish_with_message("done");
@@ -496,9 +603,9 @@ fn compute_target_beams(
 
 fn init_logging(verbose: u8) {
     let level = match verbose {
-        0 => tracing::Level::WARN,
-        1 => tracing::Level::INFO,
-        _ => tracing::Level::DEBUG,
+        0 => tracing::Level::INFO,
+        1 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
     };
     tracing_subscriber::fmt()
         .with_max_level(level)
@@ -552,6 +659,25 @@ fn progress_bar(total: u64) -> ProgressBar {
             .unwrap()
             .progress_chars("=>-"),
     );
+    // Steady tick animates the `{spinner}` even when `pos` is not advancing, so
+    // idle-but-busy phases (e.g. `init_output_cube` before the first channel is
+    // written) still show live activity rather than a frozen bar.
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+/// An indeterminate spinner for blocking phases that have no item count and run
+/// outside the main progress bar (e.g. reading metadata, solving for a common
+/// beam).  Caller drives it with `finish_and_clear` when the work completes.
+fn spinner(msg: impl Into<String>) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed}] {msg}")
+            .unwrap(),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(Duration::from_millis(100));
     pb
 }
 

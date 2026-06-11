@@ -125,11 +125,20 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
         }
     };
 
-    // Check for CASAMBM
-    let casambm: String = hdu.read_key(&mut fptr, "CASAMBM").unwrap_or_default();
+    // Check for CASAMBM.  CASA/beamcon write it as a FITS logical, but some tools
+    // (and our own older outputs) wrote a quoted string — accept both.
+    let casambm = hdu
+        .read_key::<bool>(&mut fptr, "CASAMBM")
+        .ok()
+        .or_else(|| {
+            hdu.read_key::<String>(&mut fptr, "CASAMBM")
+                .ok()
+                .map(|s| matches!(s.trim(), "T" | "TRUE"))
+        })
+        .unwrap_or(false);
     drop(fptr); // close for next reads
 
-    let beams: Vec<Option<Beam>> = if casambm.trim() == "T" || casambm.trim() == "TRUE" {
+    let beams: Vec<Option<Beam>> = if casambm {
         read_casambm_beams(path, nfreq)?
     } else {
         let beamlog = CubeMeta {
@@ -267,6 +276,42 @@ pub fn write_channel(
     Ok(())
 }
 
+/// A streaming writer that holds an initialised output cube open for the lifetime
+/// of a processing run, so channels can be written one at a time without the
+/// per-call file open/close overhead of [`write_channel`].
+///
+/// cfitsio drives a single file through one internal cursor and is **not**
+/// thread-safe, so a `CubeWriter` must be owned and driven by a single thread
+/// (the consumer end of the streaming pipeline in `main`).
+pub struct CubeWriter {
+    fptr: FitsFile,
+}
+
+impl CubeWriter {
+    /// Open an already-initialised output cube (see [`init_output_cube`]) for
+    /// sequential channel writes.
+    pub fn open(path: &Path) -> Result<Self, CubeError> {
+        let fptr = FitsFile::edit(path.to_string_lossy().into_owned())?;
+        Ok(Self { fptr })
+    }
+
+    /// Write one frequency channel plane into the open cube.
+    pub fn write_channel(
+        &mut self,
+        chan: usize,
+        data: &Array2<f32>,
+        meta: &CubeMeta,
+    ) -> Result<(), CubeError> {
+        let hdu = self.fptr.primary_hdu()?;
+        let plane = meta.ny * meta.nx;
+        let start = chan * plane;
+        let end = start + plane;
+        let flat: Vec<f32> = data.iter().copied().collect();
+        hdu.write_section(&mut self.fptr, start, end, &flat)?;
+        Ok(())
+    }
+}
+
 // ── Output cube initialisation ────────────────────────────────────────────────
 
 /// Mode for common-beam determination.
@@ -285,13 +330,106 @@ pub enum CubeMode {
 /// far cheaper than `std::fs::copy` for large cubes because the input pixel data is
 /// never read or written.
 fn copy_header_only(input: &Path, output: &Path) -> Result<(), CubeError> {
+    use std::ffi::CString;
+
     let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
     in_fptr.primary_hdu()?; // position at the primary HDU to copy
-    let mut out_fptr = FitsFile::create(output).overwrite().open()?;
+
+    // Create a *truly empty* output file with cfitsio `fits_create_file` (ffinit):
+    // it has no HDUs yet, so `fits_copy_header` (ffcphd) below initialises the
+    // primary HDU directly from the copied header.  We cannot use
+    // `FitsFile::create().open()` here — that eagerly writes a default empty
+    // (NAXIS=0) primary HDU, and ffcphd then copies *nothing* into the already
+    // existing primary, leaving a zero-dimensional image.  Writing pixel data to
+    // such an HDU later fails with the misleading cfitsio error 302
+    // ("column number < 1 or > tfields").
+    if output.exists() {
+        std::fs::remove_file(output)?;
+    }
+    let out_name = CString::new(output.to_string_lossy().into_owned())
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
 
     let mut status = 0;
+    let mut raw_out: *mut fitsio::sys::fitsfile = std::ptr::null_mut();
     unsafe {
-        fitsio::sys::ffcphd(in_fptr.as_raw(), out_fptr.as_raw(), &mut status);
+        fitsio::sys::ffinit(&mut raw_out, out_name.as_ptr(), &mut status);
+        fitsio::errors::check_status(status)?;
+
+        fitsio::sys::ffcphd(in_fptr.as_raw(), raw_out, &mut status);
+        let copy_status = fitsio::errors::check_status(status);
+
+        // Always close the raw output pointer, even if the copy failed.
+        let mut close_status = 0;
+        fitsio::sys::ffclos(raw_out, &mut close_status);
+        copy_status?;
+        fitsio::errors::check_status(close_status)?;
+    }
+    Ok(())
+}
+
+/// Update (or create) a floating-point header keyword *in place*.
+///
+/// fitsio's `write_key` calls cfitsio `ffpky*`, which **appends** a new card even
+/// when the keyword already exists — producing duplicate cards (cfitsio then reads
+/// the *first*, stale value).  Real cubes carry BMAJ/CASAMBM in the copied primary
+/// header, so we must use `fits_update_key` (ffuky*) to overwrite in place.
+fn update_key_f64(fptr: &mut FitsFile, name: &str, value: f64) -> Result<(), CubeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffukyd(
+            fptr.as_raw(),
+            c_name.as_ptr(),
+            value,
+            -15, // use the shortest decimal representation that round-trips
+            std::ptr::null_mut(),
+            &mut status,
+        );
+    }
+    fitsio::errors::check_status(status)?;
+    Ok(())
+}
+
+/// Update (or create) a string header keyword *in place* (see [`update_key_f64`]).
+#[allow(dead_code)]
+fn update_key_str(fptr: &mut FitsFile, name: &str, value: &str) -> Result<(), CubeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let c_value = std::ffi::CString::new(value)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffukys(
+            fptr.as_raw(),
+            c_name.as_ptr(),
+            c_value.as_ptr(),
+            std::ptr::null_mut(),
+            &mut status,
+        );
+    }
+    fitsio::errors::check_status(status)?;
+    Ok(())
+}
+
+/// Update (or create) a *logical* (boolean) header keyword in place.
+///
+/// `CASAMBM` is a FITS logical keyword (`T`/`F`, unquoted).  casacore / CARTA read
+/// it with `asBool`, which **throws** if the card is a quoted string (`'T'`) — that
+/// makes the cube unreadable.  Always write it as a true logical to match CASA and
+/// beamcon output.
+fn update_key_logical(fptr: &mut FitsFile, name: &str, value: bool) -> Result<(), CubeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffukyl(
+            fptr.as_raw(),
+            c_name.as_ptr(),
+            value as std::os::raw::c_int,
+            std::ptr::null_mut(),
+            &mut status,
+        );
     }
     fitsio::errors::check_status(status)?;
     Ok(())
@@ -327,18 +465,17 @@ pub fn init_output_cube(
     {
         let path_str = output_path.to_string_lossy().into_owned();
         let mut fptr = FitsFile::edit(&path_str)?;
-        let hdu = fptr.primary_hdu()?;
+        fptr.primary_hdu()?; // position at the primary HDU
 
-        // Update primary header PSF.
-        hdu.write_key(&mut fptr, "BMAJ", ref_beam.major_deg)?;
-        hdu.write_key(&mut fptr, "BMIN", ref_beam.minor_deg)?;
-        hdu.write_key(&mut fptr, "BPA", ref_beam.pa_deg)?;
+        // Update primary header PSF in place (the input header — copied verbatim —
+        // may already contain these keywords; appending would duplicate them).
+        update_key_f64(&mut fptr, "BMAJ", ref_beam.major_deg)?;
+        update_key_f64(&mut fptr, "BMIN", ref_beam.minor_deg)?;
+        update_key_f64(&mut fptr, "BPA", ref_beam.pa_deg)?;
 
-        if mode == CubeMode::Natural {
-            hdu.write_key(&mut fptr, "CASAMBM", "T")?;
-        } else {
-            let _ = hdu.write_key(&mut fptr, "CASAMBM", "F");
-        }
+        // CASAMBM must be a FITS *logical*, not a quoted string, or casacore/CARTA
+        // fail to open the cube (they read it with `asBool`).
+        update_key_logical(&mut fptr, "CASAMBM", mode == CubeMode::Natural)?;
     }
 
     if mode == CubeMode::Natural {
@@ -385,9 +522,14 @@ pub fn init_output_cube(
         table_hdu.write_col(&mut fptr, "CHAN", &chan)?;
         table_hdu.write_col(&mut fptr, "POL", &pol)?;
 
-        // Set standard BEAMS extension keywords.
+        // Standard BEAMS extension keywords.  `create_table` already wrote EXTNAME,
+        // so we do not re-write it (that would append a duplicate card).  Column
+        // units (TUNITn) are required by casacore/CARTA to interpret the beam table:
+        // BMAJ/BMIN in arcsec, BPA in deg.
         let beam_hdu = fptr.hdu("BEAMS")?;
-        beam_hdu.write_key(&mut fptr, "EXTNAME", "BEAMS")?;
+        beam_hdu.write_key(&mut fptr, "TUNIT1", "arcsec")?;
+        beam_hdu.write_key(&mut fptr, "TUNIT2", "arcsec")?;
+        beam_hdu.write_key(&mut fptr, "TUNIT3", "deg")?;
         beam_hdu.write_key(&mut fptr, "NCHAN", meta.nfreq as i64)?;
         beam_hdu.write_key(&mut fptr, "NPOL", 1i64)?;
     }
