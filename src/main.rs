@@ -186,10 +186,9 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     common = apply_beam_rounding(common, args.shared.circularise)?;
 
     info!("Common beam: {common}");
-    println!("Common beam: {common}");
 
     if args.shared.dryrun {
-        println!("Dry run — no files written.");
+        info!("Dry run — no files written.");
         return Ok(());
     }
 
@@ -199,6 +198,7 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         .par_iter()
         .zip(all_beams.par_iter())
         .map(|(file, old_beam)| {
+            pb.suspend(|| debug!("Reading {}", file.display()));
             let data = read_fits(file).with_context(|| format!("reading {}", file.display()))?;
             let out = output_path(
                 file,
@@ -207,6 +207,9 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 args.shared.outdir.as_deref(),
             );
             let conv_beam = common.deconvolve_or_zero(old_beam);
+            pb.suspend(|| {
+                debug!("{}: current {old_beam} | target {common} | kernel {conv_beam}", file.display())
+            });
             let smoothed = smooth(
                 &data.image,
                 old_beam,
@@ -217,9 +220,10 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 data.unit,
             )
             .with_context(|| format!("smoothing {}", file.display()))?;
+            pb.suspend(|| debug!("Writing {}", out.display()));
             write_fits(&smoothed, &out, file, &common, data.is_4d)
                 .with_context(|| format!("writing {}", out.display()))?;
-            info!("{} → {}", file.display(), out.display());
+            pb.suspend(|| info!("{} → {}", file.display(), out.display()));
             pb.inc(1);
             Ok(BeamLogEntry2D {
                 filename: out,
@@ -297,8 +301,18 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     let metas: Vec<CubeMeta> = files
         .iter()
         .map(|f| {
-            cube_io::read_cube_meta(f)
-                .with_context(|| format!("reading metadata from {}", f.display()))
+            debug!("Reading metadata + per-channel beams from {}", f.display());
+            let m = cube_io::read_cube_meta(f)
+                .with_context(|| format!("reading metadata from {}", f.display()))?;
+            debug!(
+                "{}: {}×{} px, {} channels, {} Stokes",
+                f.display(),
+                m.nx,
+                m.ny,
+                m.nfreq,
+                m.nstokes
+            );
+            Ok(m)
         })
         .collect::<Result<_>>()?;
 
@@ -361,18 +375,16 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         .windows(2)
         .all(|w| w[0] == w[1]);
     match target_beams.iter().find_map(|b| *b) {
-        Some(b) if all_same => println!("Target beam (all channels): {b}"),
+        Some(b) if all_same => info!("Target beam (all channels): {b}"),
         Some(b) => {
-            println!(
-                "Target beam varies per channel ({n_valid} valid channels); e.g. channel 0: {b}"
-            );
-            println!("Run with -vv to log the current/target/kernel beam for every channel.");
+            info!("Target beam varies per channel ({n_valid} valid channels); e.g. channel 0: {b}");
+            info!("Run with -v to log the current/target/kernel beam for every channel.");
         }
         None => {}
     }
 
     if args.shared.dryrun {
-        println!("Dry run — no files written.");
+        info!("Dry run — no files written.");
         return Ok(());
     }
 
@@ -391,10 +403,16 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             args.shared.outdir.as_deref(),
         );
 
+        // Cube initialisation copies the full primary header and (in natural mode)
+        // writes the BEAMS table — a potentially slow IO step on large cubes, so
+        // announce it.  `pb.suspend` keeps the log line from clobbering the bar.
+        pb.suspend(|| info!("Initialising output cube {} …", out.display()));
+        pb.set_message("initialising");
         cube_io::init_output_cube(file, &out, &target_beams, cube_mode, meta)
             .with_context(|| format!("initialising output cube {}", out.display()))?;
 
         // Process channels in parallel, write sequentially.
+        pb.set_message("smoothing");
         let channel_results: Vec<Option<Array2<f32>>> = (0..nfreq)
             .into_par_iter()
             .map(|c| -> Result<Option<Array2<f32>>> {
@@ -413,18 +431,23 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                     }
                 };
 
-                // Verbose (-vv) per-channel beam report: current, target, and the
+                // Verbose (-v) per-channel beam report: current, target, and the
                 // convolving kernel (target deconvolved from the current beam).
+                // Route through `pb.suspend` so the log never corrupts the live bar.
                 let kernel = target.deconvolve_or_zero(&old_beam);
-                debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}");
+                pb.suspend(|| {
+                    debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
+                });
 
                 if let Some(cutoff) = args.shared.cutoff
                     && old_beam.major_arcsec() > cutoff
                 {
-                    warn!(
-                        "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                        old_beam.major_arcsec()
-                    );
+                    pb.suspend(|| {
+                        warn!(
+                            "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
+                            old_beam.major_arcsec()
+                        )
+                    });
                     pb.inc(1);
                     return Ok(Some(Array2::from_elem((meta.ny, meta.nx), f32::NAN)));
                 }
@@ -446,8 +469,11 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             })
             .collect::<Result<_>>()?;
 
+        // Writing planes back is sequential disk IO; show it as a distinct phase.
+        pb.set_message("writing");
         for (c, maybe_plane) in channel_results.into_iter().enumerate() {
             if let Some(plane) = maybe_plane {
+                pb.suspend(|| debug!("Writing channel {c} to {}", out.display()));
                 cube_io::write_channel(&out, c, &plane, meta)
                     .with_context(|| format!("writing channel {c} to {}", out.display()))?;
             }
@@ -460,8 +486,9 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         };
         cube_io::write_beamlog(&beamlog, &target_beams)
             .with_context(|| format!("writing beamlog {}", beamlog.display()))?;
+        pb.suspend(|| debug!("Beamlog written to {}", beamlog.display()));
 
-        info!("{} → {}", file.display(), out.display());
+        pb.suspend(|| info!("{} → {}", file.display(), out.display()));
     }
 
     pb.finish_with_message("done");
@@ -519,9 +546,9 @@ fn compute_target_beams(
 
 fn init_logging(verbose: u8) {
     let level = match verbose {
-        0 => tracing::Level::WARN,
-        1 => tracing::Level::INFO,
-        _ => tracing::Level::DEBUG,
+        0 => tracing::Level::INFO,
+        1 => tracing::Level::DEBUG,
+        _ => tracing::Level::TRACE,
     };
     tracing_subscriber::fmt()
         .with_max_level(level)
