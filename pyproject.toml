@@ -13,6 +13,11 @@ license-files = ["LICENSE", "NOTICE.md"]
 description = "Rust port of beamcon from RACS-tools: smooth FITS images and cubes to a common beam via UV-plane (FFT) convolution"
 readme = "README.md"
 
+[project.urls]
+Homepage = "https://github.com/alecthomson/convolve-rs"
+Documentation = "https://convolve-rs.readthedocs.io"
+Repository = "https://github.com/alecthomson/convolve-rs"
+
 [project.optional-dependencies]
 test = ["pytest", "radio-beam", "astropy"]
 dev = ["prek", "ty"]
@@ -25,8 +30,28 @@ benchmark = [
     "pandas>=2.3.3",
 ]
 
+[dependency-groups]
+# Docs build: `uv sync --group docs` then `uv run sphinx-build docs docs/_build`.
+# A PEP 735 group (not an extra) so it never appears in the published wheel
+# metadata.
+docs = [
+  "sphinx<9",
+  "myst-nb>=1.1",            # markdown + executed notebooks (re-runs at every build)
+  "furo>=2024.8.6",
+  "sphinx-autoapi>=3.8.0",
+  "sphinx-autodoc-typehints",
+  "sphinx-copybutton",
+  "sphinxcontrib-programoutput", # runs `convolvers --help` at build time (needs cargo)
+  "matplotlib>=3.8",
+  "astropy>=6",
+]
+
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# `--doctest-modules` checks the examples in the pure-Python wrapper's
+# docstrings; the compiled extension's docstrings are checked by
+# tests/test_doctests.py.
+testpaths = ["tests", "convolve_rs"]
+addopts = "--doctest-modules"
 
 [tool.ruff]
 target-version = "py310"

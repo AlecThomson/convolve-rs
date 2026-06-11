@@ -1,4 +1,4 @@
-/// High-level smoothing: convolve + apply Jy/beam flux scaling.
+//! High-level smoothing: convolve + apply Jy/beam flux scaling.
 use ndarray::Array2;
 use thiserror::Error;
 
@@ -27,6 +27,16 @@ pub enum BrightnessUnit {
 impl BrightnessUnit {
     /// Classify a FITS `BUNIT` string, returning `None` if the unit is not
     /// recognised (neither a Kelvin nor a Jy/beam form).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use convolve_rs::BrightnessUnit;
+    ///
+    /// assert_eq!(BrightnessUnit::parse("Jy/beam"), Some(BrightnessUnit::JyPerBeam));
+    /// assert_eq!(BrightnessUnit::parse(" K "), Some(BrightnessUnit::Kelvin));
+    /// assert_eq!(BrightnessUnit::parse("Jy/pixel"), None);
+    /// ```
     pub fn parse(bunit: &str) -> Option<Self> {
         let u = bunit.trim().trim_matches('\'').trim().to_ascii_uppercase();
         match u.as_str() {
@@ -61,6 +71,29 @@ impl BrightnessUnit {
 /// scaling: [`BrightnessUnit::JyPerBeam`] applies the Gaussian factor,
 /// [`BrightnessUnit::Kelvin`] leaves the data unscaled (factor 1).  Returns an
 /// image with the same dtype (f32) and pixel shape, ready to write back to FITS.
+///
+/// # Examples
+///
+/// Smoothing a flat image from a 10″ to a 20″ circular beam:
+///
+/// ```
+/// use convolve_rs::{Beam, BrightnessUnit, smooth};
+/// use ndarray::Array2;
+///
+/// let old = Beam::from_arcsec(10.0, 10.0, 0.0)?;
+/// let new = Beam::from_arcsec(20.0, 20.0, 0.0)?;
+/// let image = Array2::<f32>::from_elem((64, 64), 1.0);
+/// let dx = 2.5 / 3600.0;
+///
+/// // Jy/beam: pixel values scale by the beam-area ratio Ω_new/Ω_old = 4.
+/// let jy = smooth(&image, &old, &new, dx, dx, None, BrightnessUnit::JyPerBeam)?;
+/// assert!((jy[(32, 32)] - 4.0).abs() < 1e-3);
+///
+/// // Kelvin: surface brightness is conserved, so a flat image stays at 1.
+/// let k = smooth(&image, &old, &new, dx, dx, None, BrightnessUnit::Kelvin)?;
+/// assert!((k[(32, 32)] - 1.0).abs() < 1e-3);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn smooth(
     image: &Array2<f32>,
     old_beam: &Beam,

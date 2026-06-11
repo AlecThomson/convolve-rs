@@ -1,10 +1,10 @@
-/// FITS spectral cube reading and writing with per-channel beam support.
-///
-/// Supports 3D cubes (NAXIS=3: freq×dec×ra) and 4D cubes (NAXIS=4: stokes×freq×dec×ra).
-/// Per-channel beams are read from, in priority order:
-///   1. CASA BEAMS binary-table extension (CASAMBM=T in header)
-///   2. Co-located beamlog text file: `{dir}/beamlog.{stem}.txt`
-///   3. Single BMAJ/BMIN/BPA from the primary header (broadcast to all channels)
+//! FITS spectral cube reading and writing with per-channel beam support.
+//!
+//! Supports 3D cubes (NAXIS=3: freq×dec×ra) and 4D cubes (NAXIS=4: stokes×freq×dec×ra).
+//! Per-channel beams are read from, in priority order:
+//!   1. CASA BEAMS binary-table extension (CASAMBM=T in header)
+//!   2. Co-located beamlog text file: `{dir}/beamlog.{stem}.txt`
+//!   3. Single BMAJ/BMIN/BPA from the primary header (broadcast to all channels)
 use std::path::{Path, PathBuf};
 
 use fitsio::{

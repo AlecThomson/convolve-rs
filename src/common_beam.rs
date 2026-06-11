@@ -1,9 +1,9 @@
-/// Common beam algorithms.
-///
-/// Two algorithms are provided:
-/// - `find_commonbeam_between`: analytic CASA algorithm for exactly 2 beams.
-/// - `common_manybeams_mve`: Khachiyan minimum-volume-enclosing-ellipsoid for N beams.
-/// - `common_beam`: dispatcher that picks the appropriate algorithm.
+//! Common beam algorithms.
+//!
+//! Two algorithms are provided:
+//! - [`find_commonbeam_between`]: analytic CASA algorithm for exactly 2 beams.
+//! - [`common_manybeams_mve`]: Khachiyan minimum-volume-enclosing-ellipsoid for N beams.
+//! - [`common_beam`]: dispatcher that picks the appropriate algorithm.
 use crate::beam::{Beam, BeamError, deconvolve_deg};
 use thiserror::Error;
 
@@ -30,6 +30,22 @@ pub enum CommonBeamError {
 /// Uses the 2-beam analytic algorithm when `beams.len() == 2`, otherwise
 /// the Khachiyan minimum-volume-enclosing-ellipse algorithm (same as
 /// `radio_beam.Beams.common_beam(method='pts')`).
+///
+/// # Examples
+///
+/// ```
+/// use convolve_rs::{Beam, common_beam};
+///
+/// let b1 = Beam::from_arcsec(10.0, 8.0, 30.0)?;
+/// let b2 = Beam::from_arcsec(12.0, 6.0, 60.0)?;
+/// let common = common_beam(&[b1, b2], 1e-4, 200, 5e-4)?;
+///
+/// // The common beam contains every input beam, so it is at least as large.
+/// assert!(common.area_sr() >= b1.area_sr());
+/// assert!(common.area_sr() >= b2.area_sr());
+/// assert!(common.major_arcsec() >= 12.0);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn common_beam(
     beams: &[Beam],
     tolerance: f64,

@@ -9,7 +9,14 @@ authors = ["Alec Thomson"]
 license = "BSD-3-Clause"
 description = "Rust port of beamcon from RACS-tools: smooth FITS images and cubes to a common beam via UV-plane (FFT) convolution"
 repository = "https://github.com/alecthomson/convolve-rs"
+documentation = "https://docs.rs/convolve-rs"
 readme = "README.md"
+
+[package.metadata.docs.rs]
+# Build API docs with default features only: the optional `python`/`abi3`
+# features need a Python toolchain and add nothing to the Rust API docs.
+no-default-features = false
+features = []
 
 [lib]
 name = "convolve_rs"

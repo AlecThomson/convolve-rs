@@ -25,6 +25,18 @@ use std::fmt;
 
 use thiserror::Error;
 
+/// A 2D elliptical Gaussian beam in FITS conventions.
+///
+/// # Examples
+///
+/// ```
+/// use convolve_rs::Beam;
+///
+/// let beam = Beam::from_arcsec(20.0, 10.0, 45.0)?;
+/// assert_eq!(beam.major_arcsec(), 20.0);
+/// assert_eq!(beam.major_deg, 20.0 / 3600.0);
+/// # Ok::<(), convolve_rs::BeamError>(())
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Beam {
     /// FWHM major axis in degrees (FITS BMAJ)
@@ -126,6 +138,26 @@ impl Cov {
 }
 
 impl Beam {
+    /// Create a beam from FWHM axes in degrees and a position angle in degrees
+    /// East of North.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BeamError::InvalidAxes`] if `minor_deg > major_deg`, and
+    /// [`BeamError::NotFinite`] if any value is NaN or infinite.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use convolve_rs::Beam;
+    ///
+    /// let beam = Beam::new(20.0 / 3600.0, 10.0 / 3600.0, 45.0)?;
+    /// assert_eq!(beam.pa_deg, 45.0);
+    ///
+    /// // Minor axis larger than major is rejected.
+    /// assert!(Beam::new(10.0 / 3600.0, 20.0 / 3600.0, 0.0).is_err());
+    /// # Ok::<(), convolve_rs::BeamError>(())
+    /// ```
     pub fn new(major_deg: f64, minor_deg: f64, pa_deg: f64) -> Result<Self, BeamError> {
         if !major_deg.is_finite() || !minor_deg.is_finite() || !pa_deg.is_finite() {
             return Err(BeamError::NotFinite);
@@ -143,6 +175,18 @@ impl Beam {
         })
     }
 
+    /// Create a beam from FWHM axes in arcseconds and a position angle in
+    /// degrees East of North.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use convolve_rs::Beam;
+    ///
+    /// let beam = Beam::from_arcsec(20.0, 10.0, 45.0)?;
+    /// assert_eq!(beam.minor_deg, 10.0 / 3600.0);
+    /// # Ok::<(), convolve_rs::BeamError>(())
+    /// ```
     pub fn from_arcsec(
         major_arcsec: f64,
         minor_arcsec: f64,
@@ -199,6 +243,24 @@ impl Beam {
     /// Subtracts the covariance of `other` from that of `self` and reads off the
     /// residual ellipse. Fails if the residual is not positive-definite (the
     /// source beam is not larger than the PSF). Inputs/outputs in degrees.
+    ///
+    /// # Examples
+    ///
+    /// Deconvolution inverts convolution:
+    ///
+    /// ```
+    /// use convolve_rs::Beam;
+    ///
+    /// let a = Beam::from_arcsec(10.0, 8.0, 30.0)?;
+    /// let b = Beam::from_arcsec(6.0, 5.0, 15.0)?;
+    /// let recovered = a.convolve(&b).deconvolve(&a)?;
+    /// assert!((recovered.major_arcsec() - b.major_arcsec()).abs() < 1e-6);
+    /// assert!((recovered.minor_arcsec() - b.minor_arcsec()).abs() < 1e-6);
+    ///
+    /// // Deconvolving a larger beam from a smaller one fails.
+    /// assert!(b.deconvolve(&a).is_err());
+    /// # Ok::<(), convolve_rs::BeamError>(())
+    /// ```
     pub fn deconvolve(&self, other: &Beam) -> Result<Beam, BeamError> {
         let (new_major, new_minor, new_pa_rad) = deconvolve_deg(
             self.major_deg,
@@ -226,6 +288,20 @@ impl Beam {
 
     /// Convolve `self` with `other`: sum the covariance matrices and read off the
     /// resulting ellipse.
+    ///
+    /// # Examples
+    ///
+    /// Convolving two circular beams adds their axes in quadrature:
+    ///
+    /// ```
+    /// use convolve_rs::Beam;
+    ///
+    /// let a = Beam::from_arcsec(3.0, 3.0, 0.0)?;
+    /// let b = Beam::from_arcsec(4.0, 4.0, 0.0)?;
+    /// let c = a.convolve(&b);
+    /// assert!((c.major_arcsec() - 5.0).abs() < 1e-9);
+    /// # Ok::<(), convolve_rs::BeamError>(())
+    /// ```
     pub fn convolve(&self, other: &Beam) -> Beam {
         let combined = self.cov_deg().add(&other.cov_deg());
         let (lam_major, lam_minor) = combined.eigenvalues();
@@ -325,6 +401,21 @@ pub(crate) fn deconvolve_deg(
 /// returned factor rescales pixel values by the pixel area over that amplitude.
 ///
 /// Returns `(fac, amp, result_bmaj_arcsec, result_bmin_arcsec, result_bpa_deg)`.
+///
+/// # Examples
+///
+/// ```
+/// use convolve_rs::{Beam, gauss_factor};
+///
+/// let orig = Beam::from_arcsec(10.0, 10.0, 0.0)?;
+/// let conv = Beam::from_arcsec(5.0, 5.0, 0.0)?;
+/// let (fac, _amp, bmaj, bmin, _bpa) = gauss_factor(&conv, &orig, 2.5, 2.5);
+/// assert!(fac > 0.0);
+/// // The resulting beam adds axes in quadrature: √(10² + 5²).
+/// assert!((bmaj - 125.0_f64.sqrt()).abs() < 1e-9);
+/// assert!((bmin - bmaj).abs() < 1e-9);
+/// # Ok::<(), convolve_rs::BeamError>(())
+/// ```
 pub fn gauss_factor(
     conv_beam: &Beam,
     orig_beam: &Beam,
