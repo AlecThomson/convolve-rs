@@ -285,13 +285,82 @@ pub enum CubeMode {
 /// far cheaper than `std::fs::copy` for large cubes because the input pixel data is
 /// never read or written.
 fn copy_header_only(input: &Path, output: &Path) -> Result<(), CubeError> {
+    use std::ffi::CString;
+
     let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
     in_fptr.primary_hdu()?; // position at the primary HDU to copy
-    let mut out_fptr = FitsFile::create(output).overwrite().open()?;
+
+    // Create a *truly empty* output file with cfitsio `fits_create_file` (ffinit):
+    // it has no HDUs yet, so `fits_copy_header` (ffcphd) below initialises the
+    // primary HDU directly from the copied header.  We cannot use
+    // `FitsFile::create().open()` here — that eagerly writes a default empty
+    // (NAXIS=0) primary HDU, and ffcphd then copies *nothing* into the already
+    // existing primary, leaving a zero-dimensional image.  Writing pixel data to
+    // such an HDU later fails with the misleading cfitsio error 302
+    // ("column number < 1 or > tfields").
+    if output.exists() {
+        std::fs::remove_file(output)?;
+    }
+    let out_name = CString::new(output.to_string_lossy().into_owned())
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
 
     let mut status = 0;
+    let mut raw_out: *mut fitsio::sys::fitsfile = std::ptr::null_mut();
     unsafe {
-        fitsio::sys::ffcphd(in_fptr.as_raw(), out_fptr.as_raw(), &mut status);
+        fitsio::sys::ffinit(&mut raw_out, out_name.as_ptr(), &mut status);
+        fitsio::errors::check_status(status)?;
+
+        fitsio::sys::ffcphd(in_fptr.as_raw(), raw_out, &mut status);
+        let copy_status = fitsio::errors::check_status(status);
+
+        // Always close the raw output pointer, even if the copy failed.
+        let mut close_status = 0;
+        fitsio::sys::ffclos(raw_out, &mut close_status);
+        copy_status?;
+        fitsio::errors::check_status(close_status)?;
+    }
+    Ok(())
+}
+
+/// Update (or create) a floating-point header keyword *in place*.
+///
+/// fitsio's `write_key` calls cfitsio `ffpky*`, which **appends** a new card even
+/// when the keyword already exists — producing duplicate cards (cfitsio then reads
+/// the *first*, stale value).  Real cubes carry BMAJ/CASAMBM in the copied primary
+/// header, so we must use `fits_update_key` (ffuky*) to overwrite in place.
+fn update_key_f64(fptr: &mut FitsFile, name: &str, value: f64) -> Result<(), CubeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffukyd(
+            fptr.as_raw(),
+            c_name.as_ptr(),
+            value,
+            -15, // use the shortest decimal representation that round-trips
+            std::ptr::null_mut(),
+            &mut status,
+        );
+    }
+    fitsio::errors::check_status(status)?;
+    Ok(())
+}
+
+/// Update (or create) a string header keyword *in place* (see [`update_key_f64`]).
+fn update_key_str(fptr: &mut FitsFile, name: &str, value: &str) -> Result<(), CubeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let c_value = std::ffi::CString::new(value)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffukys(
+            fptr.as_raw(),
+            c_name.as_ptr(),
+            c_value.as_ptr(),
+            std::ptr::null_mut(),
+            &mut status,
+        );
     }
     fitsio::errors::check_status(status)?;
     Ok(())
@@ -327,17 +396,18 @@ pub fn init_output_cube(
     {
         let path_str = output_path.to_string_lossy().into_owned();
         let mut fptr = FitsFile::edit(&path_str)?;
-        let hdu = fptr.primary_hdu()?;
+        fptr.primary_hdu()?; // position at the primary HDU
 
-        // Update primary header PSF.
-        hdu.write_key(&mut fptr, "BMAJ", ref_beam.major_deg)?;
-        hdu.write_key(&mut fptr, "BMIN", ref_beam.minor_deg)?;
-        hdu.write_key(&mut fptr, "BPA", ref_beam.pa_deg)?;
+        // Update primary header PSF in place (the input header — copied verbatim —
+        // may already contain these keywords; appending would duplicate them).
+        update_key_f64(&mut fptr, "BMAJ", ref_beam.major_deg)?;
+        update_key_f64(&mut fptr, "BMIN", ref_beam.minor_deg)?;
+        update_key_f64(&mut fptr, "BPA", ref_beam.pa_deg)?;
 
         if mode == CubeMode::Natural {
-            hdu.write_key(&mut fptr, "CASAMBM", "T")?;
+            update_key_str(&mut fptr, "CASAMBM", "T")?;
         } else {
-            let _ = hdu.write_key(&mut fptr, "CASAMBM", "F");
+            update_key_str(&mut fptr, "CASAMBM", "F")?;
         }
     }
 

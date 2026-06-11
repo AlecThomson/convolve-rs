@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
 use rayon::prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use convolve_rs::{
     beam::Beam,
@@ -349,8 +349,26 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         )?
     };
 
-    if let Some(b) = target_beams.iter().find_map(|b| *b) {
-        println!("Target beam (first valid channel): {b}");
+    // Report the target beam(s).  In `total` mode (or with an explicit target) all
+    // channels share one beam, so print it directly.  In `natural` mode every channel
+    // has its own target, so summarise the count and defer the per-channel detail to
+    // verbose logging in the processing loop below.
+    let n_valid = target_beams.iter().filter(|b| b.is_some()).count();
+    let all_same = target_beams
+        .iter()
+        .filter_map(|b| *b)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .all(|w| w[0] == w[1]);
+    match target_beams.iter().find_map(|b| *b) {
+        Some(b) if all_same => println!("Target beam (all channels): {b}"),
+        Some(b) => {
+            println!(
+                "Target beam varies per channel ({n_valid} valid channels); e.g. channel 0: {b}"
+            );
+            println!("Run with -vv to log the current/target/kernel beam for every channel.");
+        }
+        None => {}
     }
 
     if args.shared.dryrun {
@@ -394,6 +412,11 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
                         return Ok(None);
                     }
                 };
+
+                // Verbose (-vv) per-channel beam report: current, target, and the
+                // convolving kernel (target deconvolved from the current beam).
+                let kernel = target.deconvolve_or_zero(&old_beam);
+                debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}");
 
                 if let Some(cutoff) = args.shared.cutoff
                     && old_beam.major_arcsec() > cutoff
