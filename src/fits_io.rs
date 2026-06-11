@@ -112,8 +112,11 @@ pub fn write_fits(
     new_beam: &Beam,
     _was_4d: bool,
 ) -> Result<(), FitsError> {
-    // Copy original file to destination, preserving all headers.
-    std::fs::copy(template_path, out_path)?;
+    // Initialise the destination cheaply: copy only the template's primary-HDU
+    // header (preserving WCS/HISTORY/etc.), not its pixel data.  The data unit is
+    // defined by the copied NAXIS keywords; we overwrite every pixel below, so
+    // reading the template's data via `std::fs::copy` would be wasted I/O.
+    copy_header_only(template_path, out_path)?;
 
     let out_str = out_path.to_string_lossy().into_owned();
     let mut fptr = FitsFile::edit(&out_str)?;
@@ -128,6 +131,24 @@ pub fn write_fits(
     hdu.write_key(&mut fptr, "BMIN", new_beam.minor_deg)?;
     hdu.write_key(&mut fptr, "BPA", new_beam.pa_deg)?;
 
+    Ok(())
+}
+
+/// Create `output` containing only the primary-HDU header of `input` — no pixel data.
+///
+/// Uses cfitsio `fits_copy_header` (ffcphd): the output data unit is defined by the
+/// copied NAXIS keywords and zero-filled (sparsely) on close, avoiding a full read of
+/// the template's pixel data.
+fn copy_header_only(input: &Path, output: &Path) -> Result<(), FitsError> {
+    let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
+    in_fptr.primary_hdu()?; // position at the primary HDU to copy
+    let mut out_fptr = FitsFile::create(output).overwrite().open()?;
+
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffcphd(in_fptr.as_raw(), out_fptr.as_raw(), &mut status);
+    }
+    fitsio::errors::check_status(status)?;
     Ok(())
 }
 
