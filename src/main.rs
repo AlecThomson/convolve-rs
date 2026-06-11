@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -136,7 +137,7 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     let files = collect_files(&args.infile, args.listfile)?;
     let target_beam = parse_target_beam(&args.shared)?;
 
-    info!("Reading beam parameters from {} files", files.len());
+    let sp = spinner(format!("Reading beam parameters from {} file(s)…", files.len()));
     let all_beams: Vec<Beam> = files
         .iter()
         .map(|f| {
@@ -144,16 +145,19 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             if let Some(cutoff) = args.shared.cutoff
                 && data.beam.major_arcsec() > cutoff
             {
-                warn!(
-                    "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
-                    f.display(),
-                    data.beam.major_arcsec(),
-                    cutoff
-                );
+                sp.suspend(|| {
+                    warn!(
+                        "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
+                        f.display(),
+                        data.beam.major_arcsec(),
+                        cutoff
+                    )
+                });
             }
             Ok(data.beam)
         })
         .collect::<Result<Vec<_>>>()?;
+    sp.finish_and_clear();
 
     let mut common = match target_beam {
         Some(b) => {
@@ -173,13 +177,16 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 .cloned()
                 .collect();
             anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
-            common_beam(
+            let sp = spinner("Solving for the common beam…");
+            let cb = common_beam(
                 &valid,
                 args.shared.tolerance,
                 args.shared.nsamps,
                 args.shared.epsilon,
             )
-            .context("could not find common beam")?
+            .context("could not find common beam")?;
+            sp.finish_and_clear();
+            cb
         }
     };
 
@@ -297,24 +304,28 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
 
     let files = collect_files(&args.infile, args.listfile)?;
 
-    info!("Reading cube metadata from {} file(s)", files.len());
+    let sp = spinner(format!("Reading metadata from {} cube(s)…", files.len()));
     let metas: Vec<CubeMeta> = files
         .iter()
         .map(|f| {
-            debug!("Reading metadata + per-channel beams from {}", f.display());
+            sp.suspend(|| debug!("Reading metadata + per-channel beams from {}", f.display()));
             let m = cube_io::read_cube_meta(f)
                 .with_context(|| format!("reading metadata from {}", f.display()))?;
-            debug!(
-                "{}: {}×{} px, {} channels, {} Stokes",
-                f.display(),
-                m.nx,
-                m.ny,
-                m.nfreq,
-                m.nstokes
-            );
+            sp.suspend(|| {
+                debug!(
+                    "{}: {}×{} px, {} channels, {} Stokes",
+                    f.display(),
+                    m.nx,
+                    m.ny,
+                    m.nfreq,
+                    m.nstokes
+                )
+            });
             Ok(m)
         })
         .collect::<Result<_>>()?;
+    sp.finish_and_clear();
+    info!("Read metadata from {} cube(s)", files.len());
 
     let nfreq = metas[0].nfreq;
     for (f, m) in files.iter().zip(metas.iter()) {
@@ -352,7 +363,11 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             ModeArg::Natural => CubeMode::Natural,
             ModeArg::Total => CubeMode::Total,
         };
-        compute_target_beams(
+        let sp = spinner(match mode {
+            CubeMode::Natural => "Solving for per-channel common beams…".to_string(),
+            CubeMode::Total => "Solving for the common beam across all channels…".to_string(),
+        });
+        let beams = compute_target_beams(
             &metas,
             mode,
             args.shared.cutoff,
@@ -360,7 +375,9 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             args.shared.tolerance,
             args.shared.nsamps,
             args.shared.epsilon,
-        )?
+        )?;
+        sp.finish_and_clear();
+        beams
     };
 
     // Report the target beam(s).  In `total` mode (or with an explicit target) all
@@ -634,6 +651,25 @@ fn progress_bar(total: u64) -> ProgressBar {
             .unwrap()
             .progress_chars("=>-"),
     );
+    // Steady tick animates the `{spinner}` even when `pos` is not advancing, so
+    // idle-but-busy phases (e.g. `init_output_cube` before the first channel is
+    // written) still show live activity rather than a frozen bar.
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+/// An indeterminate spinner for blocking phases that have no item count and run
+/// outside the main progress bar (e.g. reading metadata, solving for a common
+/// beam).  Caller drives it with `finish_and_clear` when the work completes.
+fn spinner(msg: impl Into<String>) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed}] {msg}")
+            .unwrap(),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(Duration::from_millis(100));
     pb
 }
 
