@@ -125,11 +125,20 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
         }
     };
 
-    // Check for CASAMBM
-    let casambm: String = hdu.read_key(&mut fptr, "CASAMBM").unwrap_or_default();
+    // Check for CASAMBM.  CASA/beamcon write it as a FITS logical, but some tools
+    // (and our own older outputs) wrote a quoted string — accept both.
+    let casambm = hdu
+        .read_key::<bool>(&mut fptr, "CASAMBM")
+        .ok()
+        .or_else(|| {
+            hdu.read_key::<String>(&mut fptr, "CASAMBM")
+                .ok()
+                .map(|s| matches!(s.trim(), "T" | "TRUE"))
+        })
+        .unwrap_or(false);
     drop(fptr); // close for next reads
 
-    let beams: Vec<Option<Beam>> = if casambm.trim() == "T" || casambm.trim() == "TRUE" {
+    let beams: Vec<Option<Beam>> = if casambm {
         read_casambm_beams(path, nfreq)?
     } else {
         let beamlog = CubeMeta {
@@ -383,6 +392,7 @@ fn update_key_f64(fptr: &mut FitsFile, name: &str, value: f64) -> Result<(), Cub
 }
 
 /// Update (or create) a string header keyword *in place* (see [`update_key_f64`]).
+#[allow(dead_code)]
 fn update_key_str(fptr: &mut FitsFile, name: &str, value: &str) -> Result<(), CubeError> {
     let c_name = std::ffi::CString::new(name)
         .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
@@ -394,6 +404,29 @@ fn update_key_str(fptr: &mut FitsFile, name: &str, value: &str) -> Result<(), Cu
             fptr.as_raw(),
             c_name.as_ptr(),
             c_value.as_ptr(),
+            std::ptr::null_mut(),
+            &mut status,
+        );
+    }
+    fitsio::errors::check_status(status)?;
+    Ok(())
+}
+
+/// Update (or create) a *logical* (boolean) header keyword in place.
+///
+/// `CASAMBM` is a FITS logical keyword (`T`/`F`, unquoted).  casacore / CARTA read
+/// it with `asBool`, which **throws** if the card is a quoted string (`'T'`) — that
+/// makes the cube unreadable.  Always write it as a true logical to match CASA and
+/// beamcon output.
+fn update_key_logical(fptr: &mut FitsFile, name: &str, value: bool) -> Result<(), CubeError> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffukyl(
+            fptr.as_raw(),
+            c_name.as_ptr(),
+            value as std::os::raw::c_int,
             std::ptr::null_mut(),
             &mut status,
         );
@@ -440,11 +473,9 @@ pub fn init_output_cube(
         update_key_f64(&mut fptr, "BMIN", ref_beam.minor_deg)?;
         update_key_f64(&mut fptr, "BPA", ref_beam.pa_deg)?;
 
-        if mode == CubeMode::Natural {
-            update_key_str(&mut fptr, "CASAMBM", "T")?;
-        } else {
-            update_key_str(&mut fptr, "CASAMBM", "F")?;
-        }
+        // CASAMBM must be a FITS *logical*, not a quoted string, or casacore/CARTA
+        // fail to open the cube (they read it with `asBool`).
+        update_key_logical(&mut fptr, "CASAMBM", mode == CubeMode::Natural)?;
     }
 
     if mode == CubeMode::Natural {
@@ -491,9 +522,14 @@ pub fn init_output_cube(
         table_hdu.write_col(&mut fptr, "CHAN", &chan)?;
         table_hdu.write_col(&mut fptr, "POL", &pol)?;
 
-        // Set standard BEAMS extension keywords.
+        // Standard BEAMS extension keywords.  `create_table` already wrote EXTNAME,
+        // so we do not re-write it (that would append a duplicate card).  Column
+        // units (TUNITn) are required by casacore/CARTA to interpret the beam table:
+        // BMAJ/BMIN in arcsec, BPA in deg.
         let beam_hdu = fptr.hdu("BEAMS")?;
-        beam_hdu.write_key(&mut fptr, "EXTNAME", "BEAMS")?;
+        beam_hdu.write_key(&mut fptr, "TUNIT1", "arcsec")?;
+        beam_hdu.write_key(&mut fptr, "TUNIT2", "arcsec")?;
+        beam_hdu.write_key(&mut fptr, "TUNIT3", "deg")?;
         beam_hdu.write_key(&mut fptr, "NCHAN", meta.nfreq as i64)?;
         beam_hdu.write_key(&mut fptr, "NPOL", 1i64)?;
     }

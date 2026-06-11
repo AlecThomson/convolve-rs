@@ -118,6 +118,48 @@ fn natural_mode_write_channel_and_beams() {
     }
 }
 
+/// CASAMBM must be a FITS *logical* (readable as `bool`), not a quoted string —
+/// casacore/CARTA read it with `asBool` and fail to open the cube otherwise.
+/// Also pins the BEAMS-table column units that casacore needs.
+#[test]
+fn casambm_is_logical_not_string() {
+    let dir = workdir("casambm");
+    let path = dir.join("in.fits");
+    make_cube(&path);
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
+
+    // Total mode → CASAMBM = F (logical), single HDU.
+    let total = dir.join("total.fits");
+    cube_io::init_output_cube(&path, &total, &target, CubeMode::Total, &meta).unwrap();
+    {
+        let mut f = FitsFile::edit(total.to_string_lossy().to_string()).unwrap();
+        let hdu = f.primary_hdu().unwrap();
+        let v: bool = hdu
+            .read_key(&mut f, "CASAMBM")
+            .expect("CASAMBM must be readable as a logical");
+        assert!(!v, "total mode CASAMBM should be F");
+    }
+
+    // Natural mode → CASAMBM = T (logical) + BEAMS table with column units.
+    let nat = dir.join("natural.fits");
+    cube_io::init_output_cube(&path, &nat, &target, CubeMode::Natural, &meta).unwrap();
+    {
+        let mut f = FitsFile::edit(nat.to_string_lossy().to_string()).unwrap();
+        let hdu = f.primary_hdu().unwrap();
+        let v: bool = hdu
+            .read_key(&mut f, "CASAMBM")
+            .expect("CASAMBM must be readable as a logical");
+        assert!(v, "natural mode CASAMBM should be T");
+
+        let beams = f.hdu("BEAMS").unwrap();
+        let u1: String = beams.read_key(&mut f, "TUNIT1").unwrap();
+        let u2: String = beams.read_key(&mut f, "TUNIT2").unwrap();
+        let u3: String = beams.read_key(&mut f, "TUNIT3").unwrap();
+        assert_eq!((u1.trim(), u2.trim(), u3.trim()), ("arcsec", "arcsec", "deg"));
+    }
+}
+
 // ── End-to-end CLI smoke tests ─────────────────────────────────────────────────
 //
 // Drive the actual `convolvers` binary on a synthetic cube — the same path that
