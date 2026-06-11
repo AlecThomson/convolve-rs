@@ -34,8 +34,8 @@ def _resolve_version() -> str:
         if tag:
             return tag.removeprefix("v")
     try:
-        described = subprocess.run(  # noqa: S603
-            ["git", "describe", "--tags", "--always", "--dirty"],  # noqa: S607
+        described = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
             capture_output=True,
             text=True,
             check=True,
