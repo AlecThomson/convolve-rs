@@ -7,12 +7,46 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 from __future__ import annotations
 
+import os
+import subprocess
 from importlib.metadata import version as get_version
+from pathlib import Path
 
 project = "convolve-rs"
 copyright = "2026, Alec Thomson"
 author = "Alec Thomson"
-version = release = get_version("convolve-rs")
+
+
+def _resolve_version() -> str:
+    """Work out a meaningful version for the docs.
+
+    The in-repo version is a ``0.0.0`` placeholder; the release workflow
+    injects the real version from the git tag (see Cargo.toml). When the
+    installed package still reports the placeholder, fall back to Read the
+    Docs build metadata (tag builds) or ``git describe`` (branch/local
+    builds).
+    """
+    installed = get_version("convolve-rs")
+    if installed != "0.0.0":
+        return installed
+    if os.environ.get("READTHEDOCS_VERSION_TYPE") == "tag":
+        tag = os.environ.get("READTHEDOCS_GIT_IDENTIFIER", "")
+        if tag:
+            return tag.removeprefix("v")
+    try:
+        described = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=Path(__file__).parent,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return installed
+    return f"{described} (dev)" if described else installed
+
+
+version = release = _resolve_version()
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
