@@ -28,6 +28,18 @@ use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
 ///     Beam.from_arcsec: Construct from arcsecond axes.
 ///     Beam.from_fits_header: Construct from an astropy FITS header.
 ///     Beam.from_radio_beam: Construct from a ``radio_beam.Beam`` object.
+///
+/// Examples:
+///     >>> from convolve_rs import Beam
+///     >>> beam = Beam(0.005, 0.004, 30.0)
+///     >>> beam.major_deg
+///     0.005
+///     >>> round(beam.major_arcsec, 6)
+///     18.0
+///     >>> Beam(0.004, 0.005, 0.0)
+///     Traceback (most recent call last):
+///     ...
+///     ValueError: invalid beam: minor axis (0.005) > major axis (0.004)
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
 #[pyclass(name = "Beam", subclass)]
 #[derive(Clone)]
@@ -57,6 +69,12 @@ impl PyBeam {
     ///
     /// Raises:
     ///     ValueError: If minor_arcsec > major_arcsec or any value is non-finite.
+    ///
+    /// Examples:
+    ///     >>> from convolve_rs import Beam
+    ///     >>> beam = Beam.from_arcsec(18.0, 14.4, 30.0)
+    ///     >>> beam.major_deg
+    ///     0.005
     #[classmethod]
     fn from_arcsec(
         _cls: &Bound<'_, PyType>,
@@ -123,6 +141,20 @@ impl PyBeam {
     /// Raises:
     ///     ValueError: If ``other`` is larger than ``self`` and deconvolution
     ///         is impossible.
+    ///
+    /// Examples:
+    ///     Deconvolution inverts convolution:
+    ///
+    ///     >>> from convolve_rs import Beam
+    ///     >>> a = Beam.from_arcsec(3.0, 3.0, 0.0)
+    ///     >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
+    ///     >>> c = a.convolve(b)
+    ///     >>> round(c.deconvolve(a).major_arcsec, 6)
+    ///     4.0
+    ///     >>> b.deconvolve(c)
+    ///     Traceback (most recent call last):
+    ///     ...
+    ///     ValueError: beam could not be deconvolved: source beam is smaller than the PSF
     fn deconvolve(&self, other: &PyBeam) -> PyResult<PyBeam> {
         self.inner
             .deconvolve(&other.inner)
@@ -140,6 +172,15 @@ impl PyBeam {
     ///
     /// Returns:
     ///     Beam: The convolved beam.
+    ///
+    /// Examples:
+    ///     Convolving two circular beams adds their axes in quadrature:
+    ///
+    ///     >>> from convolve_rs import Beam
+    ///     >>> a = Beam.from_arcsec(3.0, 3.0, 0.0)
+    ///     >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
+    ///     >>> round(a.convolve(b).major_arcsec, 6)
+    ///     5.0
     fn convolve(&self, other: &PyBeam) -> PyBeam {
         Self {
             inner: self.inner.convolve(&other.inner),
@@ -179,6 +220,16 @@ impl PyBeam {
 ///
 /// Raises:
 ///     ValueError: If ``beams`` is empty or no valid common beam is found.
+///
+/// Examples:
+///     >>> from convolve_rs import Beam, common_beam
+///     >>> b1 = Beam.from_arcsec(10.0, 8.0, 30.0)
+///     >>> b2 = Beam.from_arcsec(12.0, 6.0, 60.0)
+///     >>> cb = common_beam([b1, b2])
+///     >>> cb.major_arcsec >= 12.0
+///     True
+///     >>> cb.area_sr() >= max(b1.area_sr(), b2.area_sr())
+///     True
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (beams, tolerance=1e-4, nsamps=200, epsilon=5e-4))]
@@ -230,6 +281,24 @@ fn common_beam(
 /// Warns:
 ///     UserWarning: If ``bunit`` is given but not recognised as either a
 ///         Kelvin or Jy/beam unit (Jy/beam is then assumed).
+///
+/// Examples:
+///     Smoothing a flat Jy/beam image from a 10″ to a 20″ circular beam
+///     scales pixel values by the beam-area ratio (4); in Kelvin, surface
+///     brightness is conserved:
+///
+///     >>> import numpy as np
+///     >>> from convolve_rs import Beam, smooth
+///     >>> image = np.ones((64, 64), dtype=np.float32)
+///     >>> old = Beam.from_arcsec(10.0, 10.0, 0.0)
+///     >>> new = Beam.from_arcsec(20.0, 20.0, 0.0)
+///     >>> dx = 2.5 / 3600.0
+///     >>> jy = smooth(image, old, new, dx, dx)
+///     >>> round(float(jy[32, 32]), 3)
+///     4.0
+///     >>> k = smooth(image, old, new, dx, dx, bunit="K")
+///     >>> round(float(k[32, 32]), 3)
+///     1.0
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None, bunit=None))]
@@ -290,6 +359,16 @@ fn smooth<'py>(
 ///         ``fac`` is the pixel scaling factor, ``amp`` is the Gaussian kernel
 ///         integral, and the remaining three are the output beam parameters
 ///         (major/minor FWHM in arcseconds, PA in degrees).
+///
+/// Examples:
+///     >>> from convolve_rs import Beam, gauss_factor
+///     >>> conv = Beam.from_arcsec(5.0, 5.0, 0.0)
+///     >>> orig = Beam.from_arcsec(10.0, 10.0, 0.0)
+///     >>> fac, amp, bmaj, bmin, bpa = gauss_factor(conv, orig, 2.5, 2.5)
+///     >>> fac > 0.0
+///     True
+///     >>> round(bmaj, 5)  # √(10² + 5²)
+///     11.18034
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 fn gauss_factor(

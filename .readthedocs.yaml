@@ -1,0 +1,18 @@
+# Read the Docs configuration file
+# See https://docs.readthedocs.io/en/stable/config-file/v2.html for details
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.13"
+    # maturin compiles the extension during `uv sync`, and
+    # sphinxcontrib-programoutput runs `cargo run -- --help` at build time.
+    # edition 2024 needs Rust >= 1.85.
+    rust: "latest"
+  commands:
+    - asdf plugin add uv
+    - asdf install uv latest
+    - asdf global uv latest
+    - uv sync --group docs
+    - uv run --no-sync python -m sphinx -T -W -b html -d docs/_build/doctrees -D language=en docs $READTHEDOCS_OUTPUT/html

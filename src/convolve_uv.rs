@@ -1,8 +1,8 @@
-/// FFT-based UV-plane beam convolution.
-///
-/// This is a port of `racs_tools.convolve_uv.convolve` and `racs_tools.gaussft.gaussft`.
-/// The "robust" mode is implemented: the FT of the convolving Gaussian is computed
-/// analytically at each UV point (no kernel image needed), which handles NaNs gracefully.
+//! FFT-based UV-plane beam convolution.
+//!
+//! This is a port of `racs_tools.convolve_uv.convolve` and `racs_tools.gaussft.gaussft`.
+//! The "robust" mode is implemented: the FT of the convolving Gaussian is computed
+//! analytically at each UV point (no kernel image needed), which handles NaNs gracefully.
 use ndarray::Array2;
 use realfft::RealFftPlanner;
 use rustfft::{FftPlanner, num_complex::Complex};
@@ -29,6 +29,27 @@ pub struct ConvolutionResult {
 ///
 /// `dx_deg` / `dy_deg` are the pixel sizes in degrees (FITS |CDELT1|, |CDELT2|).
 /// `cutoff_arcsec` blanks images whose current beam exceeds this size.
+///
+/// The returned [`ConvolutionResult::scaling_factor`] is `√(Ω_new/Ω_old)`; see
+/// [`crate::smooth::smooth`] for how this becomes the Jy/beam or Kelvin factor.
+///
+/// # Examples
+///
+/// ```
+/// use convolve_rs::{Beam, convolve_uv};
+/// use ndarray::Array2;
+///
+/// let old = Beam::from_arcsec(10.0, 10.0, 0.0)?;
+/// let new = Beam::from_arcsec(20.0, 20.0, 0.0)?;
+/// let image = Array2::<f32>::from_elem((64, 64), 1.0);
+/// let dx = 2.5 / 3600.0;
+///
+/// let result = convolve_uv(&image, &old, &new, dx, dx, None)?;
+/// // √(Ω_new/Ω_old) = √4 = 2 for a doubling of both axes.
+/// assert!((result.scaling_factor - 2.0).abs() < 1e-9);
+/// assert_eq!(result.image.dim(), (64, 64));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn convolve_uv(
     image: &Array2<f32>,
     old_beam: &Beam,
@@ -238,6 +259,15 @@ pub fn gaussft(
 /// numpy-compatible `fftfreq(n, d)`.
 ///
 /// For even n the Nyquist bin (index n/2) is listed as negative, matching numpy.
+///
+/// # Examples
+///
+/// ```
+/// use convolve_rs::fftfreq;
+///
+/// assert_eq!(fftfreq(4, 1.0), vec![0.0, 0.25, -0.5, -0.25]);
+/// assert_eq!(fftfreq(5, 1.0), vec![0.0, 0.2, 0.4, -0.4, -0.2]);
+/// ```
 pub fn fftfreq(n: usize, d: f64) -> Vec<f64> {
     let val = 1.0 / (n as f64 * d);
     let m = n.div_ceil(2); // ceiling(n/2): positive-frequency count

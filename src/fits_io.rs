@@ -1,7 +1,7 @@
-/// FITS image reading and writing.
-///
-/// Handles both 2D (NAXIS=2, shape [ny, nx]) and 4D (NAXIS=4, shape [1,1,ny,nx])
-/// images as produced by ASKAP/CASA.
+//! FITS image reading and writing.
+//!
+//! Handles both 2D (NAXIS=2, shape `[ny, nx]`) and 4D (NAXIS=4, shape
+//! `[1,1,ny,nx]`) images as produced by ASKAP/CASA.
 use std::path::{Path, PathBuf};
 
 use fitsio::FitsFile;

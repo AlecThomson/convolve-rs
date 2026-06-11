@@ -46,6 +46,32 @@ jobs:
       - name: prek (lint, format, type check)
         run: uvx prek run --all-files --show-diff-on-failure
 
+  docs:
+    name: Docs build
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@v6
+
+      # Rust is needed twice: maturin builds the extension during `uv sync`,
+      # and sphinxcontrib-programoutput runs `cargo run -- --help` to embed
+      # the CLI help text.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Build extension and install docs dependencies
+        run: uv sync --group docs
+
+      # -W makes warnings fatal. The quickstart notebook is re-executed and
+      # the CLI help regenerated on every build, so stale or broken examples
+      # fail here.
+      - name: Build docs
+        run: uv run --no-sync sphinx-build -W -b html docs docs/_build/html
+
   rust-test:
     name: Rust tests (vs MIRIAD)
     runs-on: ubuntu-latest

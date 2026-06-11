@@ -1,5 +1,16 @@
 # convolve-rs
 
+[![Docs](https://readthedocs.org/projects/convolve-rs/badge/?version=latest)](https://convolve-rs.readthedocs.io/en/latest/)
+[![docs.rs](https://img.shields.io/docsrs/convolve-rs)](https://docs.rs/convolve-rs)
+[![PyPI](https://img.shields.io/pypi/v/convolve-rs)](https://pypi.org/project/convolve-rs/)
+[![crates.io](https://img.shields.io/crates/v/convolve-rs)](https://crates.io/crates/convolve-rs)
+
+**Documentation:** Python API, CLI, and algorithm background at
+[convolve-rs.readthedocs.io](https://convolve-rs.readthedocs.io/); Rust API at
+[docs.rs/convolve-rs](https://docs.rs/convolve-rs).
+
+<!-- SPHINX-START -->
+
 A Rust port of [`beamcon`](https://github.com/alecthomson/RACS-tools) from [RACS-tools](https://github.com/alecthomson/RACS-tools). Smooths FITS images and spectral cubes to a common beam using UV-plane (FFT) convolution to avoid numerical issues with undersampled kernels.
 
 > **Note:** This is an experiment in LLM-assisted coding with Claude. Do not trust this software as far as you can throw it.
@@ -108,11 +119,14 @@ uvx prek run --all-files   # run all hooks manually
 
 ## License
 
-convolve-rs is released under the [BSD 3-Clause License](LICENSE).
+convolve-rs is released under the
+[BSD 3-Clause License](https://github.com/alecthomson/convolve-rs/blob/main/LICENSE).
 
 It builds on prior work in the radio-astronomy community: the UV-plane convolution
 and cube handling are ported from [RACS-tools](https://github.com/alecthomson/RACS-tools),
 and the common-beam computation follows [radio_beam](https://github.com/radio-astro-tools/radio-beam)
 (both BSD). The Gaussian beam algebra implements the standard formulae of Wild
 (1970), and [MIRIAD](https://github.com/csiro/miriad) (GPL) serves as a validation
-reference in the test suite. See [NOTICE.md](NOTICE.md) for full attributions.
+reference in the test suite. See
+[NOTICE.md](https://github.com/alecthomson/convolve-rs/blob/main/NOTICE.md)
+for full attributions.

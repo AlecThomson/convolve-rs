@@ -56,8 +56,10 @@ class Beam(_Beam):
         Examples
         --------
         >>> from astropy.io import fits
-        >>> hdu = fits.open("image.fits")[0]
-        >>> beam = Beam.from_fits_header(hdu.header)
+        >>> header = fits.Header({"BMAJ": 0.005, "BMIN": 0.004, "BPA": 30.0})
+        >>> beam = Beam.from_fits_header(header)
+        >>> beam.major_deg
+        0.005
         """
         return cls(
             cast("float", header["BMAJ"]),
@@ -84,9 +86,12 @@ class Beam(_Beam):
 
         Examples
         --------
-        >>> import radio_beam, astropy.units as u
+        >>> import astropy.units as u
+        >>> import radio_beam
         >>> rb = radio_beam.Beam(10 * u.arcsec, 8 * u.arcsec, 30 * u.deg)
         >>> beam = Beam.from_radio_beam(rb)
+        >>> round(beam.major_arcsec, 6)
+        10.0
         """
         import astropy.units as u  # noqa: PLC0415  (optional dependency, imported lazily)
 
