@@ -31,37 +31,14 @@ Requires [Rust](https://rustup.rs/) 1.85+.
 cargo install convolve-rs
 ```
 
-## Python usage
+## Usage
 
-```python
-from astropy.io import fits
-import numpy as np
-from convolve_rs import Beam, common_beam, smooth
-
-hdu = fits.open("image.fits")
-data = hdu[0].data.squeeze().astype(np.float32)
-dx_deg = hdu[0].header["CDELT1"]   # may be negative
-dy_deg = hdu[0].header["CDELT2"]
-
-current = Beam.from_fits_header(hdu[0].header)
-target = Beam(0.002, 0.002, 0.0)   # or common_beam([...]) across channels
-
-# `bunit` selects the flux scaling: Jy/beam images are rescaled to stay in
-# Jy/beam; Kelvin (brightness temperature) images are left unscaled. An
-# unrecognised unit emits a UserWarning and is treated as Jy/beam.
-smoothed = smooth(data, current, target, dx_deg, dy_deg, bunit=hdu[0].header.get("BUNIT"))
-
-hdu[0].data[0, 0] = smoothed
-fits.writeto("smoothed.fits", hdu[0].data, hdu[0].header, overwrite=True)
-```
-
-## CLI usage
-
-```sh
-convolvers --help
-convolvers 2d --help
-convolvers 3d --help
-```
+- Python API and quickstart:
+  [convolve-rs.readthedocs.io/en/latest/quickstart.html](https://convolve-rs.readthedocs.io/en/latest/quickstart.html)
+- CLI reference:
+  [convolve-rs.readthedocs.io/en/latest/cli.html](https://convolve-rs.readthedocs.io/en/latest/cli.html)
+- Rust API:
+  [docs.rs/convolve-rs](https://docs.rs/convolve-rs)
 
 ## Development
 
