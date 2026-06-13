@@ -43,7 +43,7 @@ def build_cube(nx: int, ny: int, nchan: int, dtype: str) -> fits.HDUList:
     chans = np.arange(nchan, dtype=np.int32)
     bmaj = (15.0 + 0.05 * chans).astype(np.float32)  # arcsec
     bmin = (12.0 + 0.05 * chans).astype(np.float32)
-    bpa = (chans.astype(np.float32) % 30.0)
+    bpa = chans.astype(np.float32) % 30.0
     cols = fits.ColDefs(
         [
             fits.Column(name="BMAJ", format="E", unit="arcsec", array=bmaj),
