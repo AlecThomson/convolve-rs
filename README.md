@@ -40,43 +40,6 @@ cargo install convolve-rs
 - Rust API:
   [docs.rs/convolve-rs](https://docs.rs/convolve-rs)
 
-## Performance & precision
-
-The convolution runs at the **native precision of the input data**: a `float32`
-(`BITPIX = -32`) cube or image is transformed in `f32` — about half the memory
-traffic and compute of a double-precision transform — while a `float64`
-(`BITPIX = -64`) cube is transformed in `f64` so no precision is lost. The
-Python `smooth()` likewise returns the same dtype it is given. This is automatic
-and requires no flags.
-
-Cubes are processed channel-by-channel through a bounded streaming pipeline:
-rayon convolves planes across all CPU cores while a single writer thread streams
-results to disk (cfitsio is not thread-safe), overlapping convolution with I/O
-and capping peak memory to the in-flight planes. The FFT plans are built once
-per cube and shared across channels rather than re-planned per channel.
-
-To profile end-to-end throughput on a synthetic cube:
-
-```sh
-scripts/profile_cube.sh 2048 2048 64 float32 total   # NX NY NCHAN DTYPE MODE
-```
-
-and to microbenchmark the convolution itself (image size × precision × masked):
-
-```sh
-cargo bench
-```
-
-### GPU acceleration
-
-GPU offload (an optional, off-by-default cuFFT backend for NVIDIA/Linux,
-selected at runtime with automatic CPU fallback) is a planned addition. It is
-deliberately **not** part of the default build so the standard install stays
-small, dependency-free, and cross-platform (including Apple Silicon); a GPU
-build would ship as a separate, opt-in package. For the current workloads the
-CPU pipeline above is typically bound by FITS I/O rather than FFT compute, so
-GPU only helps once a job is shown to be FFT-bound.
-
 ## Development
 
 Install in editable mode:
