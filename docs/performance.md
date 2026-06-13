@@ -73,3 +73,16 @@ small, dependency-free, and cross-platform (including Apple Silicon); a GPU
 build would ship as a separate, opt-in package. Because the current workloads
 are typically bound by FITS I/O rather than FFT compute, GPU offload only helps
 once a job has been profiled and shown to be FFT-bound.
+
+To decide whether it is worth building, `scripts/bench_gpu_vs_cpu.py` compares
+the production CPU convolution against an equivalent cuFFT implementation on the
+GPU. Run it on a CUDA machine:
+
+```sh
+pip install cupy-cuda12x          # match your CUDA toolkit
+python scripts/bench_gpu_vs_cpu.py --nx 2048 --ny 2048 --nchan 64
+```
+
+It reports per-plane time and throughput for the CPU path and for the GPU path
+both with and without host/device transfers, and falls back to CPU-only output
+when no GPU is present.

@@ -72,7 +72,7 @@ def main() -> None:
     hdul.writeto(args.out, overwrite=True)
     nbytes = args.nx * args.ny * args.nchan * (4 if args.dtype == "float32" else 8)
     print(
-        f"Wrote {args.out}: {args.nchan}×{args.ny}×{args.nx} {args.dtype} "
+        f"Wrote {args.out}: {args.nchan} x {args.ny} x {args.nx} {args.dtype} "
         f"(~{nbytes / 1e6:.0f} MB)"
     )
 
