@@ -70,8 +70,9 @@ impl BrightnessUnit {
 ///
 /// `dx_deg` / `dy_deg` are pixel sizes in degrees.  `unit` selects the flux
 /// scaling: [`BrightnessUnit::JyPerBeam`] applies the Gaussian factor,
-/// [`BrightnessUnit::Kelvin`] leaves the data unscaled (factor 1).  Returns an
-/// image with the same dtype (f32) and pixel shape, ready to write back to FITS.
+/// [`BrightnessUnit::Kelvin`] leaves the data unscaled (factor 1).  The
+/// convolution runs in the image's element type `T` (`f32` or `f64`); the
+/// result has the same dtype and pixel shape, ready to write back to FITS.
 ///
 /// # Examples
 ///
