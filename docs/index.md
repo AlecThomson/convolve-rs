@@ -11,6 +11,7 @@
 quickstart.md
 cli.md
 algorithms.md
+performance.md
 ```
 
 ## Rust API

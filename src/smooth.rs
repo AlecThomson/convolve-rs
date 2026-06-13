@@ -1,9 +1,10 @@
 //! High-level smoothing: convolve + apply Jy/beam flux scaling.
 use ndarray::Array2;
+use num_traits::cast;
 use thiserror::Error;
 
 use crate::beam::Beam;
-use crate::convolve_uv::{ConvolveError, convolve_uv};
+use crate::convolve_uv::{ConvolveError, FftFloat, FftPlans, convolve_uv_with_plans};
 
 #[derive(Debug, Error)]
 pub enum SmoothError {
@@ -69,8 +70,9 @@ impl BrightnessUnit {
 ///
 /// `dx_deg` / `dy_deg` are pixel sizes in degrees.  `unit` selects the flux
 /// scaling: [`BrightnessUnit::JyPerBeam`] applies the Gaussian factor,
-/// [`BrightnessUnit::Kelvin`] leaves the data unscaled (factor 1).  Returns an
-/// image with the same dtype (f32) and pixel shape, ready to write back to FITS.
+/// [`BrightnessUnit::Kelvin`] leaves the data unscaled (factor 1).  The
+/// convolution runs in the image's element type `T` (`f32` or `f64`); the
+/// result has the same dtype and pixel shape, ready to write back to FITS.
 ///
 /// # Examples
 ///
@@ -94,16 +96,52 @@ impl BrightnessUnit {
 /// assert!((k[(32, 32)] - 1.0).abs() < 1e-3);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn smooth(
-    image: &Array2<f32>,
+pub fn smooth<T: FftFloat>(
+    image: &Array2<T>,
     old_beam: &Beam,
     new_beam: &Beam,
     dx_deg: f64,
     dy_deg: f64,
     cutoff_arcsec: Option<f64>,
     unit: BrightnessUnit,
-) -> Result<Array2<f32>, SmoothError> {
-    let result = convolve_uv(image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec)?;
+) -> Result<Array2<T>, SmoothError> {
+    let (nrows, ncols) = image.dim();
+    let plans = FftPlans::<T>::new(nrows, ncols);
+    smooth_with_plans(
+        image,
+        old_beam,
+        new_beam,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+        unit,
+        &plans,
+    )
+}
+
+/// Like [`smooth`], but reuses pre-built [`FftPlans`] across calls (e.g. every
+/// channel of a cube), avoiding per-call FFT planning. `plans` must match the
+/// image dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn smooth_with_plans<T: FftFloat>(
+    image: &Array2<T>,
+    old_beam: &Beam,
+    new_beam: &Beam,
+    dx_deg: f64,
+    dy_deg: f64,
+    cutoff_arcsec: Option<f64>,
+    unit: BrightnessUnit,
+    plans: &FftPlans<T>,
+) -> Result<Array2<T>, SmoothError> {
+    let result = convolve_uv_with_plans(
+        image,
+        old_beam,
+        new_beam,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+        plans,
+    )?;
     // `convolve_uv` already bakes one g_ratio (= √(Ω_new/Ω_old)) into the image.
     // Jy/beam needs the full beam-area ratio Ω_new/Ω_old = g_ratio², so multiply
     // by g_ratio once more. Kelvin conserves surface brightness, so the image
@@ -112,7 +150,8 @@ pub fn smooth(
         BrightnessUnit::JyPerBeam => result.scaling_factor,
         BrightnessUnit::Kelvin => 1.0 / result.scaling_factor,
     };
-    let scaled = result.image.mapv(|x| (factor as f32) * x);
+    let factor_t = cast::<f64, T>(factor).expect("scaling factor out of range");
+    let scaled = result.image.mapv(|x| factor_t * x);
     Ok(scaled)
 }
 

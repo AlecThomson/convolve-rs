@@ -250,3 +250,36 @@ class TestSmooth:
             smooth(
                 self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="Jy/beam"
             )
+
+
+class TestSmoothDtype:
+    """smooth() runs at the input precision and returns the matching dtype."""
+
+    OLD = Beam(10 * ARCSEC, 10 * ARCSEC, 0.0)
+    NEW = Beam(20 * ARCSEC, 20 * ARCSEC, 0.0)
+    PIX = 2.5 * ARCSEC
+
+    def test_float32_returns_float32(self):
+        img = np.ones((32, 32), dtype=np.float32)
+        out = smooth(img, self.OLD, self.NEW, self.PIX, self.PIX)
+        assert out.dtype == np.float32
+        assert out[16, 16] == pytest.approx(4.0, abs=1e-3)
+
+    def test_float64_returns_float64(self):
+        img = np.ones((32, 32), dtype=np.float64)
+        out = smooth(img, self.OLD, self.NEW, self.PIX, self.PIX)
+        assert out.dtype == np.float64
+        assert out[16, 16] == pytest.approx(4.0, abs=1e-3)
+
+    def test_float32_and_float64_agree(self):
+        rng = np.random.default_rng(0)
+        img64 = rng.normal(size=(48, 48))
+        img32 = img64.astype(np.float32)
+        out64 = smooth(img64, self.OLD, self.NEW, self.PIX, self.PIX)
+        out32 = smooth(img32, self.OLD, self.NEW, self.PIX, self.PIX)
+        np.testing.assert_allclose(out32, out64, atol=1e-3)
+
+    def test_non_float_array_raises(self):
+        img = np.ones((32, 32), dtype=np.int32)
+        with pytest.raises(ValueError):
+            smooth(img, self.OLD, self.NEW, self.PIX, self.PIX)

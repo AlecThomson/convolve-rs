@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyReadonlyArray2};
 use pyo3::exceptions::{PyUserWarning, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
@@ -254,8 +254,9 @@ fn common_beam(
 /// unscaled.
 ///
 /// Args:
-///     image (numpy.ndarray): Input image, shape ``(ny, nx)``,
-///         dtype ``float32``.
+///     image (numpy.ndarray): Input image, shape ``(ny, nx)``, dtype
+///         ``float32`` or ``float64``. The convolution runs in the input's
+///         precision and the output keeps the same dtype.
 ///     old_beam (Beam): Current (input) restoring beam.
 ///     new_beam (Beam): Target (output) restoring beam. Must be larger than
 ///         ``old_beam``.
@@ -272,7 +273,8 @@ fn common_beam(
 ///         ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
 ///
 /// Returns:
-///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, dtype ``float32``.
+///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same dtype as the
+///         input (``float32`` or ``float64``).
 ///
 /// Raises:
 ///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
@@ -299,24 +301,12 @@ fn common_beam(
 ///     >>> k = smooth(image, old, new, dx, dx, bunit="K")
 ///     >>> round(float(k[32, 32]), 3)
 ///     1.0
-#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
-#[pyfunction]
-#[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None, bunit=None))]
-#[allow(clippy::too_many_arguments)]
-fn smooth<'py>(
-    py: Python<'py>,
-    image: PyReadonlyArray2<'py, f32>,
-    old_beam: &PyBeam,
-    new_beam: &PyBeam,
-    dx_deg: f64,
-    dy_deg: f64,
-    cutoff_arcsec: Option<f64>,
-    bunit: Option<&str>,
-) -> PyResult<Bound<'py, PyArray2<f32>>> {
-    let owned = image.as_array().to_owned();
-    let unit = match bunit {
+/// Resolve a FITS `BUNIT` string to a [`BrightnessUnit`], warning (and assuming
+/// Jy/beam) when the string is given but not recognised.
+fn resolve_unit(py: Python<'_>, bunit: Option<&str>) -> PyResult<BrightnessUnit> {
+    match bunit {
         Some(s) => match BrightnessUnit::parse(s) {
-            Some(unit) => unit,
+            Some(unit) => Ok(unit),
             None => {
                 let msg = std::ffi::CString::new(format!(
                     "Could not determine brightness unit from bunit={s:?}; \
@@ -324,22 +314,64 @@ fn smooth<'py>(
                      unit (e.g. 'Jy/beam' or 'K') to silence this warning."
                 ))?;
                 PyErr::warn(py, &py.get_type::<PyUserWarning>(), &msg, 2)?;
-                BrightnessUnit::JyPerBeam
+                Ok(BrightnessUnit::JyPerBeam)
             }
         },
-        None => BrightnessUnit::default(),
-    };
-    rust_smooth(
-        &owned,
-        &old_beam.inner,
-        &new_beam.inner,
-        dx_deg,
-        dy_deg,
-        cutoff_arcsec,
-        unit,
-    )
-    .map(|arr| arr.into_pyarray(py))
-    .map_err(|e| PyValueError::new_err(e.to_string()))
+        None => Ok(BrightnessUnit::default()),
+    }
+}
+
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None, bunit=None))]
+#[allow(clippy::too_many_arguments)]
+fn smooth<'py>(
+    py: Python<'py>,
+    image: &Bound<'py, PyAny>,
+    old_beam: &PyBeam,
+    new_beam: &PyBeam,
+    dx_deg: f64,
+    dy_deg: f64,
+    cutoff_arcsec: Option<f64>,
+    bunit: Option<&str>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let unit = resolve_unit(py, bunit)?;
+
+    // Dispatch on the input dtype so the convolution runs at the array's native
+    // precision and the output keeps that dtype. f32 (the common case) is tried
+    // first; f64 arrays take the f64 path.
+    if let Ok(arr) = image.extract::<PyReadonlyArray2<f32>>() {
+        let owned = arr.as_array().to_owned();
+        let out = rust_smooth(
+            &owned,
+            &old_beam.inner,
+            &new_beam.inner,
+            dx_deg,
+            dy_deg,
+            cutoff_arcsec,
+            unit,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        return Ok(out.into_pyarray(py).into_any());
+    }
+    if let Ok(arr) = image.extract::<PyReadonlyArray2<f64>>() {
+        let owned = arr.as_array().to_owned();
+        let out = rust_smooth(
+            &owned,
+            &old_beam.inner,
+            &new_beam.inner,
+            dx_deg,
+            dy_deg,
+            cutoff_arcsec,
+            unit,
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        return Ok(out.into_pyarray(py).into_any());
+    }
+
+    Err(PyValueError::new_err(
+        "image must be a 2-D float32 or float64 numpy array",
+    ))
 }
 
 /// Compute the flux-scaling factor for a Jy/beam convolution.
