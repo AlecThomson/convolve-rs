@@ -65,3 +65,11 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = { version = "0.17", features = ["rayon"] }
+
+[dev-dependencies]
+# Benchmark harness (dev-only; not part of the published crate or wheel).
+criterion = "0.5"
+
+[[bench]]
+name = "convolve_bench"
+harness = false
