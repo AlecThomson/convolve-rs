@@ -306,6 +306,132 @@ fn cli_natural_mode_smooths_cube() {
     assert_eq!(meta.beams.iter().filter(|b| b.is_some()).count(), NFREQ);
 }
 
+/// Build a varied-beam cube with `BITPIX = -64` (f64 pixels) to exercise the
+/// native double-precision streaming path.
+fn make_varied_cube_f64(path: &std::path::Path) {
+    let mut f = FitsFile::create(path)
+        .with_custom_primary(&fitsio::images::ImageDescription {
+            data_type: fitsio::images::ImageType::Double,
+            dimensions: &[NFREQ, NY, NX],
+        })
+        .overwrite()
+        .open()
+        .unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    let mut data = vec![0.0f64; NX * NY * NFREQ];
+    for c in 0..NFREQ {
+        data[c * NX * NY + (NY / 2) * NX + NX / 2] = 1.0;
+    }
+    hdu.write_image(&mut f, &data).unwrap();
+    hdu.write_key(&mut f, "CDELT1", -0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CDELT2", 0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CRPIX3", 1i64).unwrap();
+    hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
+    hdu.write_key(&mut f, "CASAMBM", "T").unwrap();
+
+    let bmaj: Vec<f32> = (0..NFREQ).map(|c| 16.0 + c as f32).collect();
+    let bmin: Vec<f32> = (0..NFREQ).map(|c| 12.0 + c as f32).collect();
+    let bpa: Vec<f32> = (0..NFREQ).map(|c| c as f32 * 5.0).collect();
+    let cols = vec![
+        ColumnDescription::new("BMAJ")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BMIN")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BPA")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("CHAN")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("POL")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+    ];
+    let t = f.create_table("BEAMS", &cols).unwrap();
+    t.write_col(&mut f, "BMAJ", &bmaj).unwrap();
+    t.write_col(&mut f, "BMIN", &bmin).unwrap();
+    t.write_col(&mut f, "BPA", &bpa).unwrap();
+    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>())
+        .unwrap();
+    t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
+}
+
+/// A `BITPIX = -64` cube is detected as f64 and streams channels in native
+/// double precision: a value f32 cannot represent must round-trip exactly.
+#[test]
+fn f64_cube_detects_dtype_and_roundtrips() {
+    use cube_io::PixelType;
+
+    let dir = workdir("f64_roundtrip");
+    let path = dir.join("in.fits");
+    make_varied_cube_f64(&path);
+
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    assert_eq!(meta.dtype, PixelType::F64, "BITPIX -64 should map to F64");
+
+    let out = dir.join("out.fits");
+    let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
+    cube_io::init_output_cube(&path, &out, &target, CubeMode::Total, &meta).unwrap();
+
+    // 1 + 1e-10 is not representable in f32, so an f32 round-trip would lose it.
+    let val = 1.0 + 1e-10_f64;
+    for c in 0..NFREQ {
+        let plane = Array2::from_elem((NY, NX), val);
+        cube_io::write_channel_as::<f64>(&out, c, &plane, &meta).unwrap();
+    }
+
+    let out_meta = cube_io::read_cube_meta(&out).unwrap();
+    assert_eq!(out_meta.dtype, PixelType::F64, "output kept BITPIX -64");
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel_as::<f64>(&out, c, &out_meta).unwrap();
+        assert!(
+            plane.iter().all(|&v| v == val),
+            "f64 channel {c} did not round-trip exactly"
+        );
+    }
+}
+
+/// End-to-end: the CLI smooths an f64 cube through `process_cube::<f64>` and the
+/// output cube stays double precision with finite, non-empty channels.
+#[test]
+fn cli_total_mode_smooths_f64_cube() {
+    use cube_io::PixelType;
+
+    let dir = workdir("cli_f64");
+    let path = dir.join("in.fits");
+    make_varied_cube_f64(&path);
+
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "total"]);
+    assert!(ok, "binary failed:\n{log}");
+
+    let out = dir.join("in.sm.fits");
+    assert!(out.exists(), "output cube not written:\n{log}");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    assert_eq!(
+        meta.dtype,
+        PixelType::F64,
+        "f64 output must stay BITPIX -64"
+    );
+    assert_eq!(meta.nfreq, NFREQ);
+
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel_as::<f64>(&out, c, &meta).unwrap();
+        assert!(
+            plane.iter().all(|v| v.is_finite()),
+            "channel {c} has non-finite pixels"
+        );
+        let peak = plane.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
+    }
+}
+
 #[test]
 fn cli_verbose_logs_per_channel_beams() {
     let dir = workdir("cli_verbose");
