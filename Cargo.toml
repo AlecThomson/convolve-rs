@@ -57,6 +57,7 @@ fitsio = { version = "0.21" }
 ndarray = "0.16"
 rustfft = "6"
 realfft = "3"
+num-traits = "0.2"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
 thiserror = "1"
