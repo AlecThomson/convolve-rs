@@ -63,3 +63,17 @@ sample-count-dependent — treat as ballpark):
 
 The NaN-masked path costs roughly 1.6–1.9× the clean path, because it runs a
 second FFT pair to propagate the blanking mask.
+
+## Why there is no GPU acceleration
+
+An FFT runs faster on a GPU in a microbenchmark, but that does not speed up a
+real cube. The work is dominated by FITS I/O: reading planes from disk and
+writing them back, not the FFT. The FFT is a small share of the total time, and
+a smaller share the larger the images get. Running it on a GPU also means copying
+every plane over PCIe, so the end-to-end time barely moves.
+
+The package is therefore CPU-only, with no CUDA toolkit to match or drivers to
+manage, and it installs the same way everywhere (including Apple Silicon). A GPU
+backend would only pay off for work that is actually FFT-bound, such as keeping
+data on the GPU across many operations. Use the profiling tools above to see
+where the time goes for your data.
