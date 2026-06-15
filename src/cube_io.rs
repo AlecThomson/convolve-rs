@@ -61,6 +61,14 @@ pub trait CubeElem: FftFloat {
         end: usize,
         data: &[Self],
     ) -> Result<(), CubeError>;
+    /// Serialise a plane to FITS on-disk byte order (IEEE big-endian, no scaling).
+    ///
+    /// Used by the raw-write fast path, which moves the host→big-endian byte swap
+    /// off the single writer thread and into the parallel producers: the writer
+    /// then only does positioned I/O. Valid only for native float cubes
+    /// (`BITPIX = -32`/`-64`), where the on-disk element type matches `Self` and
+    /// there is no `BZERO`/`BSCALE` to apply.
+    fn plane_to_be_bytes(plane: &Array2<Self>) -> Vec<u8>;
 }
 
 macro_rules! impl_cube_elem {
@@ -84,6 +92,16 @@ macro_rules! impl_cube_elem {
                 let hdu = fptr.primary_hdu()?;
                 hdu.write_section(fptr, start, end, data)?;
                 Ok(())
+            }
+            fn plane_to_be_bytes(plane: &Array2<Self>) -> Vec<u8> {
+                const W: usize = std::mem::size_of::<$t>();
+                let flat = plane.as_standard_layout();
+                let slice = flat.as_slice().expect("standard-layout plane");
+                let mut out = vec![0u8; slice.len() * W];
+                for (chunk, &v) in out.chunks_exact_mut(W).zip(slice) {
+                    chunk.copy_from_slice(&v.to_be_bytes());
+                }
+                out
             }
         }
     };
@@ -143,6 +161,8 @@ pub struct CubeMeta {
     pub unit: BrightnessUnit,
     /// Working pixel precision, derived from FITS `BITPIX`.
     pub dtype: PixelType,
+    /// Raw FITS `BITPIX` value (e.g. `-32`, `-64`, or a positive integer type).
+    pub bitpix: i64,
 }
 
 impl CubeMeta {
@@ -153,6 +173,17 @@ impl CubeMeta {
         let plane = self.ny * self.nx;
         let start = chan * plane;
         (start, start + plane)
+    }
+
+    /// Whether the cube's on-disk pixels are IEEE floats stored verbatim
+    /// (`BITPIX = -32`/`-64`, no `BZERO`/`BSCALE`).
+    ///
+    /// Only then does the in-memory working type match the on-disk element type
+    /// byte-for-byte, so a plane can be byte-swapped to big-endian and written
+    /// raw (see [`CubeElem::plane_to_be_bytes`]). Integer cubes must go through
+    /// cfitsio, which applies the float→int conversion and any scaling.
+    pub fn is_native_float(&self) -> bool {
+        self.bitpix == -32 || self.bitpix == -64
     }
 
     /// Beamlog path co-located with the FITS file.
@@ -256,6 +287,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
             is_4d,
             unit,
             dtype,
+            bitpix,
         }
         .beamlog_path();
 
@@ -295,6 +327,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
         is_4d,
         unit,
         dtype,
+        bitpix,
     })
 }
 
@@ -395,6 +428,33 @@ pub fn write_channel(
     meta: &CubeMeta,
 ) -> Result<(), CubeError> {
     write_channel_as::<f32>(path, chan, data, meta)
+}
+
+/// Byte offset of the primary HDU's data unit within `path`.
+///
+/// For a native-float cube this is where channel 0's pixels begin; channel `c`
+/// starts at `data_offset + c * ny * nx * size_of::<elem>()`. Used by the
+/// raw-write fast path to position channel writes with `pwrite`, bypassing
+/// cfitsio's per-element byte swap on the writer thread.
+pub fn primary_data_offset(path: &Path) -> Result<u64, CubeError> {
+    let mut fptr = FitsFile::open(path.to_string_lossy().into_owned())?;
+    fptr.primary_hdu()?; // position at the primary HDU
+
+    let mut headstart: i64 = 0;
+    let mut datastart: i64 = 0;
+    let mut dataend: i64 = 0;
+    let mut status = 0;
+    unsafe {
+        fitsio::sys::ffghadll(
+            fptr.as_raw(),
+            &mut headstart,
+            &mut datastart,
+            &mut dataend,
+            &mut status,
+        );
+    }
+    fitsio::errors::check_status(status)?;
+    Ok(datastart as u64)
 }
 
 /// A streaming writer that holds an initialised output cube open for the lifetime

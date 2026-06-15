@@ -509,9 +509,168 @@ fn process_cube<T: CubeElem>(
 ) -> Result<()> {
     // Plans depend only on the image dimensions, shared by all channels.
     let plans = FftPlans::<T>::new(meta.ny, meta.nx);
-    let nfreq = meta.nfreq;
 
-    let cap = (rayon::current_num_threads() * 2).max(4);
+    // Bound the in-flight queue by a byte budget, not a plane count, so it
+    // actually back-pressures (see `channel_cap`).
+    let plane_bytes = meta.ny * meta.nx * std::mem::size_of::<T>();
+    let cap = channel_cap(plane_bytes);
+
+    // Native-float cubes (BITPIX -32/-64) store IEEE floats verbatim, so a plane
+    // can be byte-swapped to big-endian in the parallel producers and the writer
+    // just `pwrite`s the bytes — moving the swap off the single writer thread,
+    // which was the cube pipeline's wall.  Integer cubes need cfitsio's
+    // float→int conversion + scaling, so they keep the (slower) cfitsio writer.
+    // `pwrite`-based positioned writes need a Unix `FileExt`, so gate on it.
+    if cfg!(unix) && meta.is_native_float() {
+        process_cube_raw::<T>(file, out, meta, target_beams, cutoff, pb, &plans, cap)
+    } else {
+        process_cube_cfitsio::<T>(file, out, meta, target_beams, cutoff, pb, &plans, cap)
+    }
+}
+
+/// Convolve one channel to its target beam, returning the finished plane.
+///
+/// Returns an all-NaN plane (explicit no-data) when the channel cannot be
+/// convolved — masked/zero source or target beam, or a beam above `cutoff`. A
+/// zero source beam would otherwise make the analytic UV filter's gain diverge
+/// to infinity, so blanking is deliberate rather than zero-fill or inf.
+fn convolve_channel<T: CubeElem>(
+    file: &Path,
+    c: usize,
+    meta: &CubeMeta,
+    target_beams: &[Option<Beam>],
+    cutoff: Option<f64>,
+    plans: &FftPlans<T>,
+    pb: &ProgressBar,
+) -> Result<Array2<T>> {
+    let nan_plane = || Array2::from_elem((meta.ny, meta.nx), T::nan());
+
+    let old_beam = match meta.beams[c] {
+        Some(b) if !b.is_zero() => b,
+        _ => return Ok(nan_plane()),
+    };
+    let target = match target_beams[c] {
+        Some(b) if !b.is_zero() => b,
+        _ => return Ok(nan_plane()),
+    };
+
+    // Verbose (-v) per-channel beam report: current, target, and the convolving
+    // kernel (target deconvolved from the current beam). Route through
+    // `pb.suspend` so the log never corrupts the live bar.
+    let kernel = target.deconvolve_or_zero(&old_beam);
+    pb.suspend(|| debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}"));
+
+    if let Some(cut) = cutoff
+        && old_beam.major_arcsec() > cut
+    {
+        pb.suspend(|| {
+            warn!(
+                "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
+                old_beam.major_arcsec()
+            )
+        });
+        return Ok(nan_plane());
+    }
+
+    let raw = cube_io::read_channel_as::<T>(file, c, meta)
+        .with_context(|| format!("reading channel {c} from {}", file.display()))?;
+    smooth_with_plans(
+        &raw,
+        &old_beam,
+        &target,
+        meta.dx_deg,
+        meta.dy_deg,
+        cutoff,
+        meta.unit,
+        plans,
+    )
+    .with_context(|| format!("smoothing channel {c}"))
+}
+
+/// Fast path for native-float cubes: producers byte-swap each plane to FITS
+/// big-endian in parallel, and a single writer thread `pwrite`s the raw bytes at
+/// the channel's offset — pure I/O, no per-element swap on the writer.
+#[allow(clippy::too_many_arguments)]
+fn process_cube_raw<T: CubeElem>(
+    file: &Path,
+    out: &Path,
+    meta: &CubeMeta,
+    target_beams: &[Option<Beam>],
+    cutoff: Option<f64>,
+    pb: &ProgressBar,
+    plans: &FftPlans<T>,
+    cap: usize,
+) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+
+    let nfreq = meta.nfreq;
+    let plane_bytes = meta.ny * meta.nx * std::mem::size_of::<T>();
+    let data_offset = cube_io::primary_data_offset(out)
+        .with_context(|| format!("locating data unit in {}", out.display()))?;
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(cap);
+
+    std::thread::scope(|s| {
+        // Single writer thread — owns one OS handle and writes already-swapped
+        // bytes at disjoint offsets. `write_all_at` (pwrite) does not move a
+        // shared cursor, so the work here is I/O only.
+        let writer_handle = s.spawn(move || -> Result<()> {
+            #[cfg(unix)]
+            {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(out)
+                    .with_context(|| format!("opening output cube {}", out.display()))?;
+                for (c, bytes) in rx {
+                    let off = data_offset + (c * plane_bytes) as u64;
+                    f.write_all_at(&bytes, off)
+                        .with_context(|| format!("writing channel {c} to {}", out.display()))?;
+                }
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (&rx, data_offset, plane_bytes, out);
+                unreachable!("raw write path is gated on unix in process_cube")
+            }
+        });
+
+        // Parallel producers — convolve, byte-swap, and stream raw bytes.
+        let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
+            let plane = convolve_channel::<T>(file, c, meta, target_beams, cutoff, plans, pb)?;
+            let bytes = T::plane_to_be_bytes(&plane);
+            tx.send((c, bytes))
+                .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
+            pb.inc(1);
+            Ok(())
+        });
+
+        // Close the channel so the writer loop ends, then join it. Prefer the
+        // writer's error (the real cause) over the producers' generic "writer
+        // stopped" when both fail.
+        drop(tx);
+        let writer_result = writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+        writer_result.and(produce)
+    })
+}
+
+/// Fallback path for integer cubes: a single cfitsio writer applies the
+/// float→int conversion and scaling that raw byte writes cannot.
+#[allow(clippy::too_many_arguments)]
+fn process_cube_cfitsio<T: CubeElem>(
+    file: &Path,
+    out: &Path,
+    meta: &CubeMeta,
+    target_beams: &[Option<Beam>],
+    cutoff: Option<f64>,
+    pb: &ProgressBar,
+    plans: &FftPlans<T>,
+    cap: usize,
+) -> Result<()> {
+    let nfreq = meta.nfreq;
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
 
     std::thread::scope(|s| {
@@ -531,76 +690,70 @@ fn process_cube<T: CubeElem>(
 
         // Parallel producers — convolve and stream finished planes to the writer.
         let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
-            // Hand a finished plane to the writer; a send error means the writer
-            // thread already exited (i.e. a write failed) — surfaced below.
-            let send = |plane: Array2<T>| -> Result<()> {
-                tx.send((c, plane))
-                    .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
-                pb.inc(1);
-                Ok(())
-            };
-            let nan_plane = || Array2::from_elem((meta.ny, meta.nx), T::nan());
-
-            // A channel with no source beam, no target, or a degenerate zero beam
-            // cannot be convolved — a zero source beam makes the analytic UV
-            // filter's gain (g_ratio) diverge to infinity. Blank it with NaNs so
-            // it is written as explicit no-data rather than left as the output's
-            // zero-fill or corrupted to infinity.
-            let old_beam = match meta.beams[c] {
-                Some(b) if !b.is_zero() => b,
-                _ => return send(nan_plane()),
-            };
-            let target = match target_beams[c] {
-                Some(b) if !b.is_zero() => b,
-                _ => return send(nan_plane()),
-            };
-
-            // Verbose (-v) per-channel beam report: current, target, and the
-            // convolving kernel (target deconvolved from the current beam).
-            // Route through `pb.suspend` so the log never corrupts the live bar.
-            let kernel = target.deconvolve_or_zero(&old_beam);
-            pb.suspend(|| {
-                debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
-            });
-
-            let plane = if let Some(cut) = cutoff
-                && old_beam.major_arcsec() > cut
-            {
-                pb.suspend(|| {
-                    warn!(
-                        "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                        old_beam.major_arcsec()
-                    )
-                });
-                nan_plane()
-            } else {
-                let raw = cube_io::read_channel_as::<T>(file, c, meta)
-                    .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                smooth_with_plans(
-                    &raw,
-                    &old_beam,
-                    &target,
-                    meta.dx_deg,
-                    meta.dy_deg,
-                    cutoff,
-                    meta.unit,
-                    &plans,
-                )
-                .with_context(|| format!("smoothing channel {c}"))?
-            };
-
-            send(plane)
+            let plane = convolve_channel::<T>(file, c, meta, target_beams, cutoff, plans, pb)?;
+            tx.send((c, plane))
+                .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
+            pb.inc(1);
+            Ok(())
         });
 
-        // Close the channel so the writer loop ends, then join it.  Prefer the
-        // writer's error (the real cause) over the producers' generic "writer
-        // stopped" when both fail.
         drop(tx);
         let writer_result = writer_handle
             .join()
             .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
         writer_result.and(produce)
     })
+}
+
+/// In-flight queue depth for convolved planes, chosen so the bounded channel
+/// actually back-pressures.
+///
+/// The old `2 * num_threads` cap counted *planes*: when `nfreq` was below it the
+/// channel never blocked, so the whole convolved cube plus per-worker scratch
+/// buffered in RAM (observed: 113 GB RSS for a 27 GB cube). Bounding by a byte
+/// budget instead keeps peak memory near `budget` regardless of plane size,
+/// while the `2 * num_threads` ceiling preserves enough buffering to keep the
+/// convolvers fed and the floor of 4 keeps small cubes pipelined.
+fn channel_cap(plane_bytes: usize) -> usize {
+    cap_from_budget(
+        mem_budget_bytes(),
+        plane_bytes,
+        (rayon::current_num_threads() * 2).max(4),
+    )
+}
+
+/// Pure core of [`channel_cap`]: how many planes fit in `budget`, clamped to
+/// `[4, ceiling]`. Split out from the env/thread lookups so it can be tested.
+fn cap_from_budget(budget: u64, plane_bytes: usize, ceiling: usize) -> usize {
+    let by_budget = (budget / plane_bytes.max(1) as u64) as usize;
+    by_budget.clamp(4, ceiling)
+}
+
+/// Memory budget (bytes) for the in-flight plane queue.
+///
+/// Override with `CONVOLVERS_MEM_BUDGET_MB`; otherwise use a quarter of the
+/// system's available memory (Linux `/proc/meminfo`), falling back to 4 GiB when
+/// that cannot be read. This bounds only the queue — per-worker FFT scratch is
+/// separate — so a conservative fraction leaves headroom for it.
+fn mem_budget_bytes() -> u64 {
+    const FALLBACK: u64 = 4 << 30; // 4 GiB
+    if let Ok(s) = std::env::var("CONVOLVERS_MEM_BUDGET_MB")
+        && let Ok(mb) = s.trim().parse::<u64>()
+        && mb > 0
+    {
+        return mb.saturating_mul(1 << 20);
+    }
+    available_memory_bytes().map_or(FALLBACK, |avail| (avail / 4).max(1 << 30))
+}
+
+/// Available system memory in bytes from Linux `/proc/meminfo` (`MemAvailable`),
+/// or `None` where it cannot be determined.
+fn available_memory_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    // Format: "MemAvailable:   12345678 kB"
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb.saturating_mul(1024))
 }
 
 fn compute_target_beams(
@@ -740,4 +893,37 @@ fn ceil_to(x: f64, precision: i32) -> f64 {
 fn round_up(x: f64, decimals: i32) -> f64 {
     let factor = 10_f64.powi(decimals);
     (x * factor).ceil() / factor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cap_from_budget;
+
+    const GIB: u64 = 1 << 30;
+
+    /// The byte budget back-pressures: a budget smaller than the cube means the
+    /// cap is well below the channel count, so the queue actually blocks. This
+    /// is the regression the byte-budget cap fixes — the old plane-count cap
+    /// (`2 * threads`) never blocked when `nfreq` was below it.
+    #[test]
+    fn cap_bounded_by_byte_budget_not_plane_count() {
+        let plane = 419 * (1 << 20); // ~419 MiB (10240² f32)
+        // 4 GiB budget over a 27 GiB / 64-plane cube → ~9 planes in flight,
+        // far below both the 64 channels and a 192 plane-count ceiling.
+        let cap = cap_from_budget(4 * GIB, plane, 192);
+        assert_eq!(cap, 9);
+        assert!(cap < 64, "must block before buffering the whole cube");
+    }
+
+    #[test]
+    fn cap_has_floor_of_four() {
+        // A plane larger than the whole budget still keeps a small pipeline.
+        assert_eq!(cap_from_budget(GIB, 4 * GIB as usize, 192), 4);
+    }
+
+    #[test]
+    fn cap_capped_by_ceiling_for_tiny_planes() {
+        // Tiny planes would allow a huge cap; the thread-derived ceiling holds.
+        assert_eq!(cap_from_budget(64 * GIB, 1 << 16, 192), 192);
+    }
 }
