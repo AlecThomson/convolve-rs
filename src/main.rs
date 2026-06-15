@@ -199,6 +199,9 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     info!("Common beam: {common}");
 
     if args.shared.dryrun {
+        // Emit the result on stdout (tracing logs to stderr) so `--dryrun` stays
+        // machine-readable for callers that capture it.
+        println!("{common}");
         info!("Dry run — no files written.");
         return Ok(());
     }
@@ -343,13 +346,15 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             nfreq,
             m.nfreq
         );
-        if m.nstokes > 1 {
-            warn!(
-                "{}: NAXIS4={} — only Stokes 0 will be convolved",
-                f.display(),
-                m.nstokes
-            );
-        }
+        anyhow::ensure!(
+            m.nstokes <= 1,
+            "{}: NAXIS4={} (multiple Stokes) is not supported — only Stokes 0 \
+             would be convolved while the other Stokes planes are written as \
+             zeros, producing a misleading cube. Extract a single Stokes plane \
+             first.",
+            f.display(),
+            m.nstokes
+        );
     }
 
     let target_beam = parse_target_beam(&args.shared)?;
@@ -408,6 +413,21 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     }
 
     if args.shared.dryrun {
+        // Emit the resolved target beam(s) on stdout (tracing logs to stderr) so
+        // `--dryrun` stays machine-readable: one beam when all channels share it,
+        // otherwise one `<channel> <beam>` line per channel.
+        if all_same {
+            if let Some(b) = target_beams.iter().find_map(|b| *b) {
+                println!("{b}");
+            }
+        } else {
+            for (c, b) in target_beams.iter().enumerate() {
+                match b {
+                    Some(b) => println!("{c} {b}"),
+                    None => println!("{c} masked"),
+                }
+            }
+        }
         info!("Dry run — no files written.");
         return Ok(());
     }
@@ -511,19 +531,28 @@ fn process_cube<T: CubeElem>(
 
         // Parallel producers — convolve and stream finished planes to the writer.
         let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
+            // Hand a finished plane to the writer; a send error means the writer
+            // thread already exited (i.e. a write failed) — surfaced below.
+            let send = |plane: Array2<T>| -> Result<()> {
+                tx.send((c, plane))
+                    .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
+                pb.inc(1);
+                Ok(())
+            };
+            let nan_plane = || Array2::from_elem((meta.ny, meta.nx), T::nan());
+
+            // A channel with no source beam, no target, or a degenerate zero beam
+            // cannot be convolved — a zero source beam makes the analytic UV
+            // filter's gain (g_ratio) diverge to infinity. Blank it with NaNs so
+            // it is written as explicit no-data rather than left as the output's
+            // zero-fill or corrupted to infinity.
             let old_beam = match meta.beams[c] {
-                Some(b) => b,
-                None => {
-                    pb.inc(1);
-                    return Ok(());
-                }
+                Some(b) if !b.is_zero() => b,
+                _ => return send(nan_plane()),
             };
             let target = match target_beams[c] {
-                Some(b) => b,
-                None => {
-                    pb.inc(1);
-                    return Ok(());
-                }
+                Some(b) if !b.is_zero() => b,
+                _ => return send(nan_plane()),
             };
 
             // Verbose (-v) per-channel beam report: current, target, and the
@@ -543,7 +572,7 @@ fn process_cube<T: CubeElem>(
                         old_beam.major_arcsec()
                     )
                 });
-                Array2::from_elem((meta.ny, meta.nx), T::nan())
+                nan_plane()
             } else {
                 let raw = cube_io::read_channel_as::<T>(file, c, meta)
                     .with_context(|| format!("reading channel {c} from {}", file.display()))?;
@@ -560,12 +589,7 @@ fn process_cube<T: CubeElem>(
                 .with_context(|| format!("smoothing channel {c}"))?
             };
 
-            // Hand the plane to the writer; a send error means the writer thread
-            // already exited (i.e. a write failed) — surface that below.
-            tx.send((c, plane))
-                .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
-            pb.inc(1);
-            Ok(())
+            send(plane)
         });
 
         // Close the channel so the writer loop ends, then join it.  Prefer the

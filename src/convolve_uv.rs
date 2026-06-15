@@ -38,6 +38,23 @@ pub trait FftFloat: FftNum + Float {}
 impl FftFloat for f32 {}
 impl FftFloat for f64 {}
 
+/// Cast an `f64` to `T`, saturating to ±∞ when the value is outside `T`'s finite
+/// range instead of panicking.
+///
+/// [`num_traits::cast`] returns `None` for out-of-range values (e.g. an `f64`
+/// filter coefficient or flux factor exceeding `f32::MAX`); saturating to
+/// infinity matches the old `value as f32` behaviour and lets the convolution
+/// produce an inf/NaN pixel rather than aborting the whole run mid-cube.
+pub(crate) fn cast_saturating<T: FftFloat>(value: f64) -> T {
+    cast::<f64, T>(value).unwrap_or_else(|| {
+        if value.is_sign_negative() {
+            T::neg_infinity()
+        } else {
+            T::infinity()
+        }
+    })
+}
+
 pub struct ConvolutionResult<T = f32> {
     /// Convolved image (NaNs propagated from input).
     pub image: Array2<T>,
@@ -235,10 +252,7 @@ pub fn convolve_uv_with_plans<T: FftFloat>(
     // `gaussft` works in f64 (analytic, cheap); cast to the image precision once
     // for the elementwise multiply against the spectrum.
     let (g_final, g_ratio) = gaussft(old_beam, new_beam, &u_freqs, v_freqs);
-    let g_t: Vec<T> = g_final
-        .iter()
-        .map(|&g| cast::<f64, T>(g).expect("filter value out of range"))
-        .collect();
+    let g_t: Vec<T> = g_final.iter().map(|&g| cast_saturating::<T>(g)).collect();
 
     // Forward real FFT, apply the filter in place, inverse real FFT.
     let mut im_f = rfft2(plans, &clean_image);
@@ -254,10 +268,16 @@ pub fn convolve_uv_with_plans<T: FftFloat>(
             *s = s.scale(g);
         }
         let mask_conv = irfft2(plans, mask_f);
+        // A fully-NaN-covered pixel reaches the filter's DC gain (g_ratio ≥ 1) in
+        // the convolved mask; isolated NaNs stay well below 1 and are interpolated
+        // over. The threshold sits just under 1 so that f32 round-off — which can
+        // leave a solid-NaN interior at ~0.999 when the beams are nearly equal
+        // (g_ratio ≈ 1) — does not silently un-blank a masked region.
+        let blank_threshold = T::one() - cast_saturating::<T>(1e-2);
         im_conv_flat
             .iter()
             .zip(mask_conv.iter())
-            .map(|(&v, &m)| if m >= T::one() { T::nan() } else { v })
+            .map(|(&v, &m)| if m >= blank_threshold { T::nan() } else { v })
             .collect()
     } else {
         im_conv_flat

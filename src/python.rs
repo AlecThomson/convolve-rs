@@ -9,6 +9,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
+use crate::convolve_uv::FftFloat;
 use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
 
 /// A 2-D Gaussian representation of a radio telescope's PSF (beam).
@@ -245,6 +246,57 @@ fn common_beam(
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Resolve a FITS `BUNIT` string to a [`BrightnessUnit`], warning (and assuming
+/// Jy/beam) when the string is given but not recognised.
+fn resolve_unit(py: Python<'_>, bunit: Option<&str>) -> PyResult<BrightnessUnit> {
+    match bunit {
+        Some(s) => match BrightnessUnit::parse(s) {
+            Some(unit) => Ok(unit),
+            None => {
+                let msg = std::ffi::CString::new(format!(
+                    "Could not determine brightness unit from bunit={s:?}; \
+                     assuming Jy/beam (flux scaling applied). Pass a recognised \
+                     unit (e.g. 'Jy/beam' or 'K') to silence this warning."
+                ))?;
+                PyErr::warn(py, &py.get_type::<PyUserWarning>(), &msg, 2)?;
+                Ok(BrightnessUnit::JyPerBeam)
+            }
+        },
+        None => Ok(BrightnessUnit::default()),
+    }
+}
+
+/// Convolve one already-extracted `T`-typed array and box the result as a numpy
+/// array of the same dtype. Shared by the f32 and f64 arms of [`smooth`] so the
+/// two precisions cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+fn smooth_typed<'py, T>(
+    py: Python<'py>,
+    arr: PyReadonlyArray2<'py, T>,
+    old_beam: &Beam,
+    new_beam: &Beam,
+    dx_deg: f64,
+    dy_deg: f64,
+    cutoff_arcsec: Option<f64>,
+    unit: BrightnessUnit,
+) -> PyResult<Bound<'py, PyAny>>
+where
+    T: FftFloat + numpy::Element,
+{
+    let owned = arr.as_array().to_owned();
+    let out = rust_smooth(
+        &owned,
+        old_beam,
+        new_beam,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+        unit,
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(out.into_pyarray(py).into_any())
+}
+
 /// Smooth an image from ``old_beam`` to ``new_beam``.
 ///
 /// Convolves ``image`` in the UV plane and applies the flux scaling
@@ -301,26 +353,6 @@ fn common_beam(
 ///     >>> k = smooth(image, old, new, dx, dx, bunit="K")
 ///     >>> round(float(k[32, 32]), 3)
 ///     1.0
-/// Resolve a FITS `BUNIT` string to a [`BrightnessUnit`], warning (and assuming
-/// Jy/beam) when the string is given but not recognised.
-fn resolve_unit(py: Python<'_>, bunit: Option<&str>) -> PyResult<BrightnessUnit> {
-    match bunit {
-        Some(s) => match BrightnessUnit::parse(s) {
-            Some(unit) => Ok(unit),
-            None => {
-                let msg = std::ffi::CString::new(format!(
-                    "Could not determine brightness unit from bunit={s:?}; \
-                     assuming Jy/beam (flux scaling applied). Pass a recognised \
-                     unit (e.g. 'Jy/beam' or 'K') to silence this warning."
-                ))?;
-                PyErr::warn(py, &py.get_type::<PyUserWarning>(), &msg, 2)?;
-                Ok(BrightnessUnit::JyPerBeam)
-            }
-        },
-        None => Ok(BrightnessUnit::default()),
-    }
-}
-
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (image, old_beam, new_beam, dx_deg, dy_deg, cutoff_arcsec=None, bunit=None))]
@@ -341,32 +373,28 @@ fn smooth<'py>(
     // precision and the output keeps that dtype. f32 (the common case) is tried
     // first; f64 arrays take the f64 path.
     if let Ok(arr) = image.extract::<PyReadonlyArray2<f32>>() {
-        let owned = arr.as_array().to_owned();
-        let out = rust_smooth(
-            &owned,
+        return smooth_typed(
+            py,
+            arr,
             &old_beam.inner,
             &new_beam.inner,
             dx_deg,
             dy_deg,
             cutoff_arcsec,
             unit,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        return Ok(out.into_pyarray(py).into_any());
+        );
     }
     if let Ok(arr) = image.extract::<PyReadonlyArray2<f64>>() {
-        let owned = arr.as_array().to_owned();
-        let out = rust_smooth(
-            &owned,
+        return smooth_typed(
+            py,
+            arr,
             &old_beam.inner,
             &new_beam.inner,
             dx_deg,
             dy_deg,
             cutoff_arcsec,
             unit,
-        )
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        return Ok(out.into_pyarray(py).into_any());
+        );
     }
 
     Err(PyValueError::new_err(

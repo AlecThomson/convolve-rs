@@ -221,5 +221,63 @@ def gauss_factor(conv_beam: Beam, orig_beam: Beam, dx_arcsec: builtins.float, dy
         11.18034
     """
 
-def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> typing.Any: ...
+def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> typing.Any:
+    r"""
+    Smooth an image from ``old_beam`` to ``new_beam``.
+    
+    Convolves ``image`` in the UV plane and applies the flux scaling
+    appropriate for ``bunit`` so that the output is in the same units as the
+    input: Jy/beam images get the Gaussian beam-area factor, Kelvin
+    (brightness temperature) images conserve surface brightness and are left
+    unscaled.
+    
+    Args:
+        image (numpy.ndarray): Input image, shape ``(ny, nx)``, dtype
+            ``float32`` or ``float64``. The convolution runs in the input's
+            precision and the output keeps the same dtype.
+        old_beam (Beam): Current (input) restoring beam.
+        new_beam (Beam): Target (output) restoring beam. Must be larger than
+            ``old_beam``.
+        dx_deg (float): Pixel size along the x (RA) axis in degrees
+            (FITS CDELT1, may be negative).
+        dy_deg (float): Pixel size along the y (Dec) axis in degrees
+            (FITS CDELT2).
+        cutoff_arcsec (float, optional): If given, raise ``ValueError`` if the
+            deconvolved kernel FWHM exceeds this value in arcseconds.
+        bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
+            Kelvin (e.g. ``"K"``), surface brightness is conserved and no flux
+            scaling is applied; if it denotes Jy/beam, the Gaussian
+            flux-scaling factor is applied. An unrecognised string emits a
+            ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
+    
+    Returns:
+        numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same dtype as the
+            input (``float32`` or ``float64``).
+    
+    Raises:
+        ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
+            are NaN, or the kernel exceeds ``cutoff_arcsec``.
+    
+    Warns:
+        UserWarning: If ``bunit`` is given but not recognised as either a
+            Kelvin or Jy/beam unit (Jy/beam is then assumed).
+    
+    Examples:
+        Smoothing a flat Jy/beam image from a 10″ to a 20″ circular beam
+        scales pixel values by the beam-area ratio (4); in Kelvin, surface
+        brightness is conserved:
+    
+        >>> import numpy as np
+        >>> from convolve_rs import Beam, smooth
+        >>> image = np.ones((64, 64), dtype=np.float32)
+        >>> old = Beam.from_arcsec(10.0, 10.0, 0.0)
+        >>> new = Beam.from_arcsec(20.0, 20.0, 0.0)
+        >>> dx = 2.5 / 3600.0
+        >>> jy = smooth(image, old, new, dx, dx)
+        >>> round(float(jy[32, 32]), 3)
+        4.0
+        >>> k = smooth(image, old, new, dx, dx, bunit="K")
+        >>> round(float(k[32, 32]), 3)
+        1.0
+    """
 

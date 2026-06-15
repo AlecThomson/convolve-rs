@@ -1,10 +1,11 @@
 //! High-level smoothing: convolve + apply Jy/beam flux scaling.
 use ndarray::Array2;
-use num_traits::cast;
 use thiserror::Error;
 
 use crate::beam::Beam;
-use crate::convolve_uv::{ConvolveError, FftFloat, FftPlans, convolve_uv_with_plans};
+use crate::convolve_uv::{
+    ConvolveError, FftFloat, FftPlans, cast_saturating, convolve_uv_with_plans,
+};
 
 #[derive(Debug, Error)]
 pub enum SmoothError {
@@ -150,7 +151,7 @@ pub fn smooth_with_plans<T: FftFloat>(
         BrightnessUnit::JyPerBeam => result.scaling_factor,
         BrightnessUnit::Kelvin => 1.0 / result.scaling_factor,
     };
-    let factor_t = cast::<f64, T>(factor).expect("scaling factor out of range");
+    let factor_t = cast_saturating::<T>(factor);
     let scaled = result.image.mapv(|x| factor_t * x);
     Ok(scaled)
 }

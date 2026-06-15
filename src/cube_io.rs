@@ -146,6 +146,15 @@ pub struct CubeMeta {
 }
 
 impl CubeMeta {
+    /// Flat element range `[start, end)` of frequency channel `chan` (Stokes 0)
+    /// in the primary data unit. For 3D `[nfreq, ny, nx]` and 4D
+    /// `[nstokes=1, nfreq, ny, nx]` cubes the offset is `chan * ny * nx`.
+    pub fn channel_range(&self, chan: usize) -> (usize, usize) {
+        let plane = self.ny * self.nx;
+        let start = chan * plane;
+        (start, start + plane)
+    }
+
     /// Beamlog path co-located with the FITS file.
     pub fn beamlog_path(&self) -> PathBuf {
         let dir = self.path.parent().unwrap_or(Path::new("."));
@@ -193,6 +202,18 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     // integer cubes, f64 for -64) instead of always upcasting to f64.
     let bitpix: i64 = hdu.read_key(&mut fptr, "BITPIX").unwrap_or(-32);
     let dtype = PixelType::from_bitpix(bitpix);
+    if bitpix > 0 {
+        // Integer cubes are convolved in f32, but the output header (BITPIX) is
+        // copied verbatim, so the floating-point result is rounded back to
+        // integers on write. Warn rather than silently lose precision.
+        tracing::warn!(
+            "{}: integer BITPIX={}; convolution runs in f32 but the output is \
+             written at integer precision (fractional flux is rounded). Convert \
+             to a floating-point cube (BITPIX=-32) to avoid this.",
+            path.display(),
+            bitpix
+        );
+    }
 
     // Brightness unit (BUNIT); warn and default to Jy/beam when absent.
     let unit = match hdu.read_key::<String>(&mut fptr, "BUNIT") {
@@ -307,8 +328,11 @@ fn read_casambm_beams(path: &Path, nfreq: usize) -> Result<Vec<Option<Beam>>, Cu
             let maj_deg = maj_as as f64 / 3600.0;
             let min_deg = min_as as f64 / 3600.0;
             let pa = pa_deg as f64;
-            // Treat tiny/zero beams as masked.
-            if maj_deg < tiny || !maj_deg.is_finite() {
+            // Treat tiny/zero beams as masked. `<=` (not `<`) so the `tiny`
+            // sentinel that `init_output_cube` writes for a masked channel is
+            // detected as masked on read-back — otherwise it round-trips to a
+            // bogus ~1e-38° beam.
+            if maj_deg <= tiny || !maj_deg.is_finite() {
                 None
             } else {
                 Beam::new(maj_deg, min_deg.max(tiny), pa).ok()
@@ -333,10 +357,7 @@ pub fn read_channel_as<T: CubeElem>(
     let path_str = path.to_string_lossy().into_owned();
     let mut fptr = FitsFile::open(&path_str)?;
 
-    let plane = meta.ny * meta.nx;
-    let start = chan * plane;
-    let end = start + plane;
-
+    let (start, end) = meta.channel_range(chan);
     let data = T::read_section_vec(&mut fptr, start, end)?;
     Ok(Array2::from_shape_vec((meta.ny, meta.nx), data)?)
 }
@@ -359,12 +380,10 @@ pub fn write_channel_as<T: CubeElem>(
     let path_str = path.to_string_lossy().into_owned();
     let mut fptr = FitsFile::edit(&path_str)?;
 
-    let plane = meta.ny * meta.nx;
-    let start = chan * plane;
-    let end = start + plane;
-
-    let flat: Vec<T> = data.iter().copied().collect();
-    T::write_section_vec(&mut fptr, start, end, &flat)?;
+    let (start, end) = meta.channel_range(chan);
+    let flat = data.as_standard_layout();
+    let slice = flat.as_slice().expect("standard-layout plane");
+    T::write_section_vec(&mut fptr, start, end, slice)?;
     Ok(())
 }
 
@@ -404,11 +423,10 @@ impl CubeWriter {
         data: &Array2<T>,
         meta: &CubeMeta,
     ) -> Result<(), CubeError> {
-        let plane = meta.ny * meta.nx;
-        let start = chan * plane;
-        let end = start + plane;
-        let flat: Vec<T> = data.iter().copied().collect();
-        T::write_section_vec(&mut self.fptr, start, end, &flat)?;
+        let (start, end) = meta.channel_range(chan);
+        let flat = data.as_standard_layout();
+        let slice = flat.as_slice().expect("standard-layout plane");
+        T::write_section_vec(&mut self.fptr, start, end, slice)?;
         Ok(())
     }
 
@@ -442,6 +460,24 @@ pub enum CubeMode {
 /// never read or written.
 fn copy_header_only(input: &Path, output: &Path) -> Result<(), CubeError> {
     use std::ffi::CString;
+
+    // Refuse to clobber the input. This function deletes `output` before
+    // recreating it, so if `output` resolves to `input` (e.g. an empty
+    // `--suffix` in the input's directory, or a symlink to it) the source cube
+    // would be destroyed. `canonicalize` only succeeds for paths that exist, so
+    // a brand-new output simply skips the check.
+    if let (Ok(in_canon), Ok(out_canon)) = (input.canonicalize(), output.canonicalize())
+        && in_canon == out_canon
+    {
+        return Err(CubeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "output {} resolves to the input cube; choose a different \
+                 --suffix/--prefix/--outdir",
+                output.display()
+            ),
+        )));
+    }
 
     let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
     in_fptr.primary_hdu()?; // position at the primary HDU to copy
@@ -494,27 +530,6 @@ fn update_key_f64(fptr: &mut FitsFile, name: &str, value: f64) -> Result<(), Cub
             c_name.as_ptr(),
             value,
             -15, // use the shortest decimal representation that round-trips
-            std::ptr::null_mut(),
-            &mut status,
-        );
-    }
-    fitsio::errors::check_status(status)?;
-    Ok(())
-}
-
-/// Update (or create) a string header keyword *in place* (see [`update_key_f64`]).
-#[allow(dead_code)]
-fn update_key_str(fptr: &mut FitsFile, name: &str, value: &str) -> Result<(), CubeError> {
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let c_value = std::ffi::CString::new(value)
-        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let mut status = 0;
-    unsafe {
-        fitsio::sys::ffukys(
-            fptr.as_raw(),
-            c_name.as_ptr(),
-            c_value.as_ptr(),
             std::ptr::null_mut(),
             &mut status,
         );
@@ -688,7 +703,7 @@ pub fn read_beamlog(path: &Path) -> Result<Vec<Beam>, CubeError> {
         let bmin_as = parse(fields[2], "BMIN")?;
         let bpa_deg = parse(fields[3], "BPA")?;
 
-        let beam = if bmaj_as < tiny || !bmaj_as.is_finite() {
+        let beam = if bmaj_as <= tiny || !bmaj_as.is_finite() {
             Beam::zero()
         } else {
             Beam::from_arcsec(bmaj_as, bmin_as.max(tiny), bpa_deg)?
