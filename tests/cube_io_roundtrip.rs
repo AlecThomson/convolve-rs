@@ -638,3 +638,144 @@ fn cli_verbose_logs_per_channel_beams() {
         "missing init log:\n{log}"
     );
 }
+
+/// Build a 3D integer cube (`BITPIX = 16`) with a single header beam.
+///
+/// Integer cubes cannot use the raw big-endian write path (cfitsio must apply
+/// the float→int conversion), so this exercises the `process_cube_cfitsio`
+/// fallback that the native-float fast path would otherwise leave untested.
+fn make_int_cube(path: &std::path::Path) {
+    let mut f = FitsFile::create(path)
+        .with_custom_primary(&fitsio::images::ImageDescription {
+            data_type: fitsio::images::ImageType::Short,
+            dimensions: &[NFREQ, NY, NX],
+        })
+        .overwrite()
+        .open()
+        .unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    // A bright central pixel per channel; large enough to survive int rounding
+    // after the flux is spread by convolution.
+    let mut data = vec![0i16; NX * NY * NFREQ];
+    for c in 0..NFREQ {
+        data[c * NX * NY + (NY / 2) * NX + NX / 2] = 10_000;
+    }
+    hdu.write_image(&mut f, &data).unwrap();
+    hdu.write_key(&mut f, "CDELT1", -0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CDELT2", 0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CRPIX3", 1i64).unwrap();
+    hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
+    // Single header beam (no CASAMBM, no beamlog): broadcast to all channels.
+    hdu.write_key(&mut f, "BMAJ", 0.005f64).unwrap();
+    hdu.write_key(&mut f, "BMIN", 0.004f64).unwrap();
+    hdu.write_key(&mut f, "BPA", 0.0f64).unwrap();
+}
+
+/// An integer-BITPIX cube must stream through the cfitsio fallback writer (not
+/// the native-float raw path) and produce a valid integer cube of the right
+/// shape with finite pixels.
+#[test]
+fn cli_integer_cube_uses_cfitsio_writer() {
+    use cube_io::PixelType;
+
+    let dir = workdir("cli_int");
+    let path = dir.join("in.fits");
+    make_int_cube(&path);
+
+    // Integer cubes are read at f32 working precision.
+    let in_meta = cube_io::read_cube_meta(&path).unwrap();
+    assert_eq!(in_meta.dtype, PixelType::F32);
+    assert_eq!(in_meta.bitpix, 16, "input is BITPIX 16");
+    assert!(
+        !in_meta.is_native_float(),
+        "integer cube must not take the raw float write path"
+    );
+
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "total"]);
+    assert!(ok, "binary failed:\n{log}");
+
+    let out = dir.join("in.sm.fits");
+    assert!(out.exists(), "output cube not written:\n{log}");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    assert_eq!(meta.bitpix, 16, "output kept integer BITPIX 16");
+    assert_eq!(meta.nfreq, NFREQ);
+    assert_eq!((meta.ny, meta.nx), (NY, NX));
+
+    // Every channel the cfitsio writer produced must be finite and non-empty.
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel(&out, c, &meta).unwrap();
+        assert!(
+            plane.iter().all(|v| v.is_finite()),
+            "channel {c} has non-finite pixels"
+        );
+        let peak = plane.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
+    }
+}
+
+/// The raw big-endian write path must be a faithful drop-in for cfitsio: writing
+/// the same planes through `CubeWriter` (cfitsio's encoder) and through the raw
+/// `plane_to_be_bytes` + positioned-write path must produce byte-identical
+/// files. This is what lets `process_cube` bypass cfitsio's per-element swap on
+/// the writer thread without changing the output a single bit.
+#[cfg(unix)]
+#[test]
+fn raw_write_matches_cfitsio_byte_for_byte() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = workdir("raw_vs_cfitsio");
+    let path = dir.join("in.fits");
+    make_cube(&path); // BITPIX -32, native float
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    assert!(meta.is_native_float());
+
+    let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
+
+    // Distinct per-channel planes, including a NaN-blanked channel, so the
+    // comparison covers ordinary values and the IEEE NaN bit pattern.
+    let planes: Vec<Array2<f32>> = (0..NFREQ)
+        .map(|c| {
+            if c == 1 {
+                Array2::from_elem((NY, NX), f32::NAN)
+            } else {
+                Array2::from_shape_fn((NY, NX), |(y, x)| (c * 100 + y * NX + x) as f32 + 0.25)
+            }
+        })
+        .collect();
+
+    // File A: cfitsio encoder via CubeWriter.
+    let out_cfitsio = dir.join("out_cfitsio.fits");
+    cube_io::init_output_cube(&path, &out_cfitsio, &target, CubeMode::Total, &meta).unwrap();
+    {
+        let mut w = cube_io::CubeWriter::open(&out_cfitsio).unwrap();
+        for (c, plane) in planes.iter().enumerate() {
+            w.write_channel_as::<f32>(c, plane, &meta).unwrap();
+        }
+    }
+
+    // File B: raw big-endian positioned writes (the fast-path building blocks).
+    let out_raw = dir.join("out_raw.fits");
+    cube_io::init_output_cube(&path, &out_raw, &target, CubeMode::Total, &meta).unwrap();
+    let data_off = cube_io::primary_data_offset(&out_raw).unwrap();
+    let plane_bytes = NY * NX * std::mem::size_of::<f32>();
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&out_raw)
+            .unwrap();
+        for (c, plane) in planes.iter().enumerate() {
+            let bytes = <f32 as cube_io::CubeElem>::plane_to_be_bytes(plane);
+            f.write_all_at(&bytes, data_off + (c * plane_bytes) as u64)
+                .unwrap();
+        }
+    }
+
+    let a = std::fs::read(&out_cfitsio).unwrap();
+    let b = std::fs::read(&out_raw).unwrap();
+    assert_eq!(a.len(), b.len(), "output file sizes differ");
+    assert!(
+        a == b,
+        "raw writer diverged from cfitsio: first mismatch at byte {:?}",
+        a.iter().zip(&b).position(|(x, y)| x != y)
+    );
+}
