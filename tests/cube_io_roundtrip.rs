@@ -107,6 +107,54 @@ fn total_mode_write_channel_roundtrip() {
     }
 }
 
+/// A masked (None) target beam must round-trip through the BEAMS table as None,
+/// not as a bogus ~1e-38° beam (the `tiny` sentinel must be detected on read).
+#[test]
+fn masked_target_beam_round_trips_as_none() {
+    let dir = workdir("masked_roundtrip");
+    let path = dir.join("in.fits");
+    make_cube(&path);
+
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    let out = dir.join("out.fits");
+    // Channel 1 is masked; channels 0 and 2 are valid.
+    let target: Vec<Option<Beam>> = (0..NFREQ)
+        .map(|c| (c != 1).then(|| Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()))
+        .collect();
+    cube_io::init_output_cube(&path, &out, &target, CubeMode::Natural, &meta).unwrap();
+
+    let out_meta = cube_io::read_cube_meta(&out).unwrap();
+    assert!(
+        out_meta.beams[1].is_none(),
+        "masked channel must read back as None, got {:?}",
+        out_meta.beams[1]
+    );
+    assert!(out_meta.beams[0].is_some());
+    assert!(out_meta.beams[2].is_some());
+}
+
+/// An output path that resolves to the input must be rejected, not clobber the
+/// input (which `copy_header_only` would otherwise delete before recreating).
+#[test]
+fn output_equal_to_input_is_rejected() {
+    let dir = workdir("out_eq_in");
+    let path = dir.join("in.fits");
+    make_cube(&path);
+
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
+    let res = cube_io::init_output_cube(&path, &path, &target, CubeMode::Total, &meta);
+    assert!(
+        res.is_err(),
+        "must refuse output that resolves to the input"
+    );
+    // The input cube must survive intact.
+    assert!(
+        cube_io::read_cube_meta(&path).is_ok(),
+        "input cube was destroyed"
+    );
+}
+
 /// Natural mode: a per-channel BEAMS table is written and round-trips.
 #[test]
 fn natural_mode_write_channel_and_beams() {
@@ -304,6 +352,269 @@ fn cli_natural_mode_smooths_cube() {
     let meta = cube_io::read_cube_meta(&out).unwrap();
     // Natural mode keeps the CASA BEAMS extension with one beam per channel.
     assert_eq!(meta.beams.iter().filter(|b| b.is_some()).count(), NFREQ);
+}
+
+/// Build a varied-beam cube with `BITPIX = -64` (f64 pixels) to exercise the
+/// native double-precision streaming path.
+fn make_varied_cube_f64(path: &std::path::Path) {
+    let mut f = FitsFile::create(path)
+        .with_custom_primary(&fitsio::images::ImageDescription {
+            data_type: fitsio::images::ImageType::Double,
+            dimensions: &[NFREQ, NY, NX],
+        })
+        .overwrite()
+        .open()
+        .unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    let mut data = vec![0.0f64; NX * NY * NFREQ];
+    for c in 0..NFREQ {
+        data[c * NX * NY + (NY / 2) * NX + NX / 2] = 1.0;
+    }
+    hdu.write_image(&mut f, &data).unwrap();
+    hdu.write_key(&mut f, "CDELT1", -0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CDELT2", 0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CRPIX3", 1i64).unwrap();
+    hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
+    hdu.write_key(&mut f, "CASAMBM", "T").unwrap();
+
+    let bmaj: Vec<f32> = (0..NFREQ).map(|c| 16.0 + c as f32).collect();
+    let bmin: Vec<f32> = (0..NFREQ).map(|c| 12.0 + c as f32).collect();
+    let bpa: Vec<f32> = (0..NFREQ).map(|c| c as f32 * 5.0).collect();
+    let cols = vec![
+        ColumnDescription::new("BMAJ")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BMIN")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BPA")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("CHAN")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("POL")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+    ];
+    let t = f.create_table("BEAMS", &cols).unwrap();
+    t.write_col(&mut f, "BMAJ", &bmaj).unwrap();
+    t.write_col(&mut f, "BMIN", &bmin).unwrap();
+    t.write_col(&mut f, "BPA", &bpa).unwrap();
+    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>())
+        .unwrap();
+    t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
+}
+
+/// A `BITPIX = -64` cube is detected as f64 and streams channels in native
+/// double precision: a value f32 cannot represent must round-trip exactly.
+#[test]
+fn f64_cube_detects_dtype_and_roundtrips() {
+    use cube_io::PixelType;
+
+    let dir = workdir("f64_roundtrip");
+    let path = dir.join("in.fits");
+    make_varied_cube_f64(&path);
+
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    assert_eq!(meta.dtype, PixelType::F64, "BITPIX -64 should map to F64");
+
+    let out = dir.join("out.fits");
+    let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
+    cube_io::init_output_cube(&path, &out, &target, CubeMode::Total, &meta).unwrap();
+
+    // 1 + 1e-10 is not representable in f32, so an f32 round-trip would lose it.
+    let val = 1.0 + 1e-10_f64;
+    for c in 0..NFREQ {
+        let plane = Array2::from_elem((NY, NX), val);
+        cube_io::write_channel_as::<f64>(&out, c, &plane, &meta).unwrap();
+    }
+
+    let out_meta = cube_io::read_cube_meta(&out).unwrap();
+    assert_eq!(out_meta.dtype, PixelType::F64, "output kept BITPIX -64");
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel_as::<f64>(&out, c, &out_meta).unwrap();
+        assert!(
+            plane.iter().all(|&v| v == val),
+            "f64 channel {c} did not round-trip exactly"
+        );
+    }
+}
+
+/// End-to-end: the CLI smooths an f64 cube through `process_cube::<f64>` and the
+/// output cube stays double precision with finite, non-empty channels.
+#[test]
+fn cli_total_mode_smooths_f64_cube() {
+    use cube_io::PixelType;
+
+    let dir = workdir("cli_f64");
+    let path = dir.join("in.fits");
+    make_varied_cube_f64(&path);
+
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "total"]);
+    assert!(ok, "binary failed:\n{log}");
+
+    let out = dir.join("in.sm.fits");
+    assert!(out.exists(), "output cube not written:\n{log}");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    assert_eq!(
+        meta.dtype,
+        PixelType::F64,
+        "f64 output must stay BITPIX -64"
+    );
+    assert_eq!(meta.nfreq, NFREQ);
+
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel_as::<f64>(&out, c, &meta).unwrap();
+        assert!(
+            plane.iter().all(|v| v.is_finite()),
+            "channel {c} has non-finite pixels"
+        );
+        let peak = plane.iter().cloned().fold(f64::MIN, f64::max);
+        assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
+    }
+}
+
+/// Build a 3D cube like `make_varied_cube` but with channel 1's beam masked
+/// (BMAJ = 0), so the streaming pipeline must blank that channel.
+fn make_cube_masked_chan1(path: &std::path::Path) {
+    let mut f = FitsFile::create(path)
+        .with_custom_primary(&fitsio::images::ImageDescription {
+            data_type: fitsio::images::ImageType::Float,
+            dimensions: &[NFREQ, NY, NX],
+        })
+        .overwrite()
+        .open()
+        .unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    let mut data = vec![0.0f32; NX * NY * NFREQ];
+    for c in 0..NFREQ {
+        data[c * NX * NY + (NY / 2) * NX + NX / 2] = 1.0;
+    }
+    hdu.write_image(&mut f, &data).unwrap();
+    hdu.write_key(&mut f, "CDELT1", -0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CDELT2", 0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CRPIX3", 1i64).unwrap();
+    hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
+    hdu.write_key(&mut f, "CASAMBM", "T").unwrap();
+
+    // Channel 1 masked (BMAJ = 0); channels 0 and 2 are valid.
+    let bmaj = [16.0f32, 0.0, 18.0];
+    let bmin = [12.0f32, 0.0, 14.0];
+    let bpa = [0.0f32, 0.0, 10.0];
+    let cols = vec![
+        ColumnDescription::new("BMAJ")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BMIN")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("BPA")
+            .with_type(ColumnDataType::Float)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("CHAN")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+        ColumnDescription::new("POL")
+            .with_type(ColumnDataType::Int)
+            .create()
+            .unwrap(),
+    ];
+    let t = f.create_table("BEAMS", &cols).unwrap();
+    t.write_col(&mut f, "BMAJ", &bmaj).unwrap();
+    t.write_col(&mut f, "BMIN", &bmin).unwrap();
+    t.write_col(&mut f, "BPA", &bpa).unwrap();
+    t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>())
+        .unwrap();
+    t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
+}
+
+/// A masked-beam channel must be written as NaN (explicit no-data), while the
+/// valid channels stay finite — never zero-filled or corrupted to infinity by a
+/// divide-by-zero in the analytic UV filter.
+#[test]
+fn cli_masked_channel_is_blanked_not_infinite() {
+    let dir = workdir("cli_masked");
+    let path = dir.join("in.fits");
+    make_cube_masked_chan1(&path);
+
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "total"]);
+    assert!(ok, "binary failed:\n{log}");
+
+    let out = dir.join("in.sm.fits");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+
+    // Masked channel 1: entirely NaN (blanked), with no infinities.
+    let masked = cube_io::read_channel(&out, 1, &meta).unwrap();
+    assert!(
+        masked.iter().all(|v| v.is_nan()),
+        "masked channel should be all-NaN, got finite/zero pixels"
+    );
+
+    // Valid channels: finite, non-empty, and crucially not infinite.
+    for c in [0, 2] {
+        let plane = cube_io::read_channel(&out, c, &meta).unwrap();
+        assert!(
+            plane.iter().all(|v| v.is_finite()),
+            "channel {c} has non-finite pixels"
+        );
+        assert!(
+            plane.iter().cloned().fold(f32::MIN, f32::max) > 0.0,
+            "channel {c} is empty"
+        );
+    }
+}
+
+/// Build a 4D cube with NAXIS4 = 2 (two Stokes planes) and a single header beam.
+fn make_4d_cube(path: &std::path::Path) {
+    const NSTOKES: usize = 2;
+    let mut f = FitsFile::create(path)
+        .with_custom_primary(&fitsio::images::ImageDescription {
+            data_type: fitsio::images::ImageType::Float,
+            dimensions: &[NSTOKES, NFREQ, NY, NX],
+        })
+        .overwrite()
+        .open()
+        .unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    hdu.write_image(&mut f, &vec![1.0f32; NSTOKES * NFREQ * NY * NX])
+        .unwrap();
+    hdu.write_key(&mut f, "CDELT1", -0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CDELT2", 0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CRPIX3", 1i64).unwrap();
+    hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
+    hdu.write_key(&mut f, "BMAJ", 0.005f64).unwrap();
+    hdu.write_key(&mut f, "BMIN", 0.004f64).unwrap();
+    hdu.write_key(&mut f, "BPA", 0.0f64).unwrap();
+}
+
+/// A multi-Stokes (NAXIS4 > 1) cube must be rejected rather than silently
+/// convolving only Stokes 0 and zero-filling the rest.
+#[test]
+fn cli_multi_stokes_cube_is_rejected() {
+    let dir = workdir("cli_4d");
+    let path = dir.join("in.fits");
+    make_4d_cube(&path);
+
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "total"]);
+    assert!(!ok, "multi-Stokes cube should be rejected:\n{log}");
+    assert!(
+        log.contains("Stokes"),
+        "error should mention Stokes:\n{log}"
+    );
+    assert!(
+        !dir.join("in.sm.fits").exists(),
+        "no output should be written for a rejected cube"
+    );
 }
 
 #[test]

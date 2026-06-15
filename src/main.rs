@@ -11,9 +11,10 @@ use tracing::{debug, info, warn};
 use convolve_rs::{
     beam::Beam,
     common_beam::{common_beam, fits_in_beam},
-    cube_io::{self, CubeMeta, CubeMode},
+    convolve_uv::FftPlans,
+    cube_io::{self, CubeElem, CubeMeta, CubeMode},
     fits_io::{output_path, read_fits, write_fits},
-    smooth::smooth,
+    smooth::{smooth, smooth_with_plans},
 };
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
@@ -198,6 +199,9 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     info!("Common beam: {common}");
 
     if args.shared.dryrun {
+        // Emit the result on stdout (tracing logs to stderr) so `--dryrun` stays
+        // machine-readable for callers that capture it.
+        println!("{common}");
         info!("Dry run — no files written.");
         return Ok(());
     }
@@ -342,13 +346,15 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             nfreq,
             m.nfreq
         );
-        if m.nstokes > 1 {
-            warn!(
-                "{}: NAXIS4={} — only Stokes 0 will be convolved",
-                f.display(),
-                m.nstokes
-            );
-        }
+        anyhow::ensure!(
+            m.nstokes <= 1,
+            "{}: NAXIS4={} (multiple Stokes) is not supported — only Stokes 0 \
+             would be convolved while the other Stokes planes are written as \
+             zeros, producing a misleading cube. Extract a single Stokes plane \
+             first.",
+            f.display(),
+            m.nstokes
+        );
     }
 
     let target_beam = parse_target_beam(&args.shared)?;
@@ -407,6 +413,21 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     }
 
     if args.shared.dryrun {
+        // Emit the resolved target beam(s) on stdout (tracing logs to stderr) so
+        // `--dryrun` stays machine-readable: one beam when all channels share it,
+        // otherwise one `<channel> <beam>` line per channel.
+        if all_same {
+            if let Some(b) = target_beams.iter().find_map(|b| *b) {
+                println!("{b}");
+            }
+        } else {
+            for (c, b) in target_beams.iter().enumerate() {
+                match b {
+                    Some(b) => println!("{c} {b}"),
+                    None => println!("{c} masked"),
+                }
+            }
+        }
         info!("Dry run — no files written.");
         return Ok(());
     }
@@ -435,106 +456,19 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             .with_context(|| format!("initialising output cube {}", out.display()))?;
 
         // Stream channels through a bounded pipeline instead of materialising the
-        // whole cube in RAM: rayon convolves planes in parallel (CPU- and
-        // memory-bandwidth bound) and sends each finished plane to a single writer
-        // thread that owns the output cube and writes sequentially (cfitsio is not
-        // thread-safe).  The bounded channel caps peak memory to the in-flight
-        // planes — not the entire output cube — and overlaps convolution with disk
-        // IO.  Threading (not async) fits: the work is CPU-bound and FITS IO is
-        // blocking, so an async runtime would buy nothing.
+        // whole cube in RAM (see `process_cube`).  Dispatch on the cube's pixel
+        // precision so the FFT runs at the data's native precision: f32 cubes
+        // (the common case) transform in f32, genuine f64 cubes in f64.
         pb.set_message("processing");
 
-        let cap = (rayon::current_num_threads() * 2).max(4);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<f32>)>(cap);
-
-        let writer_out = out.clone();
-        let writer_meta = meta; // copy of the &CubeMeta for the writer thread
-
-        let result: Result<()> = std::thread::scope(|s| {
-            // Single writer thread — owns the output FITS handle.  `FitsFile` holds
-            // a raw cfitsio pointer and is not `Send`, so it is opened *on* this
-            // thread and never crosses a thread boundary.
-            let writer_handle = s.spawn(move || -> Result<()> {
-                let mut writer = cube_io::CubeWriter::open(&writer_out)
-                    .with_context(|| format!("opening output cube {}", writer_out.display()))?;
-                for (c, plane) in rx {
-                    writer
-                        .write_channel(c, &plane, writer_meta)
-                        .with_context(|| {
-                            format!("writing channel {c} to {}", writer_out.display())
-                        })?;
-                }
-                Ok(())
-            });
-
-            // Parallel producers — convolve and stream finished planes to the writer.
-            let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
-                let old_beam = match meta.beams[c] {
-                    Some(b) => b,
-                    None => {
-                        pb.inc(1);
-                        return Ok(());
-                    }
-                };
-                let target = match target_beams[c] {
-                    Some(b) => b,
-                    None => {
-                        pb.inc(1);
-                        return Ok(());
-                    }
-                };
-
-                // Verbose (-v) per-channel beam report: current, target, and the
-                // convolving kernel (target deconvolved from the current beam).
-                // Route through `pb.suspend` so the log never corrupts the live bar.
-                let kernel = target.deconvolve_or_zero(&old_beam);
-                pb.suspend(|| {
-                    debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
-                });
-
-                let plane = if let Some(cutoff) = args.shared.cutoff
-                    && old_beam.major_arcsec() > cutoff
-                {
-                    pb.suspend(|| {
-                        warn!(
-                            "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                            old_beam.major_arcsec()
-                        )
-                    });
-                    Array2::from_elem((meta.ny, meta.nx), f32::NAN)
-                } else {
-                    let raw = cube_io::read_channel(file, c, meta)
-                        .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                    smooth(
-                        &raw,
-                        &old_beam,
-                        &target,
-                        meta.dx_deg,
-                        meta.dy_deg,
-                        args.shared.cutoff,
-                        meta.unit,
-                    )
-                    .with_context(|| format!("smoothing channel {c}"))?
-                };
-
-                // Hand the plane to the writer; a send error means the writer thread
-                // already exited (i.e. a write failed) — surface that below.
-                tx.send((c, plane))
-                    .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
-                pb.inc(1);
-                Ok(())
-            });
-
-            // Close the channel so the writer loop ends, then join it.  Prefer the
-            // writer's error (the real cause) over the producers' generic
-            // "writer stopped" when both fail.
-            drop(tx);
-            let writer_result = writer_handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
-            writer_result.and(produce)
-        });
-        result?;
+        match meta.dtype {
+            cube_io::PixelType::F32 => {
+                process_cube::<f32>(file, &out, meta, &target_beams, args.shared.cutoff, &pb)?
+            }
+            cube_io::PixelType::F64 => {
+                process_cube::<f64>(file, &out, meta, &target_beams, args.shared.cutoff, &pb)?
+            }
+        }
 
         let beamlog = {
             let dir = out.parent().unwrap_or(Path::new("."));
@@ -550,6 +484,123 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
 
     pb.finish_with_message("done");
     Ok(())
+}
+
+/// Stream every channel of one cube through the bounded convolution pipeline at
+/// pixel precision `T`.
+///
+/// rayon convolves planes in parallel (CPU- and memory-bandwidth bound) and
+/// sends each finished plane to a single writer thread that owns the output cube
+/// and writes sequentially (cfitsio is not thread-safe).  The bounded channel
+/// caps peak memory to the in-flight planes — not the whole cube — and overlaps
+/// convolution with disk IO.  Threading (not async) fits: the work is CPU-bound
+/// and FITS IO is blocking, so an async runtime would buy nothing.
+///
+/// One [`FftPlans`] is built up front and shared by reference across all workers,
+/// so the FFTs for every channel reuse the same plans instead of re-planning per
+/// channel.
+fn process_cube<T: CubeElem>(
+    file: &Path,
+    out: &Path,
+    meta: &CubeMeta,
+    target_beams: &[Option<Beam>],
+    cutoff: Option<f64>,
+    pb: &ProgressBar,
+) -> Result<()> {
+    // Plans depend only on the image dimensions, shared by all channels.
+    let plans = FftPlans::<T>::new(meta.ny, meta.nx);
+    let nfreq = meta.nfreq;
+
+    let cap = (rayon::current_num_threads() * 2).max(4);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
+
+    std::thread::scope(|s| {
+        // Single writer thread — owns the output FITS handle.  `FitsFile` holds a
+        // raw cfitsio pointer and is not `Send`, so it is opened *on* this thread
+        // and never crosses a thread boundary.
+        let writer_handle = s.spawn(move || -> Result<()> {
+            let mut writer = cube_io::CubeWriter::open(out)
+                .with_context(|| format!("opening output cube {}", out.display()))?;
+            for (c, plane) in rx {
+                writer
+                    .write_channel_as::<T>(c, &plane, meta)
+                    .with_context(|| format!("writing channel {c} to {}", out.display()))?;
+            }
+            Ok(())
+        });
+
+        // Parallel producers — convolve and stream finished planes to the writer.
+        let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
+            // Hand a finished plane to the writer; a send error means the writer
+            // thread already exited (i.e. a write failed) — surfaced below.
+            let send = |plane: Array2<T>| -> Result<()> {
+                tx.send((c, plane))
+                    .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
+                pb.inc(1);
+                Ok(())
+            };
+            let nan_plane = || Array2::from_elem((meta.ny, meta.nx), T::nan());
+
+            // A channel with no source beam, no target, or a degenerate zero beam
+            // cannot be convolved — a zero source beam makes the analytic UV
+            // filter's gain (g_ratio) diverge to infinity. Blank it with NaNs so
+            // it is written as explicit no-data rather than left as the output's
+            // zero-fill or corrupted to infinity.
+            let old_beam = match meta.beams[c] {
+                Some(b) if !b.is_zero() => b,
+                _ => return send(nan_plane()),
+            };
+            let target = match target_beams[c] {
+                Some(b) if !b.is_zero() => b,
+                _ => return send(nan_plane()),
+            };
+
+            // Verbose (-v) per-channel beam report: current, target, and the
+            // convolving kernel (target deconvolved from the current beam).
+            // Route through `pb.suspend` so the log never corrupts the live bar.
+            let kernel = target.deconvolve_or_zero(&old_beam);
+            pb.suspend(|| {
+                debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
+            });
+
+            let plane = if let Some(cut) = cutoff
+                && old_beam.major_arcsec() > cut
+            {
+                pb.suspend(|| {
+                    warn!(
+                        "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
+                        old_beam.major_arcsec()
+                    )
+                });
+                nan_plane()
+            } else {
+                let raw = cube_io::read_channel_as::<T>(file, c, meta)
+                    .with_context(|| format!("reading channel {c} from {}", file.display()))?;
+                smooth_with_plans(
+                    &raw,
+                    &old_beam,
+                    &target,
+                    meta.dx_deg,
+                    meta.dy_deg,
+                    cutoff,
+                    meta.unit,
+                    &plans,
+                )
+                .with_context(|| format!("smoothing channel {c}"))?
+            };
+
+            send(plane)
+        });
+
+        // Close the channel so the writer loop ends, then join it.  Prefer the
+        // writer's error (the real cause) over the producers' generic "writer
+        // stopped" when both fail.
+        drop(tx);
+        let writer_result = writer_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
+        writer_result.and(produce)
+    })
 }
 
 fn compute_target_beams(

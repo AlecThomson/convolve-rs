@@ -2,8 +2,6 @@
 # ruff: noqa: E501, F401, F403, F405
 
 import builtins
-import numpy
-import numpy.typing
 import typing
 __all__ = [
     "Beam",
@@ -31,6 +29,18 @@ class Beam:
         Beam.from_arcsec: Construct from arcsecond axes.
         Beam.from_fits_header: Construct from an astropy FITS header.
         Beam.from_radio_beam: Construct from a ``radio_beam.Beam`` object.
+    
+    Examples:
+        >>> from convolve_rs import Beam
+        >>> beam = Beam(0.005, 0.004, 30.0)
+        >>> beam.major_deg
+        0.005
+        >>> round(beam.major_arcsec, 6)
+        18.0
+        >>> Beam(0.004, 0.005, 0.0)
+        Traceback (most recent call last):
+        ...
+        ValueError: invalid beam: minor axis (0.005) > major axis (0.004)
     """
     @property
     def major_deg(self) -> builtins.float:
@@ -73,6 +83,12 @@ class Beam:
         
         Raises:
             ValueError: If minor_arcsec > major_arcsec or any value is non-finite.
+        
+        Examples:
+            >>> from convolve_rs import Beam
+            >>> beam = Beam.from_arcsec(18.0, 14.4, 30.0)
+            >>> beam.major_deg
+            0.005
         """
     def area_sr(self) -> builtins.float:
         r"""
@@ -99,6 +115,20 @@ class Beam:
         Raises:
             ValueError: If ``other`` is larger than ``self`` and deconvolution
                 is impossible.
+        
+        Examples:
+            Deconvolution inverts convolution:
+        
+            >>> from convolve_rs import Beam
+            >>> a = Beam.from_arcsec(3.0, 3.0, 0.0)
+            >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
+            >>> c = a.convolve(b)
+            >>> round(c.deconvolve(a).major_arcsec, 6)
+            4.0
+            >>> b.deconvolve(c)
+            Traceback (most recent call last):
+            ...
+            ValueError: beam could not be deconvolved: source beam is smaller than the PSF
         """
     def convolve(self, other: Beam) -> Beam:
         r"""
@@ -112,6 +142,15 @@ class Beam:
         
         Returns:
             Beam: The convolved beam.
+        
+        Examples:
+            Convolving two circular beams adds their axes in quadrature:
+        
+            >>> from convolve_rs import Beam
+            >>> a = Beam.from_arcsec(3.0, 3.0, 0.0)
+            >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
+            >>> round(a.convolve(b).major_arcsec, 6)
+            5.0
         """
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
@@ -139,6 +178,16 @@ def common_beam(beams: typing.Sequence[Beam], tolerance: builtins.float = 0.0001
     
     Raises:
         ValueError: If ``beams`` is empty or no valid common beam is found.
+    
+    Examples:
+        >>> from convolve_rs import Beam, common_beam
+        >>> b1 = Beam.from_arcsec(10.0, 8.0, 30.0)
+        >>> b2 = Beam.from_arcsec(12.0, 6.0, 60.0)
+        >>> cb = common_beam([b1, b2])
+        >>> cb.major_arcsec >= 12.0
+        True
+        >>> cb.area_sr() >= max(b1.area_sr(), b2.area_sr())
+        True
     """
 
 def gauss_factor(conv_beam: Beam, orig_beam: Beam, dx_arcsec: builtins.float, dy_arcsec: builtins.float) -> tuple[builtins.float, builtins.float, builtins.float, builtins.float, builtins.float]:
@@ -160,9 +209,19 @@ def gauss_factor(conv_beam: Beam, orig_beam: Beam, dx_arcsec: builtins.float, dy
             ``fac`` is the pixel scaling factor, ``amp`` is the Gaussian kernel
             integral, and the remaining three are the output beam parameters
             (major/minor FWHM in arcseconds, PA in degrees).
+    
+    Examples:
+        >>> from convolve_rs import Beam, gauss_factor
+        >>> conv = Beam.from_arcsec(5.0, 5.0, 0.0)
+        >>> orig = Beam.from_arcsec(10.0, 10.0, 0.0)
+        >>> fac, amp, bmaj, bmin, bpa = gauss_factor(conv, orig, 2.5, 2.5)
+        >>> fac > 0.0
+        True
+        >>> round(bmaj, 5)  # √(10² + 5²)
+        11.18034
     """
 
-def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> numpy.typing.NDArray[numpy.float32]:
+def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> typing.Any:
     r"""
     Smooth an image from ``old_beam`` to ``new_beam``.
     
@@ -173,8 +232,9 @@ def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam:
     unscaled.
     
     Args:
-        image (numpy.ndarray): Input image, shape ``(ny, nx)``,
-            dtype ``float32``.
+        image (numpy.ndarray): Input image, shape ``(ny, nx)``, dtype
+            ``float32`` or ``float64``. The convolution runs in the input's
+            precision and the output keeps the same dtype.
         old_beam (Beam): Current (input) restoring beam.
         new_beam (Beam): Target (output) restoring beam. Must be larger than
             ``old_beam``.
@@ -191,7 +251,8 @@ def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam:
             ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
     
     Returns:
-        numpy.ndarray: Smoothed image, shape ``(ny, nx)``, dtype ``float32``.
+        numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same dtype as the
+            input (``float32`` or ``float64``).
     
     Raises:
         ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
@@ -200,5 +261,23 @@ def smooth(image: numpy.typing.NDArray[numpy.float32], old_beam: Beam, new_beam:
     Warns:
         UserWarning: If ``bunit`` is given but not recognised as either a
             Kelvin or Jy/beam unit (Jy/beam is then assumed).
+    
+    Examples:
+        Smoothing a flat Jy/beam image from a 10″ to a 20″ circular beam
+        scales pixel values by the beam-area ratio (4); in Kelvin, surface
+        brightness is conserved:
+    
+        >>> import numpy as np
+        >>> from convolve_rs import Beam, smooth
+        >>> image = np.ones((64, 64), dtype=np.float32)
+        >>> old = Beam.from_arcsec(10.0, 10.0, 0.0)
+        >>> new = Beam.from_arcsec(20.0, 20.0, 0.0)
+        >>> dx = 2.5 / 3600.0
+        >>> jy = smooth(image, old, new, dx, dx)
+        >>> round(float(jy[32, 32]), 3)
+        4.0
+        >>> k = smooth(image, old, new, dx, dx, bunit="K")
+        >>> round(float(k[32, 32]), 3)
+        1.0
     """
 
