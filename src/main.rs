@@ -510,10 +510,21 @@ fn process_cube<T: CubeElem>(
     // Plans depend only on the image dimensions, shared by all channels.
     let plans = FftPlans::<T>::new(meta.ny, meta.nx);
 
-    // Bound the in-flight queue by a byte budget, not a plane count, so it
-    // actually back-pressures (see `channel_cap`).
+    // Bound both how many channels convolve at once and the output queue by a
+    // memory budget (see `PipelineLimits`). The per-channel convolution is the
+    // real RSS driver — each holds several × the plane live — so capping
+    // concurrency, not just the queue, is what keeps peak memory near budget.
     let plane_bytes = meta.ny * meta.nx * std::mem::size_of::<T>();
-    let cap = channel_cap(plane_bytes);
+    let limits = PipelineLimits::for_plane(plane_bytes);
+    pb.suspend(|| {
+        debug!(
+            "Pipeline: ≤{} channels convolving concurrently, queue depth {} \
+             (plane {:.0} MiB)",
+            limits.max_inflight,
+            limits.queue_cap,
+            plane_bytes as f64 / (1 << 20) as f64
+        )
+    });
 
     // Native-float cubes (BITPIX -32/-64) store IEEE floats verbatim, so a plane
     // can be byte-swapped to big-endian in the parallel producers and the writer
@@ -522,10 +533,29 @@ fn process_cube<T: CubeElem>(
     // float→int conversion + scaling, so they keep the (slower) cfitsio writer.
     // `pwrite`-based positioned writes need a Unix `FileExt`, so gate on it.
     if cfg!(unix) && meta.is_native_float() {
-        process_cube_raw::<T>(file, out, meta, target_beams, cutoff, pb, &plans, cap)
+        process_cube_raw::<T>(file, out, meta, target_beams, cutoff, pb, &plans, limits)
     } else {
-        process_cube_cfitsio::<T>(file, out, meta, target_beams, cutoff, pb, &plans, cap)
+        process_cube_cfitsio::<T>(file, out, meta, target_beams, cutoff, pb, &plans, limits)
     }
+}
+
+/// Run `produce` over the channel range with at most `max_inflight` channels
+/// convolving at once.
+///
+/// The per-channel convolution is single-threaded (parallelism is across
+/// channels) and holds several × the plane in scratch, so limiting the number
+/// of concurrent channels is what bounds peak RSS. A dedicated rayon pool of
+/// `max_inflight` threads does this without disturbing the global pool (used
+/// elsewhere, e.g. the 2D path).
+fn run_producers<F>(nfreq: usize, max_inflight: usize, produce: F) -> Result<()>
+where
+    F: Fn(usize) -> Result<()> + Sync + Send,
+{
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_inflight)
+        .build()
+        .context("building convolution thread pool")?;
+    pool.install(|| (0..nfreq).into_par_iter().try_for_each(produce))
 }
 
 /// Convolve one channel to its target beam, returning the finished plane.
@@ -599,7 +629,7 @@ fn process_cube_raw<T: CubeElem>(
     cutoff: Option<f64>,
     pb: &ProgressBar,
     plans: &FftPlans<T>,
-    cap: usize,
+    limits: PipelineLimits,
 ) -> Result<()> {
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
@@ -609,7 +639,7 @@ fn process_cube_raw<T: CubeElem>(
     let data_offset = cube_io::primary_data_offset(out)
         .with_context(|| format!("locating data unit in {}", out.display()))?;
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(cap);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(limits.queue_cap);
 
     std::thread::scope(|s| {
         // Single writer thread — owns one OS handle and writes already-swapped
@@ -636,8 +666,9 @@ fn process_cube_raw<T: CubeElem>(
             }
         });
 
-        // Parallel producers — convolve, byte-swap, and stream raw bytes.
-        let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
+        // Parallel producers — convolve, byte-swap, and stream raw bytes,
+        // capped to `max_inflight` concurrent convolutions to bound RSS.
+        let produce = run_producers(nfreq, limits.max_inflight, |c| {
             let plane = convolve_channel::<T>(file, c, meta, target_beams, cutoff, plans, pb)?;
             let bytes = T::plane_to_be_bytes(&plane);
             tx.send((c, bytes))
@@ -668,10 +699,10 @@ fn process_cube_cfitsio<T: CubeElem>(
     cutoff: Option<f64>,
     pb: &ProgressBar,
     plans: &FftPlans<T>,
-    cap: usize,
+    limits: PipelineLimits,
 ) -> Result<()> {
     let nfreq = meta.nfreq;
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(limits.queue_cap);
 
     std::thread::scope(|s| {
         // Single writer thread — owns the output FITS handle.  `FitsFile` holds a
@@ -688,8 +719,9 @@ fn process_cube_cfitsio<T: CubeElem>(
             Ok(())
         });
 
-        // Parallel producers — convolve and stream finished planes to the writer.
-        let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
+        // Parallel producers — convolve and stream finished planes to the
+        // writer, capped to `max_inflight` concurrent convolutions to bound RSS.
+        let produce = run_producers(nfreq, limits.max_inflight, |c| {
             let plane = convolve_channel::<T>(file, c, meta, target_beams, cutoff, plans, pb)?;
             tx.send((c, plane))
                 .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
@@ -705,36 +737,51 @@ fn process_cube_cfitsio<T: CubeElem>(
     })
 }
 
-/// In-flight queue depth for convolved planes, chosen so the bounded channel
-/// actually back-pressures.
+/// How many channels to convolve concurrently, and how deep the output queue
+/// may grow — both derived from a memory budget.
 ///
-/// The old `2 * num_threads` cap counted *planes*: when `nfreq` was below it the
-/// channel never blocked, so the whole convolved cube plus per-worker scratch
-/// buffered in RAM (observed: 113 GB RSS for a 27 GB cube). Bounding by a byte
-/// budget instead keeps peak memory near `budget` regardless of plane size,
-/// while the `2 * num_threads` ceiling preserves enough buffering to keep the
-/// convolvers fed and the floor of 4 keeps small cubes pipelined.
-fn channel_cap(plane_bytes: usize) -> usize {
-    cap_from_budget(
-        mem_budget_bytes(),
-        plane_bytes,
-        (rayon::current_num_threads() * 2).max(4),
-    )
+/// Profiling (10240²×64) showed peak RSS is dominated by the per-channel
+/// convolution working set, not the output queue: each concurrent channel holds
+/// roughly 5× the plane live (input copy, analytic filter, rfft spectrum,
+/// inverse output, and a second pair for NaN-mask propagation). With ~96 rayon
+/// workers that reached 118 GB for a 27 GB cube, and capping the *queue* alone
+/// did nothing. So `max_inflight` bounds the concurrent convolutions — the real
+/// lever — and the queue is kept just deep enough to keep the writer fed.
+#[derive(Debug, Clone, Copy)]
+struct PipelineLimits {
+    max_inflight: usize,
+    queue_cap: usize,
 }
 
-/// Pure core of [`channel_cap`]: how many planes fit in `budget`, clamped to
-/// `[4, ceiling]`. Split out from the env/thread lookups so it can be tested.
-fn cap_from_budget(budget: u64, plane_bytes: usize, ceiling: usize) -> usize {
-    let by_budget = (budget / plane_bytes.max(1) as u64) as usize;
-    by_budget.clamp(4, ceiling)
+impl PipelineLimits {
+    fn for_plane(plane_bytes: usize) -> Self {
+        Self::from_budget(
+            mem_budget_bytes(),
+            plane_bytes,
+            rayon::current_num_threads(),
+        )
+    }
+
+    /// Pure core: split `budget` across concurrent convolutions. Reserve ~6×
+    /// the plane per in-flight channel (5× working set + ~1× for its finished
+    /// plane queued for the writer), clamp to `[1, threads]`, and size the queue
+    /// to the producers feeding it (≥2 for pipelining).
+    fn from_budget(budget: u64, plane_bytes: usize, threads: usize) -> Self {
+        let per_slot = (plane_bytes as u64).saturating_mul(6).max(1);
+        let max_inflight = (budget / per_slot).clamp(1, threads.max(1) as u64) as usize;
+        Self {
+            max_inflight,
+            queue_cap: max_inflight.max(2),
+        }
+    }
 }
 
-/// Memory budget (bytes) for the in-flight plane queue.
+/// Memory budget (bytes) for the streaming pipeline.
 ///
 /// Override with `CONVOLVERS_MEM_BUDGET_MB`; otherwise use a quarter of the
 /// system's available memory (Linux `/proc/meminfo`), falling back to 4 GiB when
-/// that cannot be read. This bounds only the queue — per-worker FFT scratch is
-/// separate — so a conservative fraction leaves headroom for it.
+/// that cannot be read. The quarter leaves headroom for the shared FFT plans,
+/// the OS page cache, and the input read buffers.
 fn mem_budget_bytes() -> u64 {
     const FALLBACK: u64 = 4 << 30; // 4 GiB
     if let Ok(s) = std::env::var("CONVOLVERS_MEM_BUDGET_MB")
@@ -897,33 +944,37 @@ fn round_up(x: f64, decimals: i32) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::cap_from_budget;
+    use super::PipelineLimits;
 
     const GIB: u64 = 1 << 30;
 
-    /// The byte budget back-pressures: a budget smaller than the cube means the
-    /// cap is well below the channel count, so the queue actually blocks. This
-    /// is the regression the byte-budget cap fixes — the old plane-count cap
-    /// (`2 * threads`) never blocked when `nfreq` was below it.
+    /// Concurrency is bounded by the budget, not the thread count: a big box
+    /// (96 threads) convolving 419 MiB planes under a 44 GiB budget runs only
+    /// ~17 at once (44 GiB / 6·419 MiB), which is what keeps RSS near budget
+    /// instead of 96 × the working set. This is the memory fix.
     #[test]
-    fn cap_bounded_by_byte_budget_not_plane_count() {
+    fn inflight_bounded_by_budget_not_thread_count() {
         let plane = 419 * (1 << 20); // ~419 MiB (10240² f32)
-        // 4 GiB budget over a 27 GiB / 64-plane cube → ~9 planes in flight,
-        // far below both the 64 channels and a 192 plane-count ceiling.
-        let cap = cap_from_budget(4 * GIB, plane, 192);
-        assert_eq!(cap, 9);
-        assert!(cap < 64, "must block before buffering the whole cube");
+        let l = PipelineLimits::from_budget(44 * GIB, plane, 96);
+        assert_eq!(l.max_inflight, 17);
+        assert!(l.max_inflight < 96, "must run fewer than all threads");
+        assert_eq!(l.queue_cap, 17, "queue tracks the producers feeding it");
     }
 
     #[test]
-    fn cap_has_floor_of_four() {
-        // A plane larger than the whole budget still keeps a small pipeline.
-        assert_eq!(cap_from_budget(GIB, 4 * GIB as usize, 192), 4);
+    fn inflight_has_floor_of_one() {
+        // A plane whose working set exceeds the whole budget still makes
+        // progress — one channel at a time — rather than deadlocking.
+        let l = PipelineLimits::from_budget(GIB, 4 * GIB as usize, 96);
+        assert_eq!(l.max_inflight, 1);
+        assert_eq!(l.queue_cap, 2, "queue keeps a slot for pipelining");
     }
 
     #[test]
-    fn cap_capped_by_ceiling_for_tiny_planes() {
-        // Tiny planes would allow a huge cap; the thread-derived ceiling holds.
-        assert_eq!(cap_from_budget(64 * GIB, 1 << 16, 192), 192);
+    fn inflight_capped_by_thread_count_for_small_planes() {
+        // Tiny planes would allow far more in flight than cores; the thread
+        // count is the ceiling, so we never oversubscribe.
+        let l = PipelineLimits::from_budget(64 * GIB, 1 << 16, 96);
+        assert_eq!(l.max_inflight, 96);
     }
 }
