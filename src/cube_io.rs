@@ -598,7 +598,8 @@ fn write_beams_table(
         .with_type(ColumnDataType::Int)
         .create()?;
 
-    let table_hdu = fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
+    let table_hdu =
+        fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
     table_hdu.write_col(fptr, "BMAJ", &bmaj)?;
     table_hdu.write_col(fptr, "BMIN", &bmin)?;
     table_hdu.write_col(fptr, "BPA", &bpa)?;
