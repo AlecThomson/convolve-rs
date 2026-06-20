@@ -35,7 +35,7 @@ path = "src/main.rs"
 # required in CI or when building wheels. On by default; disable
 # (--no-default-features) to link a system cfitsio instead, as docs.rs does.
 default = ["fitsio-src"]
-fitsio-src = ["fitsio/fitsio-src"]
+fitsio-src = ["fitsio/fitsio-src", "atfits-rs/fitsio-src"]
 python = ["dep:pyo3", "dep:numpy"]
 # Stable-ABI build for distributable wheels: maturin builds a single
 # `cp310-abi3` wheel per platform (works on Python >=3.10) and can build
@@ -51,6 +51,8 @@ stubgen = ["python", "dep:pyo3-stub-gen"]
 pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 numpy = { version = "0.26", optional = true }
 pyo3-stub-gen = { version = "0.22.3", optional = true }
+# Shared low-level cfitsio helpers (pixel I/O, header editing, image creation).
+atfits-rs = { path = "../atfits-rs", version = "0.1" }
 # cfitsio linkage is controlled by the crate-level `fitsio-src` feature (see
 # [features] above).
 fitsio = { version = "0.21" }

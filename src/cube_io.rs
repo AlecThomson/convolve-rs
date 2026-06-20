@@ -7,6 +7,7 @@
 //!   3. Single BMAJ/BMIN/BPA from the primary header (broadcast to all channels)
 use std::path::{Path, PathBuf};
 
+use atfits_rs::{copy_header_only, update_key_f64, update_key_logical};
 use fitsio::{
     FitsFile,
     tables::{ColumnDataType, ColumnDescription},
@@ -20,35 +21,16 @@ use crate::smooth::BrightnessUnit;
 
 // ── Pixel element type ──────────────────────────────────────────────────────────
 
-/// In-memory pixel precision for streaming a cube, derived from FITS `BITPIX`.
-///
-/// `F32` covers `BITPIX = -32` (and is the working precision for integer cubes,
-/// matching long-standing behaviour); `F64` covers `BITPIX = -64`. Channels are
-/// read, convolved, and written in this precision so the FFT runs at the data's
-/// native precision rather than always upcasting to f64.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PixelType {
-    F32,
-    F64,
-}
-
-impl PixelType {
-    /// Map a FITS `BITPIX` value to a working precision: `-64` → f64, everything
-    /// else (f32, and all integer types) → f32.
-    pub fn from_bitpix(bitpix: i64) -> Self {
-        if bitpix == -64 {
-            PixelType::F64
-        } else {
-            PixelType::F32
-        }
-    }
-}
+/// In-memory pixel precision for streaming a cube, derived from FITS `BITPIX`
+/// (re-exported from [`atfits_rs`]): `-64` → f64, everything else → f32.
+pub use atfits_rs::PixelType;
 
 /// Pixel element types a cube can be streamed in: `f32` or `f64`.
 ///
-/// Implemented only for `f32`/`f64`; bundles the FITS section read/write so the
-/// streaming pipeline can be generic over precision while keeping the cfitsio
-/// calls monomorphic.
+/// Implemented only for `f32`/`f64`. Bundles the FITS section read/write (which
+/// delegate to the shared monomorphic cfitsio I/O in [`atfits_rs`]) behind the
+/// [`FftFloat`] bound, so the convolution pipeline can stay generic over
+/// precision and run the FFT at the data's native precision.
 pub trait CubeElem: FftFloat {
     fn read_section_vec(
         fptr: &mut FitsFile,
@@ -71,9 +53,7 @@ macro_rules! impl_cube_elem {
                 start: usize,
                 end: usize,
             ) -> Result<Vec<Self>, CubeError> {
-                let hdu = fptr.primary_hdu()?;
-                let data: Vec<$t> = hdu.read_section(fptr, start, end)?;
-                Ok(data)
+                Ok(<$t as atfits_rs::CubeElem>::read_section(fptr, start, end)?)
             }
             fn write_section_vec(
                 fptr: &mut FitsFile,
@@ -81,8 +61,7 @@ macro_rules! impl_cube_elem {
                 end: usize,
                 data: &[Self],
             ) -> Result<(), CubeError> {
-                let hdu = fptr.primary_hdu()?;
-                hdu.write_section(fptr, start, end, data)?;
+                <$t as atfits_rs::CubeElem>::write_section(fptr, start, end, data)?;
                 Ok(())
             }
         }
@@ -113,6 +92,21 @@ pub enum CubeError {
     BeamlogParse { line: usize, msg: String },
     #[error("no per-channel beam source found (no CASAMBM, no beamlog, no header beam)")]
     NoBeans,
+}
+
+/// Map the shared [`atfits_rs::AtfitsError`] (from the low-level cfitsio helpers)
+/// onto the convolve-rs error hierarchy.
+impl From<atfits_rs::AtfitsError> for CubeError {
+    fn from(e: atfits_rs::AtfitsError) -> Self {
+        use atfits_rs::AtfitsError as A;
+        match e {
+            A::Fits(e) => CubeError::Fits(e),
+            A::Io(e) => CubeError::Io(e),
+            A::MissingKeyword(s) | A::TargetAxisMissing(s) => CubeError::MissingKeyword(s),
+            A::UnsupportedNaxis(n) => CubeError::UnsupportedNaxis(n),
+            A::Other(s) => CubeError::Io(std::io::Error::other(s)),
+        }
+    }
 }
 
 // ── Public metadata struct ────────────────────────────────────────────────────
@@ -452,114 +446,11 @@ pub enum CubeMode {
     Total,
 }
 
-/// Create `output` containing only the primary-HDU header of `input` — no pixel data.
-///
-/// Uses cfitsio `fits_copy_header` (ffcphd): the output data unit is defined by the
-/// copied NAXIS keywords and zero-filled (sparsely) when the file is closed.  This is
-/// far cheaper than `std::fs::copy` for large cubes because the input pixel data is
-/// never read or written.
-fn copy_header_only(input: &Path, output: &Path) -> Result<(), CubeError> {
-    use std::ffi::CString;
-
-    // Refuse to clobber the input. This function deletes `output` before
-    // recreating it, so if `output` resolves to `input` (e.g. an empty
-    // `--suffix` in the input's directory, or a symlink to it) the source cube
-    // would be destroyed. `canonicalize` only succeeds for paths that exist, so
-    // a brand-new output simply skips the check.
-    if let (Ok(in_canon), Ok(out_canon)) = (input.canonicalize(), output.canonicalize())
-        && in_canon == out_canon
-    {
-        return Err(CubeError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "output {} resolves to the input cube; choose a different \
-                 --suffix/--prefix/--outdir",
-                output.display()
-            ),
-        )));
-    }
-
-    let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
-    in_fptr.primary_hdu()?; // position at the primary HDU to copy
-
-    // Create a *truly empty* output file with cfitsio `fits_create_file` (ffinit):
-    // it has no HDUs yet, so `fits_copy_header` (ffcphd) below initialises the
-    // primary HDU directly from the copied header.  We cannot use
-    // `FitsFile::create().open()` here — that eagerly writes a default empty
-    // (NAXIS=0) primary HDU, and ffcphd then copies *nothing* into the already
-    // existing primary, leaving a zero-dimensional image.  Writing pixel data to
-    // such an HDU later fails with the misleading cfitsio error 302
-    // ("column number < 1 or > tfields").
-    if output.exists() {
-        std::fs::remove_file(output)?;
-    }
-    let out_name = CString::new(output.to_string_lossy().into_owned())
-        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-
-    let mut status = 0;
-    let mut raw_out: *mut fitsio::sys::fitsfile = std::ptr::null_mut();
-    unsafe {
-        fitsio::sys::ffinit(&mut raw_out, out_name.as_ptr(), &mut status);
-        fitsio::errors::check_status(status)?;
-
-        fitsio::sys::ffcphd(in_fptr.as_raw(), raw_out, &mut status);
-        let copy_status = fitsio::errors::check_status(status);
-
-        // Always close the raw output pointer, even if the copy failed.
-        let mut close_status = 0;
-        fitsio::sys::ffclos(raw_out, &mut close_status);
-        copy_status?;
-        fitsio::errors::check_status(close_status)?;
-    }
-    Ok(())
-}
-
-/// Update (or create) a floating-point header keyword *in place*.
-///
-/// fitsio's `write_key` calls cfitsio `ffpky*`, which **appends** a new card even
-/// when the keyword already exists — producing duplicate cards (cfitsio then reads
-/// the *first*, stale value).  Real cubes carry BMAJ/CASAMBM in the copied primary
-/// header, so we must use `fits_update_key` (ffuky*) to overwrite in place.
-fn update_key_f64(fptr: &mut FitsFile, name: &str, value: f64) -> Result<(), CubeError> {
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let mut status = 0;
-    unsafe {
-        fitsio::sys::ffukyd(
-            fptr.as_raw(),
-            c_name.as_ptr(),
-            value,
-            -15, // use the shortest decimal representation that round-trips
-            std::ptr::null_mut(),
-            &mut status,
-        );
-    }
-    fitsio::errors::check_status(status)?;
-    Ok(())
-}
-
-/// Update (or create) a *logical* (boolean) header keyword in place.
-///
-/// `CASAMBM` is a FITS logical keyword (`T`/`F`, unquoted).  casacore / CARTA read
-/// it with `asBool`, which **throws** if the card is a quoted string (`'T'`) — that
-/// makes the cube unreadable.  Always write it as a true logical to match CASA and
-/// beamcon output.
-fn update_key_logical(fptr: &mut FitsFile, name: &str, value: bool) -> Result<(), CubeError> {
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|e| CubeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-    let mut status = 0;
-    unsafe {
-        fitsio::sys::ffukyl(
-            fptr.as_raw(),
-            c_name.as_ptr(),
-            value as std::os::raw::c_int,
-            std::ptr::null_mut(),
-            &mut status,
-        );
-    }
-    fitsio::errors::check_status(status)?;
-    Ok(())
-}
+// The header-only copy (`copy_header_only`) and update-in-place keyword editors
+// (`update_key_f64`, `update_key_logical`) now live in `atfits_rs` and are
+// imported at the top of this module. For the streaming write path that keeps
+// the handle open so the data unit is written exactly once, see
+// [`atfits_rs::copy_header_only_open`].
 
 /// Initialise an output cube by copying the input, then updating the beam headers.
 ///
