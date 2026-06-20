@@ -83,6 +83,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "atfits-rs"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "402ff31a81855e4eb3b35e4c5a8a313b523fe14f2f38176522cdddd3700bf43d"
+dependencies = [
+ "fitsio",
+ "thiserror",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,6 +239,7 @@ name = "convolve-rs"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "atfits-rs",
  "clap",
  "criterion",
  "fitsio",

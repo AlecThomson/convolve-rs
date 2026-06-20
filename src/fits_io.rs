@@ -4,6 +4,7 @@
 //! `[1,1,ny,nx]`) images as produced by ASKAP/CASA.
 use std::path::{Path, PathBuf};
 
+use atfits_rs::copy_header_only;
 use fitsio::FitsFile;
 use ndarray::Array2;
 use thiserror::Error;
@@ -21,6 +22,20 @@ pub enum FitsError {
     UnsupportedNaxis(i64),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Map the shared [`atfits_rs::AtfitsError`] onto this module's error type.
+impl From<atfits_rs::AtfitsError> for FitsError {
+    fn from(e: atfits_rs::AtfitsError) -> Self {
+        use atfits_rs::AtfitsError as A;
+        match e {
+            A::Fits(e) => FitsError::Fitsio(e),
+            A::Io(e) => FitsError::Io(e),
+            A::MissingKeyword(s) | A::TargetAxisMissing(s) => FitsError::MissingKeyword(s),
+            A::UnsupportedNaxis(n) => FitsError::UnsupportedNaxis(n),
+            A::Other(s) => FitsError::Io(std::io::Error::other(s)),
+        }
+    }
 }
 
 pub struct FitsImageData {
@@ -134,43 +149,6 @@ pub fn write_fits(
     Ok(())
 }
 
-/// Create `output` containing only the primary-HDU header of `input` — no pixel data.
-///
-/// Uses cfitsio `fits_copy_header` (ffcphd): the output data unit is defined by the
-/// copied NAXIS keywords and zero-filled (sparsely) on close, avoiding a full read of
-/// the template's pixel data.
-fn copy_header_only(input: &Path, output: &Path) -> Result<(), FitsError> {
-    let mut in_fptr = FitsFile::open(input.to_string_lossy().into_owned())?;
-    in_fptr.primary_hdu()?; // position at the primary HDU to copy
-    let mut out_fptr = FitsFile::create(output).overwrite().open()?;
-
-    let mut status = 0;
-    unsafe {
-        fitsio::sys::ffcphd(in_fptr.as_raw(), out_fptr.as_raw(), &mut status);
-    }
-    fitsio::errors::check_status(status)?;
-    Ok(())
-}
-
-/// Build the output path from the input path with an optional suffix/prefix/outdir.
-pub fn output_path(
-    input: &Path,
-    suffix: Option<&str>,
-    prefix: Option<&str>,
-    outdir: Option<&Path>,
-) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = input.extension().unwrap_or_default().to_string_lossy();
-
-    let filename = match suffix {
-        Some(s) => format!("{stem}.{s}.{ext}"),
-        None => format!("{stem}.{ext}"),
-    };
-    let filename = match prefix {
-        Some(p) => format!("{p}{filename}"),
-        None => filename,
-    };
-
-    let dir = outdir.unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")));
-    dir.join(filename)
-}
+/// Build the output path from the input path with an optional suffix/prefix/outdir
+/// (re-exported from [`atfits_rs`]).
+pub use atfits_rs::output_path;

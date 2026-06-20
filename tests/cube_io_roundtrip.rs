@@ -480,6 +480,85 @@ fn cli_total_mode_smooths_f64_cube() {
     }
 }
 
+/// Read the primary BMAJ/BMIN/BPA (deg) and CASAMBM (logical) keywords.
+fn read_primary_beam_keys(path: &std::path::Path) -> (f64, f64, f64, bool) {
+    let mut f = FitsFile::edit(path.to_string_lossy().to_string()).unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    (
+        hdu.read_key(&mut f, "BMAJ").unwrap(),
+        hdu.read_key(&mut f, "BMIN").unwrap(),
+        hdu.read_key(&mut f, "BPA").unwrap(),
+        hdu.read_key(&mut f, "CASAMBM").unwrap(),
+    )
+}
+
+/// The streaming `CubeWriter::create`/`finish` path (handle held open, data unit
+/// written once) must produce output identical to the legacy create-close-reopen
+/// `init_output_cube` + `write_channel` path: same primary beam keywords, same
+/// CASAMBM logical, same per-channel BEAMS table, and the same channel pixels.
+/// This pins the performance refactor to byte-for-byte behaviour preservation.
+#[test]
+fn streaming_writer_matches_init_output_cube() {
+    for mode in [CubeMode::Total, CubeMode::Natural] {
+        let tag = if mode == CubeMode::Natural {
+            "stream_nat"
+        } else {
+            "stream_tot"
+        };
+        let dir = workdir(tag);
+        let path = dir.join("in.fits");
+        make_cube(&path);
+        let meta = cube_io::read_cube_meta(&path).unwrap();
+
+        // Distinct per-channel target beams so the BEAMS table is non-trivial.
+        let target: Vec<Option<Beam>> = (0..NFREQ)
+            .map(|c| Some(Beam::from_arcsec(25.0 + c as f64, 20.0, 5.0).unwrap()))
+            .collect();
+        let planes: Vec<Array2<f32>> = (0..NFREQ)
+            .map(|c| Array2::from_elem((NY, NX), c as f32 + 0.5))
+            .collect();
+
+        // Legacy path: init (create-close-reopen) then per-channel write.
+        let legacy = dir.join("legacy.fits");
+        cube_io::init_output_cube(&path, &legacy, &target, mode, &meta).unwrap();
+        for (c, plane) in planes.iter().enumerate() {
+            cube_io::write_channel(&legacy, c, plane, &meta).unwrap();
+        }
+
+        // Streaming path: single open handle from create through finish.
+        let stream = dir.join("stream.fits");
+        {
+            let mut w = cube_io::CubeWriter::create(&path, &stream, &target, mode, &meta).unwrap();
+            // Write out of order to mimic the parallel pipeline's arrival order.
+            for c in (0..NFREQ).rev() {
+                w.write_channel(c, &planes[c], &meta).unwrap();
+            }
+            w.finish().unwrap();
+        }
+
+        // Primary beam keywords + CASAMBM must match exactly.
+        assert_eq!(
+            read_primary_beam_keys(&legacy),
+            read_primary_beam_keys(&stream),
+            "{tag}: primary beam keywords differ between paths"
+        );
+
+        // BEAMS table (or its absence) and channel pixels must match.
+        let lm = cube_io::read_cube_meta(&legacy).unwrap();
+        let sm = cube_io::read_cube_meta(&stream).unwrap();
+        for c in 0..NFREQ {
+            assert_eq!(
+                lm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg)),
+                sm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg)),
+                "{tag}: channel {c} beam differs"
+            );
+            let lp = cube_io::read_channel(&legacy, c, &lm).unwrap();
+            let sp = cube_io::read_channel(&stream, c, &sm).unwrap();
+            assert_eq!(lp, sp, "{tag}: channel {c} pixels differ");
+        }
+    }
+}
+
 /// Build a 3D cube like `make_varied_cube` but with channel 1's beam masked
 /// (BMAJ = 0), so the streaming pipeline must blank that channel.
 fn make_cube_masked_chan1(path: &std::path::Path) {

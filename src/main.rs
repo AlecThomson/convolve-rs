@@ -447,27 +447,37 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             args.shared.outdir.as_deref(),
         );
 
-        // Cube initialisation copies the full primary header and (in natural mode)
-        // writes the BEAMS table — a potentially slow IO step on large cubes, so
-        // announce it.  `pb.suspend` keeps the log line from clobbering the bar.
+        // The output cube is created and held open by the writer thread inside
+        // `process_cube` (see `CubeWriter::create`): the single FITS handle stays
+        // open from creation through every channel write, so cfitsio writes the
+        // data unit exactly once instead of flushing a full pass of zeros on a
+        // create-close before the real planes overwrite it.  Announce the step.
         pb.suspend(|| info!("Initialising output cube {} …", out.display()));
-        pb.set_message("initialising");
-        cube_io::init_output_cube(file, &out, &target_beams, cube_mode, meta)
-            .with_context(|| format!("initialising output cube {}", out.display()))?;
+        pb.set_message("processing");
 
         // Stream channels through a bounded pipeline instead of materialising the
         // whole cube in RAM (see `process_cube`).  Dispatch on the cube's pixel
         // precision so the FFT runs at the data's native precision: f32 cubes
         // (the common case) transform in f32, genuine f64 cubes in f64.
-        pb.set_message("processing");
-
         match meta.dtype {
-            cube_io::PixelType::F32 => {
-                process_cube::<f32>(file, &out, meta, &target_beams, args.shared.cutoff, &pb)?
-            }
-            cube_io::PixelType::F64 => {
-                process_cube::<f64>(file, &out, meta, &target_beams, args.shared.cutoff, &pb)?
-            }
+            cube_io::PixelType::F32 => process_cube::<f32>(
+                file,
+                &out,
+                meta,
+                &target_beams,
+                cube_mode,
+                args.shared.cutoff,
+                &pb,
+            )?,
+            cube_io::PixelType::F64 => process_cube::<f64>(
+                file,
+                &out,
+                meta,
+                &target_beams,
+                cube_mode,
+                args.shared.cutoff,
+                &pb,
+            )?,
         }
 
         let beamlog = {
@@ -504,6 +514,7 @@ fn process_cube<T: CubeElem>(
     out: &Path,
     meta: &CubeMeta,
     target_beams: &[Option<Beam>],
+    cube_mode: CubeMode,
     cutoff: Option<f64>,
     pb: &ProgressBar,
 ) -> Result<()> {
@@ -515,17 +526,22 @@ fn process_cube<T: CubeElem>(
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
 
     std::thread::scope(|s| {
-        // Single writer thread — owns the output FITS handle.  `FitsFile` holds a
-        // raw cfitsio pointer and is not `Send`, so it is opened *on* this thread
-        // and never crosses a thread boundary.
+        // Single writer thread — creates and owns the output FITS handle.
+        // `FitsFile` holds a raw cfitsio pointer and is not `Send`, so the handle
+        // is created *on* this thread and never crosses a thread boundary. Keeping
+        // it open from creation through every channel write to `finish` means
+        // cfitsio writes the data unit exactly once (no wasted zero-fill pass).
         let writer_handle = s.spawn(move || -> Result<()> {
-            let mut writer = cube_io::CubeWriter::open(out)
-                .with_context(|| format!("opening output cube {}", out.display()))?;
+            let mut writer = cube_io::CubeWriter::create(file, out, target_beams, cube_mode, meta)
+                .with_context(|| format!("initialising output cube {}", out.display()))?;
             for (c, plane) in rx {
                 writer
                     .write_channel_as::<T>(c, &plane, meta)
                     .with_context(|| format!("writing channel {c} to {}", out.display()))?;
             }
+            writer
+                .finish()
+                .with_context(|| format!("finalising output cube {}", out.display()))?;
             Ok(())
         });
 
