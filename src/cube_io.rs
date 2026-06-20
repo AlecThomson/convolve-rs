@@ -400,14 +400,72 @@ pub fn write_channel(
 /// (the consumer end of the streaming pipeline in `main`).
 pub struct CubeWriter {
     fptr: FitsFile,
+    /// BEAMS table to append on [`CubeWriter::finish`] (Natural mode only).
+    ///
+    /// Deferred so the extension lands *after* the primary data unit (matching
+    /// [`init_output_cube`]'s on-disk layout) and the data unit is written in a
+    /// single pass: creating the extension forces cfitsio to flush the primary
+    /// data unit, so it must happen after every channel is written, not before.
+    /// `None` in Total mode or when opened against an already-initialised cube.
+    pending_beams: Option<PendingBeams>,
+}
+
+/// Per-channel beam table buffered until [`CubeWriter::finish`].
+struct PendingBeams {
+    beams: Vec<Option<Beam>>,
+    nfreq: usize,
 }
 
 impl CubeWriter {
+    /// Create a fresh output cube from `input_path`'s primary header and hold the
+    /// FITS handle open for streaming channel writes.
+    ///
+    /// Unlike [`init_output_cube`] (create → close → reopen), the single handle
+    /// stays open from creation through every [`CubeWriter::write_channel_as`]
+    /// until [`CubeWriter::finish`], so cfitsio writes the data unit exactly once
+    /// — avoiding the wasted full zero-fill pass a create-close incurs on the data
+    /// unit of a multi-GB cube.  Only data-unit gaps no channel covered are
+    /// zero-filled on the final close.
+    ///
+    /// Primary-header beam keywords (BMAJ/BMIN/BPA/CASAMBM) are written up front;
+    /// in `Natural` mode the BEAMS extension is buffered and appended by `finish`.
+    pub fn create(
+        input_path: &Path,
+        output_path: &Path,
+        target_beams: &[Option<Beam>],
+        mode: CubeMode,
+        meta: &CubeMeta,
+    ) -> Result<Self, CubeError> {
+        // Copy the primary header from the input and keep the handle open (no
+        // data written yet). cfitsio defines the data unit from the copied NAXIS
+        // keywords; it is written once, when this handle is finally dropped.
+        let mut fptr = atfits_rs::copy_header_only_open(input_path, output_path)?;
+
+        let ref_beam = ref_beam_for(target_beams, meta);
+        write_primary_beam_keys(&mut fptr, ref_beam, mode == CubeMode::Natural)?;
+
+        // Reposition at the primary HDU so subsequent channel writes target the
+        // primary data unit (key updates above already sit there, but be explicit).
+        fptr.primary_hdu()?;
+
+        let pending_beams = (mode == CubeMode::Natural).then(|| PendingBeams {
+            beams: target_beams.to_vec(),
+            nfreq: meta.nfreq,
+        });
+        Ok(Self {
+            fptr,
+            pending_beams,
+        })
+    }
+
     /// Open an already-initialised output cube (see [`init_output_cube`]) for
     /// sequential channel writes.
     pub fn open(path: &Path) -> Result<Self, CubeError> {
         let fptr = FitsFile::edit(path.to_string_lossy().into_owned())?;
-        Ok(Self { fptr })
+        Ok(Self {
+            fptr,
+            pending_beams: None,
+        })
     }
 
     /// Write one frequency channel plane (precision `T`) into the open cube.
@@ -433,6 +491,20 @@ impl CubeWriter {
     ) -> Result<(), CubeError> {
         self.write_channel_as::<f32>(chan, data, meta)
     }
+
+    /// Finish the cube: append the buffered BEAMS extension (Natural mode) and
+    /// close the FITS file exactly once.
+    ///
+    /// Must be called after the final channel write. The single close zero-fills
+    /// only the data-unit gaps no channel covered; creating the BEAMS extension
+    /// here (not at `create`) keeps the primary data unit written in one pass.
+    pub fn finish(mut self) -> Result<(), CubeError> {
+        if let Some(p) = self.pending_beams.take() {
+            write_beams_table(&mut self.fptr, &p.beams, p.nfreq)?;
+        }
+        // `self.fptr` drops at end of scope → cfitsio closes and flushes once.
+        Ok(())
+    }
 }
 
 // ── Output cube initialisation ────────────────────────────────────────────────
@@ -452,10 +524,110 @@ pub enum CubeMode {
 // the handle open so the data unit is written exactly once, see
 // [`atfits_rs::copy_header_only_open`].
 
-/// Initialise an output cube by copying the input, then updating the beam headers.
+/// Reference beam for the primary header: the beam at CRPIX3 (clamped to range),
+/// falling back to the first valid beam, then to a zero beam.
+fn ref_beam_for(target_beams: &[Option<Beam>], meta: &CubeMeta) -> Beam {
+    let ref_idx = ((meta.crpix_freq - 1) as usize).min(meta.nfreq.saturating_sub(1));
+    target_beams[ref_idx].unwrap_or_else(|| {
+        // Find first valid beam if the reference channel is masked.
+        target_beams.iter().find_map(|b| *b).unwrap_or(Beam::zero())
+    })
+}
+
+/// Write the primary-header PSF keywords (BMAJ/BMIN/BPA + CASAMBM) in place.
+///
+/// `fptr` must be positioned at the primary HDU. Uses `update_key_*` (ffuky*),
+/// which overwrites in place — the input header is copied verbatim and may
+/// already carry these cards, so appending would duplicate them. CASAMBM is
+/// written as a FITS *logical* (not a quoted string), or casacore/CARTA fail to
+/// open the cube (they read it with `asBool`).
+fn write_primary_beam_keys(
+    fptr: &mut FitsFile,
+    ref_beam: Beam,
+    natural: bool,
+) -> Result<(), CubeError> {
+    fptr.primary_hdu()?; // position at the primary HDU
+    update_key_f64(fptr, "BMAJ", ref_beam.major_deg)?;
+    update_key_f64(fptr, "BMIN", ref_beam.minor_deg)?;
+    update_key_f64(fptr, "BPA", ref_beam.pa_deg)?;
+    update_key_logical(fptr, "CASAMBM", natural)?;
+    Ok(())
+}
+
+/// Append the CASA BEAMS binary-table extension (per-channel beams) to `fptr`.
+///
+/// Creating this extension forces cfitsio to flush the primary data unit, so on
+/// the streaming write path it must be called *after* every channel is written
+/// (see [`CubeWriter::finish`]) to keep the data unit written in a single pass.
+fn write_beams_table(
+    fptr: &mut FitsFile,
+    target_beams: &[Option<Beam>],
+    nfreq: usize,
+) -> Result<(), CubeError> {
+    let tiny = f32::MIN_POSITIVE as f64;
+
+    // Build per-channel beam arrays (BMAJ/BMIN in arcsec, BPA in deg).
+    let bmaj: Vec<f32> = target_beams
+        .iter()
+        .map(|b| b.map_or(tiny as f32, |b| b.major_arcsec() as f32))
+        .collect();
+    let bmin: Vec<f32> = target_beams
+        .iter()
+        .map(|b| b.map_or(tiny as f32, |b| b.minor_arcsec() as f32))
+        .collect();
+    let bpa: Vec<f32> = target_beams
+        .iter()
+        .map(|b| b.map_or(tiny as f32, |b| b.pa_deg as f32))
+        .collect();
+    let chan: Vec<i32> = (0..nfreq as i32).collect();
+    let pol: Vec<i32> = vec![0i32; nfreq];
+
+    let col_bmaj = ColumnDescription::new("BMAJ")
+        .with_type(ColumnDataType::Float)
+        .create()?;
+    let col_bmin = ColumnDescription::new("BMIN")
+        .with_type(ColumnDataType::Float)
+        .create()?;
+    let col_bpa = ColumnDescription::new("BPA")
+        .with_type(ColumnDataType::Float)
+        .create()?;
+    let col_chan = ColumnDescription::new("CHAN")
+        .with_type(ColumnDataType::Int)
+        .create()?;
+    let col_pol = ColumnDescription::new("POL")
+        .with_type(ColumnDataType::Int)
+        .create()?;
+
+    let table_hdu = fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
+    table_hdu.write_col(fptr, "BMAJ", &bmaj)?;
+    table_hdu.write_col(fptr, "BMIN", &bmin)?;
+    table_hdu.write_col(fptr, "BPA", &bpa)?;
+    table_hdu.write_col(fptr, "CHAN", &chan)?;
+    table_hdu.write_col(fptr, "POL", &pol)?;
+
+    // Standard BEAMS extension keywords.  `create_table` already wrote EXTNAME,
+    // so we do not re-write it (that would append a duplicate card).  Column
+    // units (TUNITn) are required by casacore/CARTA to interpret the beam table:
+    // BMAJ/BMIN in arcsec, BPA in deg.
+    let beam_hdu = fptr.hdu("BEAMS")?;
+    beam_hdu.write_key(fptr, "TUNIT1", "arcsec")?;
+    beam_hdu.write_key(fptr, "TUNIT2", "arcsec")?;
+    beam_hdu.write_key(fptr, "TUNIT3", "deg")?;
+    beam_hdu.write_key(fptr, "NCHAN", nfreq as i64)?;
+    beam_hdu.write_key(fptr, "NPOL", 1i64)?;
+    Ok(())
+}
+
+/// Initialise an output cube by copying the input header, then updating the beam
+/// headers, closing the file once. The data unit is zero-filled by the close.
 ///
 /// For `Natural` mode a BEAMS binary-table extension is appended.
 /// For `Total` mode only the primary BMAJ/BMIN/BPA keywords are updated.
+///
+/// The streaming cube write path uses [`CubeWriter::create`] instead, which keeps
+/// the handle open so the data unit is written a single time. This function
+/// remains for callers that initialise then write planes through a separate
+/// handle (e.g. [`write_channel`]).
 pub fn init_output_cube(
     input_path: &Path,
     output_path: &Path,
@@ -470,85 +642,16 @@ pub fn init_output_cube(
     // plane is overwritten by `write_channel` anyway.
     copy_header_only(input_path, output_path)?;
 
-    // Reference channel: CRPIX3 (1-based) → 0-based index clamped to valid range.
-    let ref_idx = ((meta.crpix_freq - 1) as usize).min(meta.nfreq.saturating_sub(1));
-    let ref_beam = target_beams[ref_idx].unwrap_or_else(|| {
-        // Find first valid beam if the reference channel is masked.
-        target_beams.iter().find_map(|b| *b).unwrap_or(Beam::zero())
-    });
-
-    let tiny = f32::MIN_POSITIVE as f64;
+    let ref_beam = ref_beam_for(target_beams, meta);
 
     {
         let path_str = output_path.to_string_lossy().into_owned();
         let mut fptr = FitsFile::edit(&path_str)?;
-        fptr.primary_hdu()?; // position at the primary HDU
+        write_primary_beam_keys(&mut fptr, ref_beam, mode == CubeMode::Natural)?;
 
-        // Update primary header PSF in place (the input header — copied verbatim —
-        // may already contain these keywords; appending would duplicate them).
-        update_key_f64(&mut fptr, "BMAJ", ref_beam.major_deg)?;
-        update_key_f64(&mut fptr, "BMIN", ref_beam.minor_deg)?;
-        update_key_f64(&mut fptr, "BPA", ref_beam.pa_deg)?;
-
-        // CASAMBM must be a FITS *logical*, not a quoted string, or casacore/CARTA
-        // fail to open the cube (they read it with `asBool`).
-        update_key_logical(&mut fptr, "CASAMBM", mode == CubeMode::Natural)?;
-    }
-
-    if mode == CubeMode::Natural {
-        // Build per-channel beam arrays (BMAJ/BMIN in arcsec, BPA in deg).
-        let bmaj: Vec<f32> = target_beams
-            .iter()
-            .map(|b| b.map_or(tiny as f32, |b| b.major_arcsec() as f32))
-            .collect();
-        let bmin: Vec<f32> = target_beams
-            .iter()
-            .map(|b| b.map_or(tiny as f32, |b| b.minor_arcsec() as f32))
-            .collect();
-        let bpa: Vec<f32> = target_beams
-            .iter()
-            .map(|b| b.map_or(tiny as f32, |b| b.pa_deg as f32))
-            .collect();
-        let chan: Vec<i32> = (0..meta.nfreq as i32).collect();
-        let pol: Vec<i32> = vec![0i32; meta.nfreq];
-
-        let col_bmaj = ColumnDescription::new("BMAJ")
-            .with_type(ColumnDataType::Float)
-            .create()?;
-        let col_bmin = ColumnDescription::new("BMIN")
-            .with_type(ColumnDataType::Float)
-            .create()?;
-        let col_bpa = ColumnDescription::new("BPA")
-            .with_type(ColumnDataType::Float)
-            .create()?;
-        let col_chan = ColumnDescription::new("CHAN")
-            .with_type(ColumnDataType::Int)
-            .create()?;
-        let col_pol = ColumnDescription::new("POL")
-            .with_type(ColumnDataType::Int)
-            .create()?;
-
-        let path_str = output_path.to_string_lossy().into_owned();
-        let mut fptr = FitsFile::edit(&path_str)?;
-
-        let table_hdu =
-            fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
-        table_hdu.write_col(&mut fptr, "BMAJ", &bmaj)?;
-        table_hdu.write_col(&mut fptr, "BMIN", &bmin)?;
-        table_hdu.write_col(&mut fptr, "BPA", &bpa)?;
-        table_hdu.write_col(&mut fptr, "CHAN", &chan)?;
-        table_hdu.write_col(&mut fptr, "POL", &pol)?;
-
-        // Standard BEAMS extension keywords.  `create_table` already wrote EXTNAME,
-        // so we do not re-write it (that would append a duplicate card).  Column
-        // units (TUNITn) are required by casacore/CARTA to interpret the beam table:
-        // BMAJ/BMIN in arcsec, BPA in deg.
-        let beam_hdu = fptr.hdu("BEAMS")?;
-        beam_hdu.write_key(&mut fptr, "TUNIT1", "arcsec")?;
-        beam_hdu.write_key(&mut fptr, "TUNIT2", "arcsec")?;
-        beam_hdu.write_key(&mut fptr, "TUNIT3", "deg")?;
-        beam_hdu.write_key(&mut fptr, "NCHAN", meta.nfreq as i64)?;
-        beam_hdu.write_key(&mut fptr, "NPOL", 1i64)?;
+        if mode == CubeMode::Natural {
+            write_beams_table(&mut fptr, target_beams, meta.nfreq)?;
+        }
     }
 
     Ok(())
