@@ -283,3 +283,96 @@ class TestSmoothDtype:
         img = np.ones((32, 32), dtype=np.int32)
         with pytest.raises(ValueError):
             smooth(img, self.OLD, self.NEW, self.PIX, self.PIX)
+
+
+class TestSmoothInputs:
+    """smooth() takes arrays as they come from FITS and from other threads."""
+
+    OLD = Beam.from_arcsec(12.0, 10.0, 20.0)
+    NEW = Beam.from_arcsec(18.0, 15.0, 35.0)
+    PIX = 2.5 * ARCSEC
+
+    def _image(self, shape=(65, 48), dtype=np.float32, nans=True):
+        rng = np.random.default_rng(1234)
+        img = rng.normal(size=shape).astype(dtype)
+        img[shape[0] // 2 :, : shape[1] // 3] += 5.0
+        if nans:
+            img[:20, :25] = np.nan
+        return img
+
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    def test_big_endian_fits_data(self, tmp_path, dtype):
+        # astropy hands back FITS data big-endian (">f4"/">f8"); it must be
+        # accepted and give the same answer as the native-order array.
+        path = tmp_path / "plane.fits"
+        fits.PrimaryHDU(data=self._image(dtype=dtype)).writeto(path)
+        data = fits.getdata(path)
+        assert not data.dtype.isnative
+
+        out = smooth(data, self.OLD, self.NEW, self.PIX, self.PIX)
+        native = smooth(data.astype(dtype), self.OLD, self.NEW, self.PIX, self.PIX)
+        assert out.dtype == np.dtype(dtype)
+        np.testing.assert_array_equal(out, native)
+
+    def test_non_contiguous_input(self):
+        base = self._image(shape=(96, 130))
+        for view in (base.T, base[::2, 1::3], np.asfortranarray(base)):
+            out = smooth(view, self.OLD, self.NEW, self.PIX, self.PIX)
+            expected = smooth(
+                np.ascontiguousarray(view), self.OLD, self.NEW, self.PIX, self.PIX
+            )
+            np.testing.assert_array_equal(out, expected)
+
+    def test_input_is_left_alone(self):
+        for nans in (False, True):
+            img = self._image(nans=nans)
+            before = img.copy()
+            smooth(img, self.OLD, self.NEW, self.PIX, self.PIX)
+            np.testing.assert_array_equal(img, before)
+
+    def test_concurrent_threads_match_sequential(self):
+        # The GIL is released during the convolution, so a thread-pool executor
+        # (racs_tools' default) runs planes in parallel; results must not mix.
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        images = [self._image(shape=(200, 180 + k)) * (k + 1) for k in range(6)]
+        expected = [smooth(im, self.OLD, self.NEW, self.PIX, self.PIX) for im in images]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            got = list(
+                pool.map(
+                    lambda im: smooth(im, self.OLD, self.NEW, self.PIX, self.PIX),
+                    images,
+                )
+            )
+        for g, e in zip(got, expected, strict=True):
+            np.testing.assert_array_equal(g, e)
+
+    @pytest.mark.parametrize("shape", [(128, 96), (129, 97)])
+    def test_matches_racs_tools_robust(self, shape):
+        # Parity with the Python implementation this ports, when it is installed.
+        convolve_uv = pytest.importorskip("racs_tools.convolve_uv")
+        img = self._image(shape=shape)
+        old = rb.Beam(12 * u.arcsec, 10 * u.arcsec, 20 * u.deg)
+        new = rb.Beam(18 * u.arcsec, 15 * u.arcsec, 35 * u.deg)
+        theirs = convolve_uv.smooth(
+            img, old, new, self.PIX * u.deg, self.PIX * u.deg, conv_mode="robust"
+        )
+        ours = smooth(
+            img,
+            Beam.from_radio_beam(old),
+            Beam.from_radio_beam(new),
+            self.PIX,
+            self.PIX,
+        )
+        # convolve-rs blanks where the convolved NaN mask reaches 0.99 of the
+        # filter gain rather than 1, so f32 round-off cannot un-blank a masked
+        # region; that adds a thin rim of blanked pixels but never removes one.
+        assert np.isnan(ours)[np.isnan(theirs)].all()
+        assert (
+            np.isnan(ours).sum() - np.isnan(theirs).sum()
+            < 0.02 * np.isnan(theirs).sum()
+        )
+        finite = ~np.isnan(ours)
+        np.testing.assert_allclose(
+            ours[finite], theirs[finite], rtol=0, atol=1e-4 * theirs[finite].std()
+        )

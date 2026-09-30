@@ -127,7 +127,8 @@ pub struct CubeMeta {
     pub dx_deg: f64,
     /// |CDELT2| in degrees.
     pub dy_deg: f64,
-    /// FITS 1-based CRPIX for the spectral axis (used as the header reference channel).
+    /// FITS 1-based CRPIX for the spectral axis (used as the header reference
+    /// channel). May lie outside `1..=nfreq`.
     pub crpix_freq: i64,
     /// Per-channel beams.  `None` means the channel is masked / has no valid beam.
     pub beams: Vec<Option<Beam>>,
@@ -172,13 +173,26 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
 
     let naxis1: i64 = hdu.read_key(&mut fptr, "NAXIS1")?; // x / RA
     let naxis2: i64 = hdu.read_key(&mut fptr, "NAXIS2")?; // y / Dec
-    let naxis3: i64 = hdu.read_key(&mut fptr, "NAXIS3")?; // freq
+    let naxis3: i64 = hdu.read_key(&mut fptr, "NAXIS3")?;
 
-    let (nstokes, nfreq, is_4d) = if naxis == 4 {
+    // Which of axes 3/4 is the spectral one. ASKAP and beamcon write RA, DEC,
+    // FREQ, STOKES, but CASA writes RA, DEC, STOKES, FREQ; like racs_tools (which
+    // asks astropy's WCS for the spectral axis) accept either, keyed on CTYPE.
+    // With a single Stokes plane the two orders lay the channels out identically
+    // (channel c starts at c·ny·nx), so only the sizes and CRPIX differ.
+    let ctype3 = hdu
+        .read_key::<String>(&mut fptr, "CTYPE3")
+        .map(|s| s.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    let (nstokes, nfreq, freq_axis, is_4d) = if naxis == 4 {
         let naxis4: i64 = hdu.read_key(&mut fptr, "NAXIS4")?;
-        (naxis4 as usize, naxis3 as usize, true)
+        if ctype3 == "STOKES" {
+            (naxis3 as usize, naxis4 as usize, 4, true)
+        } else {
+            (naxis4 as usize, naxis3 as usize, 3, true)
+        }
     } else {
-        (1, naxis3 as usize, false)
+        (1, naxis3 as usize, 3, false)
     };
 
     let nx = naxis1 as usize;
@@ -189,8 +203,11 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     let dx_deg = cdelt1.abs();
     let dy_deg = cdelt2.abs();
 
-    // Reference channel for the spectral axis (CRPIX3 for 3D, CRPIX3 for 4D where freq=axis 3)
-    let crpix_freq: i64 = hdu.read_key(&mut fptr, "CRPIX3").unwrap_or(1);
+    // Reference channel for the spectral axis. cfitsio truncates a fractional
+    // CRPIX (e.g. 144.5) to an integer, as racs_tools' `int(crpix)` does.
+    let crpix_freq: i64 = hdu
+        .read_key(&mut fptr, &format!("CRPIX{freq_axis}"))
+        .unwrap_or(1);
 
     // Pixel precision: convolve in the data's native precision (f32 for -32 and
     // integer cubes, f64 for -64) instead of always upcasting to f64.
@@ -342,7 +359,8 @@ fn read_casambm_beams(path: &Path, nfreq: usize) -> Result<Vec<Option<Beam>>, Cu
 /// requested precision `T`.
 ///
 /// Reads stokes=0 (the first Stokes plane).  For 3D [nfreq, ny, nx] and 4D
-/// [nstokes=1, nfreq, ny, nx] cubes the flat offset is identical: `chan * ny * nx`.
+/// [nstokes=1, nfreq, ny, nx] or [nfreq, nstokes=1, ny, nx] cubes the flat
+/// offset is identical: `chan * ny * nx`.
 pub fn read_channel_as<T: CubeElem>(
     path: &Path,
     chan: usize,
@@ -524,10 +542,13 @@ pub enum CubeMode {
 // the handle open so the data unit is written exactly once, see
 // [`atfits_rs::copy_header_only_open`].
 
-/// Reference beam for the primary header: the beam at CRPIX3 (clamped to range),
-/// falling back to the first valid beam, then to a zero beam.
+/// Reference beam for the primary header: the beam at the spectral CRPIX
+/// (clamped to the channel range, so a reference pixel off either end of the
+/// axis picks the nearest channel), falling back to the first valid beam, then
+/// to a zero beam.
 fn ref_beam_for(target_beams: &[Option<Beam>], meta: &CubeMeta) -> Beam {
-    let ref_idx = ((meta.crpix_freq - 1) as usize).min(meta.nfreq.saturating_sub(1));
+    let last = meta.nfreq.saturating_sub(1) as i64;
+    let ref_idx = (meta.crpix_freq - 1).clamp(0, last) as usize;
     target_beams[ref_idx].unwrap_or_else(|| {
         // Find first valid beam if the reference channel is masked.
         target_beams.iter().find_map(|b| *b).unwrap_or(Beam::zero())

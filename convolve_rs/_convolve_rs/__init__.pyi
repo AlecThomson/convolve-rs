@@ -233,8 +233,12 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
     
     Args:
         image (numpy.ndarray): Input image, shape ``(ny, nx)``, dtype
-            ``float32`` or ``float64``. The convolution runs in the input's
-            precision and the output keeps the same dtype.
+            ``float32`` or ``float64`` in either byte order (so data straight
+            from ``astropy.io.fits``, which is big-endian, is accepted). The
+            convolution runs in the input's precision and the output keeps the
+            same precision, in native byte order. The GIL is released while
+            the image is convolved, so calls from several threads run in
+            parallel; do not modify the array from another thread meanwhile.
         old_beam (Beam): Current (input) restoring beam.
         new_beam (Beam): Target (output) restoring beam. Must be larger than
             ``old_beam``.
@@ -251,8 +255,8 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
             ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
     
     Returns:
-        numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same dtype as the
-            input (``float32`` or ``float64``).
+        numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same precision as
+            the input (``float32`` or ``float64``), native byte order.
     
     Raises:
         ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels

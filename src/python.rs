@@ -10,7 +10,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
 use crate::convolve_uv::FftFloat;
-use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
+use crate::smooth::{BrightnessUnit, smooth_view};
 
 /// A 2-D Gaussian representation of a radio telescope's PSF (beam).
 ///
@@ -269,6 +269,11 @@ fn resolve_unit(py: Python<'_>, bunit: Option<&str>) -> PyResult<BrightnessUnit>
 /// Convolve one already-extracted `T`-typed array and box the result as a numpy
 /// array of the same dtype. Shared by the f32 and f64 arms of [`smooth`] so the
 /// two precisions cannot drift apart.
+///
+/// The input is read straight from numpy's buffer (in whatever layout it has)
+/// rather than copied, and the GIL is released for the convolution so other
+/// Python threads, e.g. a thread-pool executor smoothing several planes at once,
+/// run in parallel with it. The result is handed to numpy without a copy.
 #[allow(clippy::too_many_arguments)]
 fn smooth_typed<'py, T>(
     py: Python<'py>,
@@ -283,18 +288,35 @@ fn smooth_typed<'py, T>(
 where
     T: FftFloat + numpy::Element,
 {
-    let owned = arr.as_array().to_owned();
-    let out = rust_smooth(
-        &owned,
-        old_beam,
-        new_beam,
-        dx_deg,
-        dy_deg,
-        cutoff_arcsec,
-        unit,
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let view = arr.as_array();
+    let out = py
+        .detach(|| {
+            smooth_view(
+                view,
+                old_beam,
+                new_beam,
+                dx_deg,
+                dy_deg,
+                cutoff_arcsec,
+                unit,
+            )
+        })
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(out.into_pyarray(py).into_any())
+}
+
+/// `image` in native byte order: FITS data is big-endian (numpy dtype ``>f4``),
+/// which the typed extraction below does not accept, so such an array is
+/// converted once. Native-order arrays (and non-arrays) are returned as is.
+fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let Ok(dtype) = image.getattr("dtype") else {
+        return Ok(image.clone());
+    };
+    if dtype.getattr("isnative")?.is_truthy()? {
+        return Ok(image.clone());
+    }
+    let native = dtype.call_method1("newbyteorder", ("=",))?;
+    image.call_method1("astype", (native,))
 }
 
 /// Smooth an image from ``old_beam`` to ``new_beam``.
@@ -307,8 +329,12 @@ where
 ///
 /// Args:
 ///     image (numpy.ndarray): Input image, shape ``(ny, nx)``, dtype
-///         ``float32`` or ``float64``. The convolution runs in the input's
-///         precision and the output keeps the same dtype.
+///         ``float32`` or ``float64`` in either byte order (so data straight
+///         from ``astropy.io.fits``, which is big-endian, is accepted). The
+///         convolution runs in the input's precision and the output keeps the
+///         same precision, in native byte order. The GIL is released while
+///         the image is convolved, so calls from several threads run in
+///         parallel; do not modify the array from another thread meanwhile.
 ///     old_beam (Beam): Current (input) restoring beam.
 ///     new_beam (Beam): Target (output) restoring beam. Must be larger than
 ///         ``old_beam``.
@@ -325,8 +351,8 @@ where
 ///         ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
 ///
 /// Returns:
-///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same dtype as the
-///         input (``float32`` or ``float64``).
+///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same precision as
+///         the input (``float32`` or ``float64``), native byte order.
 ///
 /// Raises:
 ///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
@@ -368,6 +394,7 @@ fn smooth<'py>(
     bunit: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let unit = resolve_unit(py, bunit)?;
+    let image = &native_byte_order(image)?;
 
     // Dispatch on the input dtype so the convolution runs at the array's native
     // precision and the output keeps that dtype. f32 (the common case) is tried

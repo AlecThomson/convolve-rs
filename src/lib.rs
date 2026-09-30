@@ -53,11 +53,11 @@ pub mod smooth;
 pub use beam::{Beam, BeamError, gauss_factor};
 pub use common_beam::{CommonBeamError, common_beam, find_commonbeam_between};
 pub use convolve_uv::{
-    ConvolutionResult, ConvolveError, FftFloat, FftPlans, convolve_uv, convolve_uv_with_plans,
-    fftfreq, gaussft,
+    ConvolutionResult, ConvolveError, FftFloat, FftPlans, convolve_uv,
+    convolve_uv_owned_with_plans, convolve_uv_with_plans, fftfreq, gaussft,
 };
 pub use fits_io::{FitsError, FitsImageData, output_path, read_fits, write_fits};
-pub use smooth::{BrightnessUnit, SmoothError, smooth, smooth_with_plans};
+pub use smooth::{BrightnessUnit, SmoothError, smooth, smooth_owned_with_plans, smooth_with_plans};
 
 #[cfg(feature = "python")]
 mod python;

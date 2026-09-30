@@ -14,7 +14,7 @@ use convolve_rs::{
     convolve_uv::FftPlans,
     cube_io::{self, CubeElem, CubeMeta, CubeMode},
     fits_io::{output_path, read_fits, write_fits},
-    smooth::{smooth, smooth_with_plans},
+    smooth::smooth_owned_with_plans,
 };
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
@@ -227,14 +227,17 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                     file.display()
                 )
             });
-            let smoothed = smooth(
-                &data.image,
+            // Owned: the image is smoothed in the buffer it was read into.
+            let plans = FftPlans::new(data.image.nrows(), data.image.ncols());
+            let smoothed = smooth_owned_with_plans(
+                data.image,
                 old_beam,
                 &common,
                 data.dx_deg,
                 data.dy_deg,
                 args.shared.cutoff,
                 data.unit,
+                &plans,
             )
             .with_context(|| format!("smoothing {}", file.display()))?;
             pb.suspend(|| debug!("Writing {}", out.display()));
@@ -335,7 +338,11 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         })
         .collect::<Result<_>>()?;
     sp.finish_and_clear();
-    info!("Read metadata from {} cube(s)", files.len());
+    info!(
+        "Read metadata from {} cube(s), {} channel(s) each",
+        files.len(),
+        metas[0].nfreq
+    );
 
     let nfreq = metas[0].nfreq;
     for (f, m) in files.iter().zip(metas.iter()) {
@@ -348,7 +355,7 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         );
         anyhow::ensure!(
             m.nstokes <= 1,
-            "{}: NAXIS4={} (multiple Stokes) is not supported — only Stokes 0 \
+            "{}: {} Stokes planes are not supported — only Stokes 0 \
              would be convolved while the other Stokes planes are written as \
              zeros, producing a misleading cube. Extract a single Stokes plane \
              first.",
@@ -592,8 +599,9 @@ fn process_cube<T: CubeElem>(
             } else {
                 let raw = cube_io::read_channel_as::<T>(file, c, meta)
                     .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                smooth_with_plans(
-                    &raw,
+                // Owned: the channel is smoothed in the buffer it was read into.
+                smooth_owned_with_plans(
+                    raw,
                     &old_beam,
                     &target,
                     meta.dx_deg,
