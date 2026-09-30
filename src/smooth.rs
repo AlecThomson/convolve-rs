@@ -1,10 +1,12 @@
 //! High-level smoothing: convolve + apply Jy/beam flux scaling.
 use ndarray::Array2;
+#[cfg(feature = "python")]
+use ndarray::ArrayView2;
 use thiserror::Error;
 
 use crate::beam::Beam;
 use crate::convolve_uv::{
-    ConvolveError, FftFloat, FftPlans, cast_saturating, convolve_uv_with_plans,
+    ConvolveError, FftFloat, FftPlans, OutputGain, PlaneInput, convolve_plane,
 };
 
 #[derive(Debug, Error)]
@@ -134,26 +136,102 @@ pub fn smooth_with_plans<T: FftFloat>(
     unit: BrightnessUnit,
     plans: &FftPlans<T>,
 ) -> Result<Array2<T>, SmoothError> {
-    let result = convolve_uv_with_plans(
+    smooth_plane(
+        PlaneInput::Borrowed(image.view()),
+        old_beam,
+        new_beam,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+        unit,
+        plans,
+    )
+}
+
+/// Like [`smooth_with_plans`], but takes ownership of `image` and smooths it in
+/// its own buffer, so a NaN-free plane needs no image-sized allocation at all
+/// (one with NaNs needs one, for the mask). Prefer this when the input is not
+/// needed afterwards, such as a cube channel just read from disk.
+#[allow(clippy::too_many_arguments)]
+pub fn smooth_owned_with_plans<T: FftFloat>(
+    image: Array2<T>,
+    old_beam: &Beam,
+    new_beam: &Beam,
+    dx_deg: f64,
+    dy_deg: f64,
+    cutoff_arcsec: Option<f64>,
+    unit: BrightnessUnit,
+    plans: &FftPlans<T>,
+) -> Result<Array2<T>, SmoothError> {
+    smooth_plane(
+        PlaneInput::Owned(image),
+        old_beam,
+        new_beam,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+        unit,
+        plans,
+    )
+}
+
+/// [`smooth`] on a borrowed view (any memory layout), planning for its size.
+#[cfg(feature = "python")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn smooth_view<T: FftFloat>(
+    image: ArrayView2<'_, T>,
+    old_beam: &Beam,
+    new_beam: &Beam,
+    dx_deg: f64,
+    dy_deg: f64,
+    cutoff_arcsec: Option<f64>,
+    unit: BrightnessUnit,
+) -> Result<Array2<T>, SmoothError> {
+    let (nrows, ncols) = image.dim();
+    let plans = FftPlans::<T>::new(nrows, ncols);
+    smooth_plane(
+        PlaneInput::Borrowed(image),
+        old_beam,
+        new_beam,
+        dx_deg,
+        dy_deg,
+        cutoff_arcsec,
+        unit,
+        &plans,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn smooth_plane<T: FftFloat>(
+    image: PlaneInput<'_, T>,
+    old_beam: &Beam,
+    new_beam: &Beam,
+    dx_deg: f64,
+    dy_deg: f64,
+    cutoff_arcsec: Option<f64>,
+    unit: BrightnessUnit,
+    plans: &FftPlans<T>,
+) -> Result<Array2<T>, SmoothError> {
+    // The convolution already bakes one g_ratio (= √(Ω_new/Ω_old)) into the image.
+    // Jy/beam needs the full beam-area ratio Ω_new/Ω_old = g_ratio², so multiply
+    // by g_ratio once more. Kelvin conserves surface brightness, so the image
+    // must be flux-normalised — divide the baked-in g_ratio back out. Either is
+    // folded into the filter, so it costs no extra pass over the image.
+    let gain = match unit {
+        BrightnessUnit::JyPerBeam => OutputGain::Ratio,
+        BrightnessUnit::Kelvin => OutputGain::InverseRatio,
+    };
+    let result = convolve_plane(
         image,
         old_beam,
         new_beam,
         dx_deg,
         dy_deg,
         cutoff_arcsec,
+        gain,
         plans,
     )?;
-    // `convolve_uv` already bakes one g_ratio (= √(Ω_new/Ω_old)) into the image.
-    // Jy/beam needs the full beam-area ratio Ω_new/Ω_old = g_ratio², so multiply
-    // by g_ratio once more. Kelvin conserves surface brightness, so the image
-    // must be flux-normalised — divide the baked-in g_ratio back out.
-    let factor = match unit {
-        BrightnessUnit::JyPerBeam => result.scaling_factor,
-        BrightnessUnit::Kelvin => 1.0 / result.scaling_factor,
-    };
-    let factor_t = cast_saturating::<T>(factor);
-    let scaled = result.image.mapv(|x| factor_t * x);
-    Ok(scaled)
+    Ok(result.image)
 }
 
 #[cfg(test)]

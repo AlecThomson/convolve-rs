@@ -717,3 +717,108 @@ fn cli_verbose_logs_per_channel_beams() {
         "missing init log:\n{log}"
     );
 }
+
+/// Build a 4D cube in CASA axis order — RA, DEC, STOKES, FREQ — with one Stokes
+/// plane, a varying beam per channel (via BEAMS), and the reference channel on
+/// axis 4.
+fn make_casa_order_cube(path: &std::path::Path) {
+    let mut f = FitsFile::create(path)
+        .with_custom_primary(&fitsio::images::ImageDescription {
+            data_type: fitsio::images::ImageType::Float,
+            dimensions: &[NFREQ, 1, NY, NX],
+        })
+        .overwrite()
+        .open()
+        .unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    let mut data = vec![0.0f32; NX * NY * NFREQ];
+    for c in 0..NFREQ {
+        data[c * NX * NY + (NY / 2) * NX + NX / 2] = 1.0 + c as f32;
+    }
+    hdu.write_image(&mut f, &data).unwrap();
+    hdu.write_key(&mut f, "CDELT1", -0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CDELT2", 0.0005f64).unwrap();
+    hdu.write_key(&mut f, "CTYPE3", "STOKES").unwrap();
+    hdu.write_key(&mut f, "CRPIX3", 1.0f64).unwrap();
+    hdu.write_key(&mut f, "CTYPE4", "FREQ").unwrap();
+    hdu.write_key(&mut f, "CRPIX4", 2.0f64).unwrap();
+    hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
+    hdu.write_key(&mut f, "BMAJ", 0.005f64).unwrap();
+    hdu.write_key(&mut f, "BMIN", 0.004f64).unwrap();
+    hdu.write_key(&mut f, "BPA", 0.0f64).unwrap();
+}
+
+/// A CASA-order cube (Stokes on axis 3, frequency on axis 4) is read by its
+/// CTYPEs: the channels come from NAXIS4 and the reference channel from CRPIX4,
+/// rather than a single Stokes plane being mistaken for multiple Stokes and
+/// the cube rejected.
+#[test]
+fn casa_axis_order_cube_is_read_and_smoothed() {
+    let dir = workdir("casa_order");
+    let path = dir.join("in.fits");
+    make_casa_order_cube(&path);
+
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    assert_eq!((meta.nfreq, meta.nstokes, meta.crpix_freq), (NFREQ, 1, 2));
+    assert!(meta.is_4d);
+
+    let (ok, log) = run_cli(&[
+        "3d",
+        path.to_str().unwrap(),
+        "--mode",
+        "total",
+        "--bmaj",
+        "30",
+        "--bmin",
+        "30",
+        "--bpa",
+        "0",
+    ]);
+    assert!(ok, "binary failed:\n{log}");
+    let out = dir.join("in.sm.fits");
+    let out_meta = cube_io::read_cube_meta(&out).unwrap();
+    assert_eq!((out_meta.nfreq, out_meta.nstokes), (NFREQ, 1));
+    for c in 0..NFREQ {
+        let plane = cube_io::read_channel(&out, c, &out_meta).unwrap();
+        // Channel c's point source had amplitude 1 + c, so the smoothed peaks
+        // keep that order: the channels were not shuffled or mixed up.
+        let peak = plane.iter().cloned().fold(f32::MIN, f32::max);
+        let first = cube_io::read_channel(&out, 0, &out_meta).unwrap();
+        let first_peak = first.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(
+            (peak / first_peak - (1.0 + c as f32)).abs() < 1e-3,
+            "channel {c}: peak ratio {}",
+            peak / first_peak
+        );
+    }
+}
+
+/// A reference pixel before the first channel (negative CRPIX, as a WCS
+/// referenced to an off-axis frequency can have) attaches the *first*
+/// channel's beam to the primary header, not the last one's.
+#[test]
+fn negative_crpix_uses_first_channel_beam() {
+    let dir = workdir("neg_crpix");
+    let path = dir.join("in.fits");
+    make_varied_cube(&path);
+    {
+        let mut f = FitsFile::edit(&path).unwrap();
+        let hdu = f.primary_hdu().unwrap();
+        hdu.write_key(&mut f, "CRPIX3", -5.0f64).unwrap();
+    }
+
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "natural"]);
+    assert!(ok, "binary failed:\n{log}");
+    let out = dir.join("in.sm.fits");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    let (bmaj, ..) = read_primary_beam_keys(&out);
+    let first = meta.beams[0].unwrap();
+    let last = meta.beams[NFREQ - 1].unwrap();
+    assert!(
+        (bmaj - first.major_deg).abs() < 1e-9 && (bmaj - last.major_deg).abs() > 1e-6,
+        "primary BMAJ {bmaj} should be channel 0's {} (not channel {}'s {})",
+        first.major_deg,
+        NFREQ - 1,
+        last.major_deg
+    );
+}
