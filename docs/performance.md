@@ -40,6 +40,8 @@ layout; big-endian FITS data is converted once), hands the result back without
 a copy, and releases the GIL while convolving, so a thread pool smoothing
 several planes runs them in parallel.
 
+(compared-with-racs-tools)=
+
 ## Compared with racs_tools
 
 RACS-tools' robust mode was itself reworked in 2026 to cut its peak memory
@@ -97,7 +99,7 @@ cargo bench
 ```
 
 Head-to-head against racs_tools' robust mode (time and peak memory per plane,
-from Python; see [above](#compared-with-racs-tools)):
+from Python; see {ref}`compared-with-racs-tools`):
 
 ```sh
 python scripts/bench_vs_racs_tools.py 4500x3900 9000x7800   # NYxNX ...
