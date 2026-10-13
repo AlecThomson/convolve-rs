@@ -278,6 +278,29 @@ impl Beam {
         })
     }
 
+    /// True if `other` can be convolved up to `self`.
+    ///
+    /// Unlike [`Beam::deconvolve`], this accepts a kernel that is a line or a
+    /// point (e.g. 20″×10″ inside 20″×20″), which the UV-plane filter handles
+    /// fine.
+    ///
+    /// ```
+    /// use convolve_rs::Beam;
+    ///
+    /// let target = Beam::from_arcsec(20.0, 20.0, 0.0)?;
+    /// assert!(target.contains(&Beam::from_arcsec(20.0, 10.0, 0.0)?));
+    /// assert!(!target.contains(&Beam::from_arcsec(21.0, 10.0, 0.0)?));
+    /// # Ok::<(), convolve_rs::BeamError>(())
+    /// ```
+    pub fn contains(&self, other: &Beam) -> bool {
+        let own = self.cov_deg();
+        let residual = own.sub(&other.cov_deg());
+        // Round-off on the subtraction is relative to the beam size.
+        let tol = 1e-12 * (own.xx + own.yy).abs();
+        let (_, lam_minor) = residual.eigenvalues();
+        residual.xx >= -tol && residual.yy >= -tol && lam_minor >= -tol
+    }
+
     /// Like `deconvolve` but returns a zero beam on failure instead of an error.
     pub fn deconvolve_or_zero(&self, other: &Beam) -> Beam {
         match self.deconvolve(other) {
