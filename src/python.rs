@@ -33,7 +33,7 @@ use crate::smooth::{BrightnessUnit, smooth_view};
 /// Examples:
 ///     >>> from convolve_rs import Beam
 ///     >>> beam = Beam(0.005, 0.004, 30.0)
-///     >>> beam.major_deg
+///     >>> beam.major_deg()
 ///     0.005
 ///     >>> round(beam.major_arcsec, 6)
 ///     18.0
@@ -74,7 +74,7 @@ impl PyBeam {
     /// Examples:
     ///     >>> from convolve_rs import Beam
     ///     >>> beam = Beam.from_arcsec(18.0, 14.4, 30.0)
-    ///     >>> beam.major_deg
+    ///     >>> beam.major_deg()
     ///     0.005
     #[classmethod]
     fn from_arcsec<'py>(
@@ -91,19 +91,19 @@ impl PyBeam {
     /// FWHM major axis in degrees (FITS BMAJ).
     #[getter]
     fn major_deg(&self) -> f64 {
-        self.inner.major_deg
+        self.inner.major_deg()
     }
 
     /// FWHM minor axis in degrees (FITS BMIN).
     #[getter]
     fn minor_deg(&self) -> f64 {
-        self.inner.minor_deg
+        self.inner.minor_deg()
     }
 
     /// Position angle in degrees East of North (FITS BPA).
     #[getter]
     fn pa_deg(&self) -> f64 {
-        self.inner.pa_deg
+        self.inner.pa_deg()
     }
 
     /// FWHM major axis in arcseconds.
@@ -192,7 +192,9 @@ impl PyBeam {
     fn __repr__(&self) -> String {
         format!(
             "Beam(major_deg={}, minor_deg={}, pa_deg={})",
-            self.inner.major_deg, self.inner.minor_deg, self.inner.pa_deg
+            self.inner.major_deg(),
+            self.inner.minor_deg(),
+            self.inner.pa_deg()
         )
     }
 
@@ -204,7 +206,7 @@ impl PyBeam {
 /// An instance of `cls`, which may be a Python subclass of `Beam`.
 fn new_instance<'py>(cls: &Bound<'py, PyType>, beam: Beam) -> PyResult<Bound<'py, PyBeam>> {
     Ok(cls
-        .call1((beam.major_deg, beam.minor_deg, beam.pa_deg))?
+        .call1((beam.major_deg(), beam.minor_deg(), beam.pa_deg()))?
         .downcast_into::<PyBeam>()?)
 }
 
@@ -474,7 +476,16 @@ fn gauss_factor(
     dx_arcsec: f64,
     dy_arcsec: f64,
 ) -> (f64, f64, f64, f64, f64) {
-    rust_gauss_factor(&conv_beam.inner, &orig_beam.inner, dx_arcsec, dy_arcsec)
+    let fac = rust_gauss_factor(&conv_beam.inner, &orig_beam.inner, dx_arcsec, dy_arcsec);
+    let amp = dx_arcsec.abs() * dy_arcsec.abs() / fac;
+    let out = orig_beam.inner.convolve(&conv_beam.inner);
+    (
+        fac,
+        amp,
+        out.major_arcsec(),
+        out.minor_arcsec(),
+        out.pa_deg(),
+    )
 }
 
 #[cfg(feature = "stubgen")]

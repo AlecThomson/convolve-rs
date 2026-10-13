@@ -311,7 +311,7 @@ pub(crate) fn convolve_plane<T: FftFloat>(
             scaling_factor: 1.0,
         });
     }
-    if !(old_beam.major_deg > 0.0 && old_beam.minor_deg > 0.0) {
+    if !(old_beam.major_deg() > 0.0 && old_beam.minor_deg() > 0.0) {
         return Err(ConvolveError::ZeroSizeBeam(*old_beam));
     }
     if !new_beam.contains(old_beam) {
@@ -424,10 +424,10 @@ impl UvTaper {
         let fwhm_to_sigma = 2.0 * (2.0 * 2_f64.ln()).sqrt(); // = 2*sqrt(2*ln2)
 
         // New beam (target) and old beam (input PSF) as Gaussian sigmas.
-        let sx = new_beam.major_deg * deg2rad / fwhm_to_sigma;
-        let sy = new_beam.minor_deg * deg2rad / fwhm_to_sigma;
-        let sx_in = old_beam.major_deg * deg2rad / fwhm_to_sigma;
-        let sy_in = old_beam.minor_deg * deg2rad / fwhm_to_sigma;
+        let sx = new_beam.major_deg() * deg2rad / fwhm_to_sigma;
+        let sy = new_beam.minor_deg() * deg2rad / fwhm_to_sigma;
+        let sx_in = old_beam.major_deg() * deg2rad / fwhm_to_sigma;
+        let sy_in = old_beam.minor_deg() * deg2rad / fwhm_to_sigma;
 
         // Amplitude ratio (= flux scaling factor).
         let g_amp = (2.0 * std::f64::consts::PI * sx * sy).sqrt();
@@ -443,8 +443,8 @@ impl UvTaper {
                 sx2 * s * s + sy2 * c * c,
             )
         };
-        let (a, b, c) = form(sx, sy, new_beam.pa_deg);
-        let (a_in, b_in, c_in) = form(sx_in, sy_in, old_beam.pa_deg);
+        let (a, b, c) = form(sx, sy, new_beam.pa_deg());
+        let (a_in, b_in, c_in) = form(sx_in, sy_in, old_beam.pa_deg());
         let k = -2.0 * std::f64::consts::PI * std::f64::consts::PI;
 
         Self {
@@ -1060,8 +1060,11 @@ mod tests {
         let (g, ratio) = gaussft(&old, &new, &u, &v);
         let f = 2.0 * (2.0 * 2f64.ln()).sqrt();
         let arg = |b: &Beam, u: f64, v: f64| {
-            let (sx, sy) = (b.major_deg.to_radians() / f, b.minor_deg.to_radians() / f);
-            let (s, c) = b.pa_deg.to_radians().sin_cos();
+            let (sx, sy) = (
+                b.major_deg().to_radians() / f,
+                b.minor_deg().to_radians() / f,
+            );
+            let (s, c) = b.pa_deg().to_radians().sin_cos();
             let (ur, vr) = (u * c - v * s, u * s + v * c);
             -2.0 * std::f64::consts::PI.powi(2) * ((sx * ur).powi(2) + (sy * vr).powi(2))
         };

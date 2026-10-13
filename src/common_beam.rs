@@ -12,13 +12,17 @@ const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
 #[derive(Debug, Error)]
 pub enum CommonBeamError {
     #[error("no beams provided")]
-    NoBeans,
+    NoBeams,
     #[error("all beams are invalid or flagged")]
     AllFlagged,
     #[error("Khachiyan algorithm did not converge after {0} iterations")]
     NoConvergence(usize),
-    #[error("common beam does not deconvolve all inputs: {0}")]
-    DeconvFailed(String),
+    #[error("no common beam found that contains every input (epsilon reached {0:.2e})")]
+    NotFound(f64),
+    #[error("singular matrix in the minimum-volume ellipse fit")]
+    Singular,
+    #[error("nsamps must be at least 1")]
+    NoSamples,
     #[error("beam error: {0}")]
     Beam(#[from] BeamError),
 }
@@ -53,13 +57,10 @@ pub fn common_beam(
     epsilon: f64,
 ) -> Result<Beam, CommonBeamError> {
     if beams.is_empty() {
-        return Err(CommonBeamError::NoBeans);
+        return Err(CommonBeamError::NoBeams);
     }
-    if beams
-        .iter()
-        .any(|b| !(b.major_deg.is_finite() && b.minor_deg.is_finite() && b.pa_deg.is_finite()))
-    {
-        return Err(CommonBeamError::Beam(BeamError::NotFinite));
+    if nsamps == 0 {
+        return Err(CommonBeamError::NoSamples);
     }
     if beams.len() == 1 {
         return Ok(beams[0]);
@@ -105,12 +106,12 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
 
     // If the small beam is circular the minor axis is the circle radius.
     if small_beam.is_circular(1e-6) {
-        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg)?;
+        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg())?;
         return Ok(beam);
     }
 
     // Wrap PA difference to [-π/2, π/2].
-    let pa_diff_rad = ((small_beam.pa_deg - large_beam.pa_deg) * DEG2RAD
+    let pa_diff_rad = ((small_beam.pa_deg() - large_beam.pa_deg()) * DEG2RAD
         + std::f64::consts::FRAC_PI_2
         + std::f64::consts::PI)
         .rem_euclid(std::f64::consts::PI)
@@ -124,9 +125,9 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
             (small_major, large_major)
         };
         let pa = if large_major >= small_major {
-            large_beam.pa_deg
+            large_beam.pa_deg()
         } else {
-            small_beam.pa_deg
+            small_beam.pa_deg()
         };
         return Beam::from_arcsec(major, minor, pa).map_err(Into::into);
     }
@@ -146,7 +147,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
     let (trans_maj_unsc, trans_min_unsc, trans_pa_unsc) =
         transform_ellipse_arcsec(trans_maj_sc, trans_min_sc, trans_pa_sc, 1.0 / p, 1.0 / q);
 
-    let final_pa_deg = trans_pa_unsc.to_degrees() + large_beam.pa_deg;
+    let final_pa_deg = trans_pa_unsc.to_degrees() + large_beam.pa_deg();
 
     let eps = 100.0 * f64::EPSILON;
     let beam = Beam::from_arcsec(trans_maj_unsc + eps, trans_min_unsc + eps, final_pa_deg)?;
@@ -225,44 +226,38 @@ pub fn common_manybeams_mve(
 
         let (radii, rotation) = min_vol_ellipse(&hull_pts, tolerance)?;
 
-        // Rotation matrix convention from radio_beam:
-        // ((sin θ, cos θ), (cos θ, -sin θ))
+        // radio_beam's rotation matrix convention: ((sin θ, cos θ), (cos θ, -sin θ)).
         let pa = (-rotation[0][0]).atan2(rotation[1][0]);
-        let pa = if pa == -std::f64::consts::PI || pa == std::f64::consts::PI {
+        let pa = if pa.abs() == std::f64::consts::PI {
             0.0
         } else {
             pa
         };
 
-        let r0 = radii[0];
-        let r1 = radii[1];
-        let (major_deg, minor_deg) = if r0 >= r1 { (r0, r1) } else { (r1, r0) };
-
+        let (major_deg, minor_deg) = if radii[0] >= radii[1] {
+            (radii[0], radii[1])
+        } else {
+            (radii[1], radii[0])
+        };
         let com_beam = Beam::new(major_deg, minor_deg, pa.to_degrees())?;
-
         if fits_in_beam(beams, &com_beam) {
             return Ok(com_beam);
         }
 
-        if step == max_iter {
-            return Err(CommonBeamError::DeconvFailed(format!(
-                "epsilon reached {eps:.2e} without finding valid solution"
-            )));
+        if step < max_iter {
+            eps += (step as f64 + 1.0) * (max_epsilon - eps) / max_iter as f64;
         }
-
-        eps += (step as f64 + 1.0) * (max_epsilon - eps) / max_iter as f64;
     }
-
-    unreachable!()
+    Err(CommonBeamError::NotFound(eps))
 }
 
 /// Sample `nsamps` points on the edge of each beam's ellipse (scaled by `1 + epsilon`).
 fn collect_ellipse_points(beams: &[Beam], nsamps: usize, epsilon: f64) -> Vec<[f64; 2]> {
     let mut pts = Vec::with_capacity(beams.len() * nsamps);
     for beam in beams {
-        let bpa = beam.pa_deg * DEG2RAD;
-        let major = beam.major_deg * (1.0 + epsilon);
-        let minor = beam.minor_deg * (1.0 + epsilon);
+        let bpa = beam.pa_deg() * DEG2RAD;
+        let major = beam.major_deg() * (1.0 + epsilon);
+        let minor = beam.minor_deg() * (1.0 + epsilon);
         for k in 0..nsamps {
             let phi = 2.0 * std::f64::consts::PI * k as f64 / nsamps as f64;
             let x = major * phi.cos();
@@ -456,7 +451,7 @@ fn mat3_inv(m: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], CommonBeamError> {
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
 
     if det.abs() < f64::EPSILON {
-        return Err(CommonBeamError::DeconvFailed("singular 3x3 matrix".into()));
+        return Err(CommonBeamError::Singular);
     }
     let inv_det = 1.0 / det;
 
@@ -483,7 +478,7 @@ fn mat3_inv(m: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], CommonBeamError> {
 fn mat2_inv(m: [[f64; 2]; 2]) -> Result<[[f64; 2]; 2], CommonBeamError> {
     let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
     if det.abs() < f64::EPSILON {
-        return Err(CommonBeamError::DeconvFailed("singular 2x2 matrix".into()));
+        return Err(CommonBeamError::Singular);
     }
     let inv_det = 1.0 / det;
     Ok([
@@ -561,7 +556,7 @@ mod tests {
     fn test_common_beam_identical() {
         let b = Beam::new(10.0 / 3600.0, 8.0 / 3600.0, 30.0).unwrap();
         let result = common_beam(&[b, b], 1e-4, 200, 5e-4).unwrap();
-        assert!(result.approx_eq(&b) || result.major_deg >= b.major_deg);
+        assert!(result.approx_eq(&b) || result.major_deg() >= b.major_deg());
     }
 
     #[test]
@@ -570,7 +565,8 @@ mod tests {
         let b2 = Beam::new(12.0 / 3600.0, 6.0 / 3600.0, 60.0).unwrap();
         let result = common_beam(&[b1, b2], 1e-4, 200, 5e-4).unwrap();
         assert!(
-            result.major_deg >= b1.major_deg.max(b2.major_deg) || fits_in_beam(&[b1, b2], &result)
+            result.major_deg() >= b1.major_deg().max(b2.major_deg())
+                || fits_in_beam(&[b1, b2], &result)
         );
     }
 
@@ -594,17 +590,10 @@ mod tests {
     }
 
     #[test]
-    fn test_nan_beam_is_an_error_not_a_panic() {
-        let good = Beam::from_arcsec(10.0, 8.0, 0.0).unwrap();
-        let bad = Beam {
-            major_deg: f64::NAN,
-            minor_deg: 1e-3,
-            pa_deg: 0.0,
-        };
-        for beams in [vec![good, bad], vec![good, bad, good]] {
-            assert!(common_beam(&beams, 1e-4, 200, 5e-4).is_err());
-        }
-        assert!(!fits_in_beam(&[bad], &good));
+    fn test_zero_samples_is_an_error() {
+        let b = Beam::from_arcsec(10.0, 8.0, 0.0).unwrap();
+        let c = Beam::from_arcsec(9.0, 9.0, 0.0).unwrap();
+        assert!(common_beam(&[b, c, b], 1e-4, 0, 5e-4).is_err());
     }
 
     /// The CASA two-beam solution is only used if it contains both inputs.

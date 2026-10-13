@@ -548,8 +548,8 @@ fn streaming_writer_matches_init_output_cube() {
         let sm = cube_io::read_cube_meta(&stream).unwrap();
         for c in 0..NFREQ {
             assert_eq!(
-                lm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg)),
-                sm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg)),
+                lm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg())),
+                sm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg())),
                 "{tag}: channel {c} beam differs"
             );
             let lp = cube_io::read_channel(&legacy, c, &lm).unwrap();
@@ -830,11 +830,11 @@ fn negative_crpix_uses_first_channel_beam() {
     let first = meta.beams[0].unwrap();
     let last = meta.beams[NFREQ - 1].unwrap();
     assert!(
-        (bmaj - first.major_deg).abs() < 1e-9 && (bmaj - last.major_deg).abs() > 1e-6,
+        (bmaj - first.major_deg()).abs() < 1e-9 && (bmaj - last.major_deg()).abs() > 1e-6,
         "primary BMAJ {bmaj} should be channel 0's {} (not channel {}'s {})",
-        first.major_deg,
+        first.major_deg(),
         NFREQ - 1,
-        last.major_deg
+        last.major_deg()
     );
 }
 
@@ -856,7 +856,7 @@ fn beams_table_nan_and_swapped_axes() {
     let swapped = meta.beams[2].expect("swapped row is kept");
     assert!((swapped.major_arcsec() - 18.0).abs() < 1e-4);
     assert!((swapped.minor_arcsec() - 12.0).abs() < 1e-4);
-    assert!((swapped.pa_deg - -60.0).abs() < 1e-4);
+    assert!((swapped.pa_deg() - -60.0).abs() < 1e-4);
 
     std::fs::write(
         dir.join("beamlog.log.txt"),

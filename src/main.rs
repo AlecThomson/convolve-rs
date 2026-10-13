@@ -248,18 +248,18 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         );
         for e in &results {
             let conv = e.conv_beam.map_or("nan nan nan".to_string(), |b| {
-                format!("{} {} {}", b.major_deg, b.minor_deg, b.pa_deg)
+                format!("{} {} {}", b.major_deg(), b.minor_deg(), b.pa_deg())
             });
             writeln!(
                 out,
                 "{} {} {} {} {} {} {} {conv}",
                 e.filename.display(),
-                e.old_beam.major_deg,
-                e.old_beam.minor_deg,
-                e.old_beam.pa_deg,
-                e.new_beam.major_deg,
-                e.new_beam.minor_deg,
-                e.new_beam.pa_deg,
+                e.old_beam.major_deg(),
+                e.old_beam.minor_deg(),
+                e.old_beam.pa_deg(),
+                e.new_beam.major_deg(),
+                e.new_beam.minor_deg(),
+                e.new_beam.pa_deg(),
             )?;
         }
         std::fs::write(log_path, out)?;
@@ -423,7 +423,7 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
         .filter_map(|b| *b)
         .collect::<Vec<_>>()
         .windows(2)
-        .all(|w| w[0] == w[1]);
+        .all(|w| w[0].approx_eq(&w[1]));
     match target_beams.iter().find_map(|b| *b) {
         Some(b) if all_same => info!("Target beam (all channels): {b}"),
         Some(b) => {
@@ -728,7 +728,7 @@ fn parse_target_beam(args: &SharedArgs) -> Result<Option<Beam>> {
 
 /// True for a beam that can be convolved and is within the cutoff (arcsec).
 fn usable_beam(b: &Beam, cutoff: Option<f64>) -> bool {
-    b.is_finite() && b.minor_deg > 0.0 && cutoff.is_none_or(|c| b.major_arcsec() <= c)
+    b.has_area() && cutoff.is_none_or(|c| b.major_arcsec() <= c)
 }
 
 /// Round a computed common beam up to 0.1″ axes and 0.01° PA, as racs_tools
@@ -738,7 +738,7 @@ fn round_common_beam(b: Beam, inputs: &[Beam]) -> Result<Beam> {
         Beam::from_arcsec(
             ceil_to(b.major_arcsec() + step, 1),
             ceil_to(b.minor_arcsec() + step, 1),
-            ceil_to(b.pa_deg, 2),
+            ceil_to(b.pa_deg(), 2),
         )
         .context("rounding common beam")
     };

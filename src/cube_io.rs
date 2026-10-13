@@ -50,7 +50,7 @@ pub enum CubeError {
     #[error("beamlog parse error at line {line}: {msg}")]
     BeamlogParse { line: usize, msg: String },
     #[error("no per-channel beam source found (no CASAMBM, no beamlog, no header beam)")]
-    NoBeans,
+    NoBeams,
 }
 
 /// Map the shared [`atfits_rs::AtfitsError`] (from the low-level cfitsio helpers)
@@ -228,7 +228,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
             let hdu2 = fptr2.primary_hdu()?;
             let bmaj: f64 = hdu2
                 .read_key(&mut fptr2, "BMAJ")
-                .map_err(|_| CubeError::NoBeans)?;
+                .map_err(|_| CubeError::NoBeams)?;
             let bmin: f64 = hdu2.read_key(&mut fptr2, "BMIN").unwrap_or(bmaj);
             let bpa: f64 = hdu2.read_key(&mut fptr2, "BPA").unwrap_or(0.0);
             let b = Beam::new(bmaj, bmin, bpa)?;
@@ -524,9 +524,9 @@ fn write_primary_beam_keys(
     natural: bool,
 ) -> Result<(), CubeError> {
     fptr.primary_hdu()?; // position at the primary HDU
-    update_key_f64(fptr, "BMAJ", ref_beam.major_deg)?;
-    update_key_f64(fptr, "BMIN", ref_beam.minor_deg)?;
-    update_key_f64(fptr, "BPA", ref_beam.pa_deg)?;
+    update_key_f64(fptr, "BMAJ", ref_beam.major_deg())?;
+    update_key_f64(fptr, "BMIN", ref_beam.minor_deg())?;
+    update_key_f64(fptr, "BPA", ref_beam.pa_deg())?;
     update_key_logical(fptr, "CASAMBM", natural)?;
     Ok(())
 }
@@ -554,7 +554,7 @@ fn write_beams_table(
         .collect();
     let bpa: Vec<f32> = target_beams
         .iter()
-        .map(|b| b.map_or(tiny as f32, |b| b.pa_deg as f32))
+        .map(|b| b.map_or(tiny as f32, |b| b.pa_deg() as f32))
         .collect();
     let chan: Vec<i32> = (0..nfreq as i32).collect();
     let pol: Vec<i32> = vec![0i32; nfreq];
@@ -692,7 +692,7 @@ pub fn write_beamlog(path: &Path, beams: &[Option<Beam>]) -> Result<(), CubeErro
                 i,
                 b.major_arcsec(),
                 b.minor_arcsec(),
-                b.pa_deg
+                b.pa_deg()
             ),
             None => writeln!(out, "{i} nan nan nan"),
         }

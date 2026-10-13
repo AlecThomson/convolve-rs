@@ -111,9 +111,9 @@ fn write_test_fits(
     let hdu = fptr.primary_hdu()?;
 
     // Beam keywords (degrees, FITS convention)
-    hdu.write_key(&mut fptr, "BMAJ", beam.major_deg)?;
-    hdu.write_key(&mut fptr, "BMIN", beam.minor_deg)?;
-    hdu.write_key(&mut fptr, "BPA", beam.pa_deg)?;
+    hdu.write_key(&mut fptr, "BMAJ", beam.major_deg())?;
+    hdu.write_key(&mut fptr, "BMIN", beam.minor_deg())?;
+    hdu.write_key(&mut fptr, "BPA", beam.pa_deg())?;
 
     // Minimal WCS
     hdu.write_key(&mut fptr, "CDELT1", -pix_deg)?; // RA: negative
@@ -176,7 +176,7 @@ fn miriad_smooth(
         target_beam.major_arcsec(),
         target_beam.minor_arcsec(),
     );
-    let pa = format!("pa={}", target_beam.pa_deg);
+    let pa = format!("pa={}", target_beam.pa_deg());
     let status = Command::new(bin_dir.join("convol"))
         .env("MIR", &mir_root)
         .arg(format!("map={}", mir_in.display()))
@@ -227,17 +227,17 @@ fn test_beam_conv_deconv_roundtrip() {
         let recovered = convolved.deconvolve(&a).unwrap();
         let tol = 1e-9;
         assert!(
-            (recovered.major_deg - b.major_deg).abs() < tol,
+            (recovered.major_deg() - b.major_deg()).abs() < tol,
             "({maj_a}×{min_a}@{pa_a}) + ({maj_b}×{min_b}@{pa_b}): \
              major {:.10e} vs {:.10e}",
-            recovered.major_deg,
-            b.major_deg,
+            recovered.major_deg(),
+            b.major_deg(),
         );
         assert!(
-            (recovered.minor_deg - b.minor_deg).abs() < tol,
+            (recovered.minor_deg() - b.minor_deg()).abs() < tol,
             "minor mismatch: {:.10e} vs {:.10e}",
-            recovered.minor_deg,
-            b.minor_deg,
+            recovered.minor_deg(),
+            b.minor_deg(),
         );
     }
 }
@@ -254,24 +254,24 @@ fn test_beam_deconvolve_test_params() {
     let reconv = old.convolve(&conv_beam);
     let tol = 1e-9;
     assert!(
-        (reconv.major_deg - target.major_deg).abs() < tol,
+        (reconv.major_deg() - target.major_deg()).abs() < tol,
         "reconv.major={:.10e} target.major={:.10e}",
-        reconv.major_deg,
-        target.major_deg,
+        reconv.major_deg(),
+        target.major_deg(),
     );
     assert!(
-        (reconv.minor_deg - target.minor_deg).abs() < tol,
+        (reconv.minor_deg() - target.minor_deg()).abs() < tol,
         "reconv.minor={:.10e} target.minor={:.10e}",
-        reconv.minor_deg,
-        target.minor_deg,
+        reconv.minor_deg(),
+        target.minor_deg(),
     );
 
     // Sanity: convolving beam must fit inside the target beam
     assert!(
-        conv_beam.major_deg <= target.major_deg + 1e-12,
+        conv_beam.major_deg() <= target.major_deg() + 1e-12,
         "conv beam larger than target"
     );
-    assert!(conv_beam.major_deg > 0.0, "conv beam is zero");
+    assert!(conv_beam.major_deg() > 0.0, "conv beam is zero");
 }
 
 /// At DC (u=0, v=0) the gaussft filter equals g_ratio exactly.
@@ -466,7 +466,7 @@ fn test_common_beam_identical() {
     let result = common_beam(&[b, b], 0.001, 200, 1e-5).unwrap();
     let tol = 0.05 / 3600.0; // 0.05 arcsec in degrees
     assert!(
-        (result.major_deg - b.major_deg).abs() < tol,
+        (result.major_deg() - b.major_deg()).abs() < tol,
         "major: {:.6} vs {:.6}",
         result.major_arcsec(),
         b.major_arcsec(),
@@ -482,7 +482,7 @@ fn test_common_beam_two_circular() {
     let result = common_beam(&[small, large], 0.001, 200, 1e-5).unwrap();
     let tol = 0.1 / 3600.0; // 0.1 arcsec
     assert!(
-        (result.major_deg - large.major_deg).abs() < tol,
+        (result.major_deg() - large.major_deg()).abs() < tol,
         "common beam should equal the larger beam; got {:.4}\" expected {:.4}\"",
         result.major_arcsec(),
         large.major_arcsec(),
@@ -728,9 +728,9 @@ fn write_test_cube_casambm(
     hdu.write_key(&mut fptr, "CASAMBM", "T")?;
 
     // Reference beam from channel 0 (CRPIX3=1 → 0-based index 0).
-    hdu.write_key(&mut fptr, "BMAJ", beams[0].major_deg)?;
-    hdu.write_key(&mut fptr, "BMIN", beams[0].minor_deg)?;
-    hdu.write_key(&mut fptr, "BPA", beams[0].pa_deg)?;
+    hdu.write_key(&mut fptr, "BMAJ", beams[0].major_deg())?;
+    hdu.write_key(&mut fptr, "BMIN", beams[0].minor_deg())?;
+    hdu.write_key(&mut fptr, "BPA", beams[0].pa_deg())?;
 
     // Write all channel data as one flat C-order array.
     let flat: Vec<f32> = channel_images
@@ -742,7 +742,7 @@ fn write_test_cube_casambm(
     // Append BEAMS binary-table extension.
     let bmaj_v: Vec<f32> = beams.iter().map(|b| b.major_arcsec() as f32).collect();
     let bmin_v: Vec<f32> = beams.iter().map(|b| b.minor_arcsec() as f32).collect();
-    let bpa_v: Vec<f32> = beams.iter().map(|b| b.pa_deg as f32).collect();
+    let bpa_v: Vec<f32> = beams.iter().map(|b| b.pa_deg() as f32).collect();
     let chan_v: Vec<i32> = (0..nchan as i32).collect();
     let pol_v: Vec<i32> = vec![0; nchan];
 
@@ -829,7 +829,7 @@ fn miriad_smooth_cube(
             target.major_arcsec(),
             target.minor_arcsec()
         ))
-        .arg(format!("pa={}", target.pa_deg))
+        .arg(format!("pa={}", target.pa_deg()))
         .arg("options=cube")
         .arg(format!("out={}", mir_out.display()))
         .status()?;
@@ -947,7 +947,8 @@ fn test_cube_channel_beam_area_ratio() {
 
     let bmaj_pix = CUBE_OLD_BMAJ / PIX_ARCSEC;
     let bmin_pix = CUBE_OLD_BMIN / PIX_ARCSEC;
-    let expected_ratio = (target.major_deg * target.minor_deg) / (old.major_deg * old.minor_deg);
+    let expected_ratio =
+        (target.major_deg() * target.minor_deg()) / (old.major_deg() * old.minor_deg());
 
     for c in 0..CUBE_NCHAN {
         let image = make_gaussian_image(CUBE_NY, CUBE_NX, bmaj_pix, bmin_pix, CUBE_OLD_BPA);

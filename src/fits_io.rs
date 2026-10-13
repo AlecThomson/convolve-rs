@@ -197,9 +197,9 @@ pub fn write_fits<T: CubeElem>(
 
     // The template already has these cards; appending would leave the old
     // beam first, which is the one readers pick up.
-    update_key_f64(&mut fptr, "BMAJ", new_beam.major_deg)?;
-    update_key_f64(&mut fptr, "BMIN", new_beam.minor_deg)?;
-    update_key_f64(&mut fptr, "BPA", new_beam.pa_deg)?;
+    update_key_f64(&mut fptr, "BMAJ", new_beam.major_deg())?;
+    update_key_f64(&mut fptr, "BMIN", new_beam.minor_deg())?;
+    update_key_f64(&mut fptr, "BPA", new_beam.pa_deg())?;
 
     let flat = image.as_standard_layout();
     let slice = flat
