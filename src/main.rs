@@ -14,7 +14,7 @@ use convolve_rs::{
     convolve_uv::FftPlans,
     cube_io::PixelType,
     cube_io::{self, CubeElem, CubeMeta, CubeMode},
-    fits_io::{FitsImageHeader, output_path, read_fits, read_fits_header, write_fits},
+    fits_io::{FitsImageHeader, output_path, read_fits_header, read_fits_plane, write_fits},
     smooth::smooth_owned_with_plans,
 };
 
@@ -281,10 +281,11 @@ fn smooth_image<T: CubeElem>(
     let image = if blank {
         Array2::from_elem((header.ny, header.nx), T::nan())
     } else {
-        let data = read_fits::<T>(file).with_context(|| format!("reading {}", file.display()))?;
+        let data =
+            read_fits_plane::<T>(header).with_context(|| format!("reading {}", file.display()))?;
         let plans = FftPlans::new(header.ny, header.nx);
         smooth_owned_with_plans(
-            data.image,
+            data,
             &header.beam,
             target,
             header.dx_deg,

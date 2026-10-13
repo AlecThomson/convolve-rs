@@ -137,11 +137,7 @@ pub fn read_fits_header(path: &Path) -> Result<FitsImageHeader, FitsError> {
 /// Read a 2D FITS image, or the first plane of a 4D one, in precision `T`.
 pub fn read_fits<T: CubeElem>(path: &Path) -> Result<FitsImageData<T>, FitsError> {
     let header = read_fits_header(path)?;
-    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let data = T::read_section_vec(&mut fptr, 0, header.nx * header.ny)
-        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
-    let image = Array2::from_shape_vec((header.ny, header.nx), data)
-        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    let image = read_fits_plane(&header)?;
     Ok(FitsImageData {
         path: header.path,
         image,
@@ -152,6 +148,15 @@ pub fn read_fits<T: CubeElem>(path: &Path) -> Result<FitsImageData<T>, FitsError
         unit: header.unit,
         header_cards: vec![],
     })
+}
+
+/// Read the first plane of the image described by `header`.
+pub fn read_fits_plane<T: CubeElem>(header: &FitsImageHeader) -> Result<Array2<T>, FitsError> {
+    let mut fptr = FitsFile::open(header.path.to_string_lossy().as_ref())?;
+    let data = T::read_section_vec(&mut fptr, 0, header.nx * header.ny)
+        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    Array2::from_shape_vec((header.ny, header.nx), data)
+        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))
 }
 
 /// `(|CDELT1|, |CDELT2|)` in degrees. Headers that only carry a CD matrix get
