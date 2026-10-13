@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use atfits_rs::copy_header_only;
 use fitsio::FitsFile;
+use fitsio::hdu::FitsHdu;
 use ndarray::Array2;
 use thiserror::Error;
 
@@ -75,11 +76,7 @@ pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
     let image = Array2::from_shape_vec((ny, nx), data)
         .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
 
-    // Pixel scales — use absolute values since CDELT1 is negative for RA.
-    let cdelt1: f64 = hdu.read_key(&mut fptr, "CDELT1")?;
-    let cdelt2: f64 = hdu.read_key(&mut fptr, "CDELT2")?;
-    let dx_deg = cdelt1.abs();
-    let dy_deg = cdelt2.abs();
+    let (dx_deg, dy_deg) = pixel_scales(&mut fptr, &hdu).map_err(FitsError::MissingKeyword)?;
 
     // Beam.
     let bmaj: f64 = hdu
@@ -113,6 +110,21 @@ pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
         unit,
         header_cards: vec![],
     })
+}
+
+/// `(|CDELT1|, |CDELT2|)` in degrees. Headers that only carry a CD matrix get
+/// an error naming the missing keyword.
+pub(crate) fn pixel_scales(fptr: &mut FitsFile, hdu: &FitsHdu) -> Result<(f64, f64), String> {
+    let mut read = |key: &str| -> Result<f64, String> {
+        hdu.read_key::<f64>(fptr, key).map(f64::abs).map_err(|_| {
+            if hdu.read_key::<f64>(fptr, "CD1_1").is_ok() {
+                format!("{key} (CD-matrix headers are not supported; add CDELT1/CDELT2)")
+            } else {
+                key.to_string()
+            }
+        })
+    };
+    Ok((read("CDELT1")?, read("CDELT2")?))
 }
 
 /// Write a smoothed image to `out_path`.

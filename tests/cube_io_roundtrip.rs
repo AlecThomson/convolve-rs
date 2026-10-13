@@ -559,9 +559,8 @@ fn streaming_writer_matches_init_output_cube() {
     }
 }
 
-/// Build a 3D cube like `make_varied_cube` but with channel 1's beam masked
-/// (BMAJ = 0), so the streaming pipeline must blank that channel.
-fn make_cube_masked_chan1(path: &std::path::Path) {
+/// Build a 3D point-source cube with the given per-channel BEAMS table.
+fn make_cube_with_beams(path: &std::path::Path, bmaj: &[f32], bmin: &[f32], bpa: &[f32]) {
     let mut f = FitsFile::create(path)
         .with_custom_primary(&fitsio::images::ImageDescription {
             data_type: fitsio::images::ImageType::Float,
@@ -582,10 +581,6 @@ fn make_cube_masked_chan1(path: &std::path::Path) {
     hdu.write_key(&mut f, "BUNIT", "Jy/beam").unwrap();
     hdu.write_key(&mut f, "CASAMBM", "T").unwrap();
 
-    // Channel 1 masked (BMAJ = 0); channels 0 and 2 are valid.
-    let bmaj = [16.0f32, 0.0, 18.0];
-    let bmin = [12.0f32, 0.0, 14.0];
-    let bpa = [0.0f32, 0.0, 10.0];
     let cols = vec![
         ColumnDescription::new("BMAJ")
             .with_type(ColumnDataType::Float)
@@ -609,12 +604,22 @@ fn make_cube_masked_chan1(path: &std::path::Path) {
             .unwrap(),
     ];
     let t = f.create_table("BEAMS", &cols).unwrap();
-    t.write_col(&mut f, "BMAJ", &bmaj).unwrap();
-    t.write_col(&mut f, "BMIN", &bmin).unwrap();
-    t.write_col(&mut f, "BPA", &bpa).unwrap();
+    t.write_col(&mut f, "BMAJ", bmaj).unwrap();
+    t.write_col(&mut f, "BMIN", bmin).unwrap();
+    t.write_col(&mut f, "BPA", bpa).unwrap();
     t.write_col(&mut f, "CHAN", &(0..NFREQ as i32).collect::<Vec<_>>())
         .unwrap();
     t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
+}
+
+/// Like `make_varied_cube` but with channel 1's beam masked (BMAJ = 0).
+fn make_cube_masked_chan1(path: &std::path::Path) {
+    make_cube_with_beams(
+        path,
+        &[16.0, 0.0, 18.0],
+        &[12.0, 0.0, 14.0],
+        &[0.0, 0.0, 10.0],
+    );
 }
 
 /// A masked-beam channel must be written as NaN (explicit no-data), while the
@@ -821,4 +826,52 @@ fn negative_crpix_uses_first_channel_beam() {
         NFREQ - 1,
         last.major_deg
     );
+}
+
+/// A NaN BMIN masks the channel instead of becoming a near-zero axis, and a
+/// row with BMIN > BMAJ is read with the axes swapped.
+#[test]
+fn beams_table_nan_and_swapped_axes() {
+    let dir = workdir("beams_nan_swapped");
+    let path = dir.join("in.fits");
+    make_cube_with_beams(
+        &path,
+        &[16.0, 17.0, 12.0],
+        &[12.0, f32::NAN, 18.0],
+        &[0.0, 0.0, 30.0],
+    );
+    let meta = cube_io::read_cube_meta(&path).unwrap();
+    assert!(meta.beams[0].is_some());
+    assert!(meta.beams[1].is_none(), "NaN BMIN must mask the channel");
+    let swapped = meta.beams[2].expect("swapped row is kept");
+    assert!((swapped.major_arcsec() - 18.0).abs() < 1e-4);
+    assert!((swapped.minor_arcsec() - 12.0).abs() < 1e-4);
+    assert!((swapped.pa_deg - -60.0).abs() < 1e-4);
+
+    std::fs::write(
+        dir.join("beamlog.log.txt"),
+        "#Channel BMAJ[arcsec] BMIN[arcsec] BPA[deg]\n0 16 12 0\n1 17 nan 0\n2 12 18 30\n",
+    )
+    .unwrap();
+    let beams = cube_io::read_beamlog(&dir.join("beamlog.log.txt")).unwrap();
+    assert!(beams[1].is_zero());
+    assert!((beams[2].major_arcsec() - 18.0).abs() < 1e-9);
+}
+
+/// A header with only a CD matrix gets an error that says so.
+#[test]
+fn cd_matrix_header_is_reported() {
+    let dir = workdir("cd_matrix");
+    let path = dir.join("in.fits");
+    make_cube(&path);
+    {
+        let mut f = FitsFile::edit(&path).unwrap();
+        let hdu = f.primary_hdu().unwrap();
+        atfits_rs::delete_key(&mut f, "CDELT1").unwrap();
+        atfits_rs::delete_key(&mut f, "CDELT2").unwrap();
+        hdu.write_key(&mut f, "CD1_1", -0.001f64).unwrap();
+        hdu.write_key(&mut f, "CD2_2", 0.001f64).unwrap();
+    }
+    let err = cube_io::read_cube_meta(&path).unwrap_err().to_string();
+    assert!(err.contains("CD-matrix"), "{err}");
 }
