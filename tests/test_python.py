@@ -81,6 +81,22 @@ class TestBeamClassmethods:
         assert ours.pa_deg == pytest.approx(via_rb.pa_deg)
 
 
+class TestBeamSubclass:
+    def test_methods_return_subclass(self):
+        a = Beam.from_arcsec(10.0, 8.0, 30.0)
+        b = Beam.from_arcsec(5.0, 4.0, 0.0)
+        results = [
+            a,
+            a.convolve(b),
+            a.convolve(b).deconvolve(b),
+            common_beam([a, b]),
+            common_beam([a]),
+            common_beam([a, b, Beam.from_arcsec(9.0, 9.0, 0.0)]),
+        ]
+        for r in results:
+            assert type(r) is Beam
+
+
 # ── Beam math vs radio_beam ───────────────────────────────────────────────────
 
 
@@ -250,6 +266,41 @@ class TestSmooth:
             smooth(
                 self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="Jy/beam"
             )
+
+
+class TestSmoothErrors:
+    OLD = Beam(10 * ARCSEC, 10 * ARCSEC, 0.0)
+    NEW = Beam(20 * ARCSEC, 20 * ARCSEC, 0.0)
+    PIX = 2.5 * ARCSEC
+
+    def test_unreachable_target_raises(self):
+        img = np.ones((16, 16), dtype=np.float32)
+        with pytest.raises(ValueError, match="cannot be reached"):
+            smooth(img, self.NEW, self.OLD, self.PIX, self.PIX)
+
+    def test_zero_size_beam_raises(self):
+        img = np.ones((16, 16), dtype=np.float32)
+        with pytest.raises(ValueError, match="zero size"):
+            smooth(img, Beam(0.0, 0.0, 0.0), self.NEW, self.PIX, self.PIX)
+
+    def test_cutoff_raises(self):
+        img = np.ones((16, 16), dtype=np.float32)
+        with pytest.raises(ValueError, match="cutoff"):
+            smooth(img, self.OLD, self.NEW, self.PIX, self.PIX, cutoff_arcsec=5.0)
+
+    def test_all_nan_returned_unchanged(self):
+        img = np.full((16, 16), np.nan, dtype=np.float32)
+        out = smooth(img, self.OLD, self.NEW, self.PIX, self.PIX)
+        assert np.isnan(out).all()
+
+    def test_negative_cdelt_matches_positive(self):
+        rng = np.random.default_rng(3)
+        img = rng.normal(size=(40, 36)).astype(np.float32)
+        old = Beam.from_arcsec(8.0, 5.0, 30.0)
+        new = Beam.from_arcsec(16.0, 9.0, 70.0)
+        pos = smooth(img, old, new, self.PIX, self.PIX)
+        neg = smooth(img, old, new, -self.PIX, self.PIX)
+        np.testing.assert_array_equal(pos, neg)
 
 
 class TestSmoothDtype:

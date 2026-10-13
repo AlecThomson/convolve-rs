@@ -77,15 +77,15 @@ impl PyBeam {
     ///     >>> beam.major_deg
     ///     0.005
     #[classmethod]
-    fn from_arcsec(
-        _cls: &Bound<'_, PyType>,
+    fn from_arcsec<'py>(
+        cls: &Bound<'py, PyType>,
         major_arcsec: f64,
         minor_arcsec: f64,
         pa_deg: f64,
-    ) -> PyResult<Self> {
-        Beam::from_arcsec(major_arcsec, minor_arcsec, pa_deg)
-            .map(|inner| Self { inner })
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+    ) -> PyResult<Bound<'py, PyBeam>> {
+        let beam = Beam::from_arcsec(major_arcsec, minor_arcsec, pa_deg)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        new_instance(cls, beam)
     }
 
     /// FWHM major axis in degrees (FITS BMAJ).
@@ -156,11 +156,13 @@ impl PyBeam {
     ///     Traceback (most recent call last):
     ///     ...
     ///     ValueError: beam could not be deconvolved: source beam is smaller than the PSF
-    fn deconvolve(&self, other: &PyBeam) -> PyResult<PyBeam> {
-        self.inner
+    fn deconvolve<'py>(slf: &Bound<'py, Self>, other: &PyBeam) -> PyResult<Bound<'py, PyBeam>> {
+        let beam = slf
+            .borrow()
+            .inner
             .deconvolve(&other.inner)
-            .map(|inner| Self { inner })
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        new_instance(&slf.get_type(), beam)
     }
 
     /// Convolve ``self`` with ``other``.
@@ -182,10 +184,9 @@ impl PyBeam {
     ///     >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
     ///     >>> round(a.convolve(b).major_arcsec, 6)
     ///     5.0
-    fn convolve(&self, other: &PyBeam) -> PyBeam {
-        Self {
-            inner: self.inner.convolve(&other.inner),
-        }
+    fn convolve<'py>(slf: &Bound<'py, Self>, other: &PyBeam) -> PyResult<Bound<'py, PyBeam>> {
+        let beam = slf.borrow().inner.convolve(&other.inner);
+        new_instance(&slf.get_type(), beam)
     }
 
     fn __repr__(&self) -> String {
@@ -198,6 +199,13 @@ impl PyBeam {
     fn __str__(&self) -> String {
         format!("{}", self.inner)
     }
+}
+
+/// An instance of `cls`, which may be a Python subclass of `Beam`.
+fn new_instance<'py>(cls: &Bound<'py, PyType>, beam: Beam) -> PyResult<Bound<'py, PyBeam>> {
+    Ok(cls
+        .call1((beam.major_deg, beam.minor_deg, beam.pa_deg))?
+        .downcast_into::<PyBeam>()?)
 }
 
 /// Find the smallest beam that every beam in ``beams`` can be convolved to.
@@ -217,7 +225,7 @@ impl PyBeam {
 ///         all inputs. Default ``5e-4``.
 ///
 /// Returns:
-///     Beam: The smallest common beam.
+///     Beam: The smallest common beam, of the same class as ``beams[0]``.
 ///
 /// Raises:
 ///     ValueError: If ``beams`` is empty or no valid common beam is found.
@@ -234,16 +242,16 @@ impl PyBeam {
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (beams, tolerance=1e-4, nsamps=200, epsilon=5e-4))]
-fn common_beam(
-    beams: Vec<PyBeam>,
+fn common_beam<'py>(
+    beams: Vec<Bound<'py, PyBeam>>,
     tolerance: f64,
     nsamps: usize,
     epsilon: f64,
-) -> PyResult<PyBeam> {
-    let rust_beams: Vec<Beam> = beams.iter().map(|b| b.inner).collect();
-    rust_common_beam(&rust_beams, tolerance, nsamps, epsilon)
-        .map(|inner| PyBeam { inner })
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+) -> PyResult<Bound<'py, PyBeam>> {
+    let rust_beams: Vec<Beam> = beams.iter().map(|b| b.borrow().inner).collect();
+    let beam = rust_common_beam(&rust_beams, tolerance, nsamps, epsilon)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    new_instance(&beams[0].get_type(), beam)
 }
 
 /// Resolve a FITS `BUNIT` string to a [`BrightnessUnit`], warning (and assuming
@@ -336,14 +344,14 @@ fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAn
 ///         the image is convolved, so calls from several threads run in
 ///         parallel; do not modify the array from another thread meanwhile.
 ///     old_beam (Beam): Current (input) restoring beam.
-///     new_beam (Beam): Target (output) restoring beam. Must be larger than
-///         ``old_beam``.
+///     new_beam (Beam): Target (output) restoring beam. ``old_beam``
+///         convolved with some Gaussian must give ``new_beam``.
 ///     dx_deg (float): Pixel size along the x (RA) axis in degrees
-///         (FITS CDELT1, may be negative).
+///         (FITS CDELT1; the sign is ignored).
 ///     dy_deg (float): Pixel size along the y (Dec) axis in degrees
-///         (FITS CDELT2).
-///     cutoff_arcsec (float, optional): If given, raise ``ValueError`` if the
-///         deconvolved kernel FWHM exceeds this value in arcseconds.
+///         (FITS CDELT2; the sign is ignored).
+///     cutoff_arcsec (float, optional): If given, raise ``ValueError`` when
+///         the BMAJ of ``old_beam`` exceeds this value in arcseconds.
 ///     bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
 ///         Kelvin (e.g. ``"K"``), surface brightness is conserved and no flux
 ///         scaling is applied; if it denotes Jy/beam, the Gaussian
@@ -352,11 +360,13 @@ fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAn
 ///
 /// Returns:
 ///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same precision as
-///         the input (``float32`` or ``float64``), native byte order.
+///         the input (``float32`` or ``float64``), native byte order. An
+///         all-NaN image is returned unchanged.
 ///
 /// Raises:
-///     ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
-///         are NaN, or the kernel exceeds ``cutoff_arcsec``.
+///     ValueError: If ``new_beam`` cannot be reached from ``old_beam``,
+///         ``old_beam`` has zero size, its BMAJ exceeds ``cutoff_arcsec``, or
+///         ``image`` is not a 2-D float array.
 ///
 /// Warns:
 ///     UserWarning: If ``bunit`` is given but not recognised as either a
