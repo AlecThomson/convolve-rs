@@ -25,50 +25,9 @@ use crate::smooth::BrightnessUnit;
 /// (re-exported from [`atfits_rs`]): `-64` → f64, everything else → f32.
 pub use atfits_rs::PixelType;
 
-/// Pixel element types a cube can be streamed in: `f32` or `f64`.
-///
-/// Implemented only for `f32`/`f64`. Bundles the FITS section read/write (which
-/// delegate to the shared monomorphic cfitsio I/O in [`atfits_rs`]) behind the
-/// [`FftFloat`] bound, so the convolution pipeline can stay generic over
-/// precision and run the FFT at the data's native precision.
-pub trait CubeElem: FftFloat {
-    fn read_section_vec(
-        fptr: &mut FitsFile,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<Self>, CubeError>;
-    fn write_section_vec(
-        fptr: &mut FitsFile,
-        start: usize,
-        end: usize,
-        data: &[Self],
-    ) -> Result<(), CubeError>;
-}
-
-macro_rules! impl_cube_elem {
-    ($t:ty) => {
-        impl CubeElem for $t {
-            fn read_section_vec(
-                fptr: &mut FitsFile,
-                start: usize,
-                end: usize,
-            ) -> Result<Vec<Self>, CubeError> {
-                Ok(<$t as atfits_rs::CubeElem>::read_section(fptr, start, end)?)
-            }
-            fn write_section_vec(
-                fptr: &mut FitsFile,
-                start: usize,
-                end: usize,
-                data: &[Self],
-            ) -> Result<(), CubeError> {
-                <$t as atfits_rs::CubeElem>::write_section(fptr, start, end, data)?;
-                Ok(())
-            }
-        }
-    };
-}
-impl_cube_elem!(f32);
-impl_cube_elem!(f64);
+/// Pixel types a plane can be read, convolved and written in: `f32` or `f64`.
+pub trait CubeElem: atfits_rs::CubeElem + FftFloat {}
+impl<T: atfits_rs::CubeElem + FftFloat> CubeElem for T {}
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -127,9 +86,10 @@ pub struct CubeMeta {
     pub dx_deg: f64,
     /// |CDELT2| in degrees.
     pub dy_deg: f64,
-    /// FITS 1-based CRPIX for the spectral axis (used as the header reference
-    /// channel). May lie outside `1..=nfreq`.
-    pub crpix_freq: i64,
+    /// FITS 1-based CRPIX of the spectral axis, truncated to a whole pixel.
+    /// Picks the reference channel for the header beam; may lie outside
+    /// `1..=nfreq`.
+    pub crpix_freq: f64,
     /// Per-channel beams.  `None` means the channel is masked / has no valid beam.
     pub beams: Vec<Option<Beam>>,
     /// True for 4D input (has a Stokes axis in the header).
@@ -201,28 +161,13 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     let (dx_deg, dy_deg) =
         crate::fits_io::pixel_scales(&mut fptr, &hdu).map_err(CubeError::MissingKeyword)?;
 
-    // Reference channel for the spectral axis. cfitsio truncates a fractional
-    // CRPIX (e.g. 144.5) to an integer, as racs_tools' `int(crpix)` does.
-    let crpix_freq: i64 = hdu
-        .read_key(&mut fptr, &format!("CRPIX{freq_axis}"))
-        .unwrap_or(1);
+    // racs_tools truncates a fractional CRPIX with int(); do the same.
+    let crpix_freq = atfits_rs::key_f64(&mut fptr, &format!("CRPIX{freq_axis}"))?
+        .unwrap_or(1.0)
+        .floor();
 
-    // Pixel precision: convolve in the data's native precision (f32 for -32 and
-    // integer cubes, f64 for -64) instead of always upcasting to f64.
-    let bitpix: i64 = hdu.read_key(&mut fptr, "BITPIX").unwrap_or(-32);
+    let bitpix: i64 = hdu.read_key(&mut fptr, "BITPIX")?;
     let dtype = PixelType::from_bitpix(bitpix);
-    if bitpix > 0 {
-        // Integer cubes are convolved in f32, but the output header (BITPIX) is
-        // copied verbatim, so the floating-point result is rounded back to
-        // integers on write. Warn rather than silently lose precision.
-        tracing::warn!(
-            "{}: integer BITPIX={}; convolution runs in f32 but the output is \
-             written at integer precision (fractional flux is rounded). Convert \
-             to a floating-point cube (BITPIX=-32) to avoid this.",
-            path.display(),
-            bitpix
-        );
-    }
 
     // Brightness unit (BUNIT); warn and default to Jy/beam when absent.
     let unit = match hdu.read_key::<String>(&mut fptr, "BUNIT") {
@@ -380,7 +325,7 @@ pub fn read_channel_as<T: CubeElem>(
     let mut fptr = FitsFile::open(&path_str)?;
 
     let (start, end) = meta.channel_range(chan);
-    let data = T::read_section_vec(&mut fptr, start, end)?;
+    let data = T::read_section(&mut fptr, start, end)?;
     Ok(Array2::from_shape_vec((meta.ny, meta.nx), data)?)
 }
 
@@ -405,7 +350,7 @@ pub fn write_channel_as<T: CubeElem>(
     let (start, end) = meta.channel_range(chan);
     let flat = data.as_standard_layout();
     let slice = flat.as_slice().expect("standard-layout plane");
-    T::write_section_vec(&mut fptr, start, end, slice)?;
+    T::write_section(&mut fptr, start, end, slice)?;
     Ok(())
 }
 
@@ -468,6 +413,7 @@ impl CubeWriter {
         // data written yet). cfitsio defines the data unit from the copied NAXIS
         // keywords; it is written once, when this handle is finally dropped.
         let mut fptr = atfits_rs::copy_header_only_open(input_path, output_path)?;
+        crate::fits_io::float_output(&mut fptr, None)?;
 
         let ref_beam = ref_beam_for(target_beams, meta);
         write_primary_beam_keys(&mut fptr, ref_beam, mode == CubeMode::Natural)?;
@@ -506,7 +452,7 @@ impl CubeWriter {
         let (start, end) = meta.channel_range(chan);
         let flat = data.as_standard_layout();
         let slice = flat.as_slice().expect("standard-layout plane");
-        T::write_section_vec(&mut self.fptr, start, end, slice)?;
+        T::write_section(&mut self.fptr, start, end, slice)?;
         Ok(())
     }
 
@@ -557,8 +503,8 @@ pub enum CubeMode {
 /// axis picks the nearest channel), falling back to the first valid beam, then
 /// to a zero beam.
 fn ref_beam_for(target_beams: &[Option<Beam>], meta: &CubeMeta) -> Beam {
-    let last = meta.nfreq.saturating_sub(1) as i64;
-    let ref_idx = (meta.crpix_freq - 1).clamp(0, last) as usize;
+    let last = meta.nfreq.saturating_sub(1) as f64;
+    let ref_idx = (meta.crpix_freq - 1.0).clamp(0.0, last) as usize;
     target_beams[ref_idx].unwrap_or_else(|| {
         // Find first valid beam if the reference channel is masked.
         target_beams.iter().find_map(|b| *b).unwrap_or(Beam::zero())

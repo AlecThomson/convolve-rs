@@ -4,7 +4,10 @@
 //! ASKAP/CASA. Only the first plane of a 4D image is used, as racs_tools does.
 use std::path::{Path, PathBuf};
 
-use atfits_rs::{PixelType, copy_header_only_open, resize_image, update_key_f64};
+use atfits_rs::{
+    HeaderGeom, PixelType, copy_header_only_open, delete_key, key_exists, resize_image,
+    update_key_f64,
+};
 use fitsio::FitsFile;
 use fitsio::hdu::FitsHdu;
 use ndarray::Array2;
@@ -153,8 +156,7 @@ pub fn read_fits<T: CubeElem>(path: &Path) -> Result<FitsImageData<T>, FitsError
 /// Read the first plane of the image described by `header`.
 pub fn read_fits_plane<T: CubeElem>(header: &FitsImageHeader) -> Result<Array2<T>, FitsError> {
     let mut fptr = FitsFile::open(header.path.to_string_lossy().as_ref())?;
-    let data = T::read_section_vec(&mut fptr, 0, header.nx * header.ny)
-        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    let data = T::read_section(&mut fptr, 0, header.nx * header.ny)?;
     Array2::from_shape_vec((header.ny, header.nx), data)
         .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))
 }
@@ -186,16 +188,12 @@ pub fn write_fits<T: CubeElem>(
     _was_4d: bool,
 ) -> Result<(), FitsError> {
     let mut fptr = copy_header_only_open(template_path, out_path)?;
-    let hdu = fptr.primary_hdu()?;
-    let naxis: i64 = hdu.read_key(&mut fptr, "NAXIS")?;
-    let bitpix: i64 = hdu.read_key(&mut fptr, "BITPIX")?;
+    let naxis = HeaderGeom::from_file(&mut fptr)?.naxis;
     let (ny, nx) = image.dim();
-    if naxis > 2 {
-        let mut dims = vec![1; naxis as usize];
-        dims[0] = nx;
-        dims[1] = ny;
-        resize_image(&mut fptr, bitpix, &dims)?;
-    }
+    let mut dims = vec![1; naxis];
+    dims[0] = nx;
+    dims[1] = ny;
+    float_output(&mut fptr, Some(&dims))?;
 
     // The template already has these cards; appending would leave the old
     // beam first, which is the one readers pick up.
@@ -207,8 +205,31 @@ pub fn write_fits<T: CubeElem>(
     let slice = flat
         .as_slice()
         .ok_or_else(|| FitsError::Io(std::io::Error::other("image is not contiguous")))?;
-    T::write_section_vec(&mut fptr, 0, nx * ny, slice)
-        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    T::write_section(&mut fptr, 0, nx * ny, slice)?;
+    Ok(())
+}
+
+/// Make an output copied from an input header hold floats, and give it shape
+/// `dims` if set. Integer inputs are smoothed in f32 and may be blanked with
+/// NaN, so their outputs are written as BITPIX = -32 without scaling keys.
+pub(crate) fn float_output(
+    fptr: &mut FitsFile,
+    dims: Option<&[usize]>,
+) -> Result<(), atfits_rs::AtfitsError> {
+    let geom = HeaderGeom::from_file(fptr)?;
+    let integer = geom.bitpix > 0;
+    let bitpix = if integer { -32 } else { geom.bitpix };
+    let dims = dims.unwrap_or(&geom.dims);
+    if integer || dims != geom.dims.as_slice() {
+        resize_image(fptr, bitpix, dims)?;
+    }
+    if integer {
+        for key in ["BSCALE", "BZERO", "BLANK"] {
+            if key_exists(fptr, key)? {
+                delete_key(fptr, key)?;
+            }
+        }
+    }
     Ok(())
 }
 

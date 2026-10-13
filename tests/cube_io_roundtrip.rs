@@ -561,9 +561,19 @@ fn streaming_writer_matches_init_output_cube() {
 
 /// Build a 3D point-source cube with the given per-channel BEAMS table.
 fn make_cube_with_beams(path: &std::path::Path, bmaj: &[f32], bmin: &[f32], bpa: &[f32]) {
+    make_cube_typed(path, fitsio::images::ImageType::Float, bmaj, bmin, bpa);
+}
+
+fn make_cube_typed(
+    path: &std::path::Path,
+    data_type: fitsio::images::ImageType,
+    bmaj: &[f32],
+    bmin: &[f32],
+    bpa: &[f32],
+) {
     let mut f = FitsFile::create(path)
         .with_custom_primary(&fitsio::images::ImageDescription {
-            data_type: fitsio::images::ImageType::Float,
+            data_type,
             dimensions: &[NFREQ, NY, NX],
         })
         .overwrite()
@@ -764,7 +774,7 @@ fn casa_axis_order_cube_is_read_and_smoothed() {
     make_casa_order_cube(&path);
 
     let meta = cube_io::read_cube_meta(&path).unwrap();
-    assert_eq!((meta.nfreq, meta.nstokes, meta.crpix_freq), (NFREQ, 1, 2));
+    assert_eq!((meta.nfreq, meta.nstokes, meta.crpix_freq), (NFREQ, 1, 2.0));
     assert!(meta.is_4d);
 
     let (ok, log) = run_cli(&[
@@ -913,5 +923,38 @@ fn cli_target_ignores_cutoff_channels() {
             .unwrap()
             .iter()
             .all(|v| v.is_finite())
+    );
+}
+
+/// An integer cube is written out as floats, so blanked channels can hold NaN
+/// and smoothed values are not rounded.
+#[test]
+fn cli_integer_cube_writes_floats() {
+    let dir = workdir("cli_integer");
+    let path = dir.join("in.fits");
+    make_cube_typed(
+        &path,
+        fitsio::images::ImageType::Short,
+        &[16.0, 0.0, 18.0],
+        &[12.0, 0.0, 14.0],
+        &[0.0, 0.0, 10.0],
+    );
+    let (ok, log) = run_cli(&["3d", path.to_str().unwrap(), "--mode", "total"]);
+    assert!(ok, "{log}");
+    let out = dir.join("in.sm.fits");
+    let mut f = FitsFile::open(&out).unwrap();
+    let bitpix: i64 = f.primary_hdu().unwrap().read_key(&mut f, "BITPIX").unwrap();
+    assert_eq!(bitpix, -32);
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    assert!(
+        cube_io::read_channel(&out, 1, &meta)
+            .unwrap()
+            .iter()
+            .all(|v| v.is_nan())
+    );
+    let plane = cube_io::read_channel(&out, 0, &meta).unwrap();
+    assert!(
+        plane.iter().any(|v| v.fract() != 0.0),
+        "values were rounded"
     );
 }

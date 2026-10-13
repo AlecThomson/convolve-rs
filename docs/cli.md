@@ -73,4 +73,5 @@ Per-channel beams are read from, in priority order:
   size, are written as NaN and left out when finding or checking the target.
 - Only the first plane of a 4D image is smoothed; the output has
   `NAXIS3 = NAXIS4 = 1`. `BITPIX = -64` images are smoothed and written in
-  double precision.
+  double precision; integer images are smoothed in single precision and
+  written as `BITPIX = -32`.
