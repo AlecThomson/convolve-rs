@@ -875,3 +875,43 @@ fn cd_matrix_header_is_reported() {
     let err = cube_io::read_cube_meta(&path).unwrap_err().to_string();
     assert!(err.contains("CD-matrix"), "{err}");
 }
+
+/// An explicit target is checked only against channels within the cutoff.
+#[test]
+fn cli_target_ignores_cutoff_channels() {
+    let dir = workdir("cli_target_cutoff");
+    let path = dir.join("in.fits");
+    make_cube_with_beams(
+        &path,
+        &[16.0, 30.0, 18.0],
+        &[12.0, 30.0, 14.0],
+        &[0.0, 0.0, 10.0],
+    );
+    let (ok, log) = run_cli(&[
+        "3d",
+        path.to_str().unwrap(),
+        "--cutoff",
+        "20",
+        "--bmaj",
+        "20",
+        "--bmin",
+        "20",
+        "--bpa",
+        "0",
+    ]);
+    assert!(ok, "{log}");
+    let out = dir.join("in.sm.fits");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    assert!(
+        cube_io::read_channel(&out, 1, &meta)
+            .unwrap()
+            .iter()
+            .all(|v| v.is_nan())
+    );
+    assert!(
+        cube_io::read_channel(&out, 0, &meta)
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite())
+    );
+}

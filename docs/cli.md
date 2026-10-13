@@ -63,3 +63,14 @@ Per-channel beams are read from, in priority order:
 2. A co-located beamlog text file: `{dir}/beamlog.{stem}.txt`
 3. Single `BMAJ`/`BMIN`/`BPA` from the primary header (broadcast to all
    channels)
+
+## Beam handling
+
+- A computed common beam is rounded up to 0.1″ axes and 0.01° position angle,
+  as in racs_tools. An explicit `--bmaj/--bmin/--bpa` target is used as given.
+  `--circularise` applies to either.
+- Images or channels whose BMAJ exceeds `--cutoff`, or whose beam has zero
+  size, are written as NaN and left out when finding or checking the target.
+- Only the first plane of a 4D image is smoothed; the output has
+  `NAXIS3 = NAXIS4 = 1`. `BITPIX = -64` images are smoothed and written in
+  double precision.

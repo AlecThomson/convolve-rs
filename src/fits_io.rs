@@ -1,16 +1,17 @@
 //! FITS image reading and writing.
 //!
-//! Handles both 2D (NAXIS=2, shape `[ny, nx]`) and 4D (NAXIS=4, shape
-//! `[1,1,ny,nx]`) images as produced by ASKAP/CASA.
+//! Handles 2D images (NAXIS=2) and 4D images (NAXIS=4) as produced by
+//! ASKAP/CASA. Only the first plane of a 4D image is used, as racs_tools does.
 use std::path::{Path, PathBuf};
 
-use atfits_rs::copy_header_only;
+use atfits_rs::{PixelType, copy_header_only_open, resize_image, update_key_f64};
 use fitsio::FitsFile;
 use fitsio::hdu::FitsHdu;
 use ndarray::Array2;
 use thiserror::Error;
 
 use crate::beam::Beam;
+use crate::cube_io::CubeElem;
 use crate::smooth::BrightnessUnit;
 
 #[derive(Debug, Error)]
@@ -39,9 +40,29 @@ impl From<atfits_rs::AtfitsError> for FitsError {
     }
 }
 
-pub struct FitsImageData {
+/// Header metadata of a 2D image, or of the first plane of a 4D one.
+#[derive(Debug, Clone)]
+pub struct FitsImageHeader {
     pub path: PathBuf,
-    pub image: Array2<f32>,
+    pub nx: usize,
+    pub ny: usize,
+    /// Number of planes behind the first one's axes (1 for a plain image).
+    pub nplanes: usize,
+    pub is_4d: bool,
+    /// |CDELT1| in degrees (x / RA pixel size)
+    pub dx_deg: f64,
+    /// |CDELT2| in degrees (y / Dec pixel size)
+    pub dy_deg: f64,
+    pub beam: Beam,
+    /// Brightness unit from BUNIT (defaults to Jy/beam if absent).
+    pub unit: BrightnessUnit,
+    /// Pixel precision, from BITPIX.
+    pub dtype: PixelType,
+}
+
+pub struct FitsImageData<T = f32> {
+    pub path: PathBuf,
+    pub image: Array2<T>,
     pub is_4d: bool,
     /// |CDELT1| in degrees (x / RA pixel size)
     pub dx_deg: f64,
@@ -54,37 +75,36 @@ pub struct FitsImageData {
     pub header_cards: Vec<(String, String)>,
 }
 
-/// Read a 2D or 4D FITS image.
-pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
-    let path_str = path.to_string_lossy().into_owned();
-    let mut fptr = FitsFile::open(&path_str)?;
+/// Read the shape, pixel scale, beam and unit of a 2D or 4D FITS image without
+/// reading its pixels.
+pub fn read_fits_header(path: &Path) -> Result<FitsImageHeader, FitsError> {
+    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
     let hdu = fptr.primary_hdu()?;
 
     let naxis: i64 = hdu.read_key(&mut fptr, "NAXIS")?;
-    let naxis1: i64 = hdu.read_key(&mut fptr, "NAXIS1")?; // x / RA (cols)
-    let naxis2: i64 = hdu.read_key(&mut fptr, "NAXIS2")?; // y / Dec (rows)
-
     if naxis != 2 && naxis != 4 {
         return Err(FitsError::UnsupportedNaxis(naxis));
     }
-
-    let nx = naxis1 as usize;
-    let ny = naxis2 as usize;
-
-    // Read flat image data (works for both 2D and 4D when extra axes are size 1).
-    let data: Vec<f32> = hdu.read_image(&mut fptr)?;
-    let image = Array2::from_shape_vec((ny, nx), data)
-        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    let mut dims = Vec::with_capacity(naxis as usize);
+    for i in 1..=naxis {
+        dims.push(hdu.read_key::<i64>(&mut fptr, &format!("NAXIS{i}"))? as usize);
+    }
+    let nplanes = dims[2..].iter().product();
+    if nplanes > 1 {
+        tracing::warn!(
+            "{}: {nplanes} planes beyond the image axes; only the first is smoothed",
+            path.display()
+        );
+    }
+    let bitpix: i64 = hdu.read_key(&mut fptr, "BITPIX")?;
 
     let (dx_deg, dy_deg) = pixel_scales(&mut fptr, &hdu).map_err(FitsError::MissingKeyword)?;
 
-    // Beam.
     let bmaj: f64 = hdu
         .read_key(&mut fptr, "BMAJ")
         .map_err(|_| FitsError::MissingKeyword("BMAJ".into()))?;
     let bmin: f64 = hdu.read_key(&mut fptr, "BMIN").unwrap_or(bmaj);
     let bpa: f64 = hdu.read_key(&mut fptr, "BPA").unwrap_or(0.0);
-
     let beam = Beam::new(bmaj, bmin, bpa)
         .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -100,14 +120,36 @@ pub fn read_fits(path: &Path) -> Result<FitsImageData, FitsError> {
         }
     };
 
-    Ok(FitsImageData {
+    Ok(FitsImageHeader {
         path: path.to_path_buf(),
-        image,
+        nx: dims[0],
+        ny: dims[1],
+        nplanes,
         is_4d: naxis == 4,
         dx_deg,
         dy_deg,
         beam,
         unit,
+        dtype: PixelType::from_bitpix(bitpix),
+    })
+}
+
+/// Read a 2D FITS image, or the first plane of a 4D one, in precision `T`.
+pub fn read_fits<T: CubeElem>(path: &Path) -> Result<FitsImageData<T>, FitsError> {
+    let header = read_fits_header(path)?;
+    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
+    let data = T::read_section_vec(&mut fptr, 0, header.nx * header.ny)
+        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    let image = Array2::from_shape_vec((header.ny, header.nx), data)
+        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(FitsImageData {
+        path: header.path,
+        image,
+        is_4d: header.is_4d,
+        dx_deg: header.dx_deg,
+        dy_deg: header.dy_deg,
+        beam: header.beam,
+        unit: header.unit,
         header_cards: vec![],
     })
 }
@@ -129,35 +171,39 @@ pub(crate) fn pixel_scales(fptr: &mut FitsFile, hdu: &FitsHdu) -> Result<(f64, f
 
 /// Write a smoothed image to `out_path`.
 ///
-/// Copies `template_path` to `out_path`, then overwrites the pixel data and
-/// updates BMAJ/BMIN/BPA in the header.  This preserves all other keywords
-/// (WCS, HISTORY, etc.) from the original file.
-pub fn write_fits(
-    image: &Array2<f32>,
+/// The header is copied from `template_path`, with BMAJ/BMIN/BPA replaced and
+/// any planes beyond the first dropped.
+pub fn write_fits<T: CubeElem>(
+    image: &Array2<T>,
     out_path: &Path,
     template_path: &Path,
     new_beam: &Beam,
     _was_4d: bool,
 ) -> Result<(), FitsError> {
-    // Initialise the destination cheaply: copy only the template's primary-HDU
-    // header (preserving WCS/HISTORY/etc.), not its pixel data.  The data unit is
-    // defined by the copied NAXIS keywords; we overwrite every pixel below, so
-    // reading the template's data via `std::fs::copy` would be wasted I/O.
-    copy_header_only(template_path, out_path)?;
-
-    let out_str = out_path.to_string_lossy().into_owned();
-    let mut fptr = FitsFile::edit(&out_str)?;
+    let mut fptr = copy_header_only_open(template_path, out_path)?;
     let hdu = fptr.primary_hdu()?;
+    let naxis: i64 = hdu.read_key(&mut fptr, "NAXIS")?;
+    let bitpix: i64 = hdu.read_key(&mut fptr, "BITPIX")?;
+    let (ny, nx) = image.dim();
+    if naxis > 2 {
+        let mut dims = vec![1; naxis as usize];
+        dims[0] = nx;
+        dims[1] = ny;
+        resize_image(&mut fptr, bitpix, &dims)?;
+    }
 
-    // Flatten to Vec<f32> in row-major order (C order = FITS row-major).
-    let flat: Vec<f32> = image.iter().cloned().collect();
-    hdu.write_image(&mut fptr, &flat)?;
+    // The template already has these cards; appending would leave the old
+    // beam first, which is the one readers pick up.
+    update_key_f64(&mut fptr, "BMAJ", new_beam.major_deg)?;
+    update_key_f64(&mut fptr, "BMIN", new_beam.minor_deg)?;
+    update_key_f64(&mut fptr, "BPA", new_beam.pa_deg)?;
 
-    // Update beam keywords.
-    hdu.write_key(&mut fptr, "BMAJ", new_beam.major_deg)?;
-    hdu.write_key(&mut fptr, "BMIN", new_beam.minor_deg)?;
-    hdu.write_key(&mut fptr, "BPA", new_beam.pa_deg)?;
-
+    let flat = image.as_standard_layout();
+    let slice = flat
+        .as_slice()
+        .ok_or_else(|| FitsError::Io(std::io::Error::other("image is not contiguous")))?;
+    T::write_section_vec(&mut fptr, 0, nx * ny, slice)
+        .map_err(|e| FitsError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
 }
 
