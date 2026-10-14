@@ -4,10 +4,9 @@
 //! plane of a 4D image is used, as in racs_tools.
 use std::path::{Path, PathBuf};
 
-use atfits_rs::{HeaderGeom, PixelType, create_cube_open, update_key_f64};
+use atfits_rs::{HeaderGeom, PixelType, create_cube_open, pixel_scale_deg, update_key_f64};
 use fitsio::FitsFile;
-use fitsio::hdu::{FitsHdu, HduInfo};
-use fitsio::images::ImageType;
+use fitsio::hdu::FitsHdu;
 use ndarray::Array2;
 use thiserror::Error;
 
@@ -54,9 +53,9 @@ pub struct FitsImageHeader {
     pub ny: usize,
     /// Planes beyond the first (1 for a plain image).
     pub nplanes: usize,
-    /// |CDELT1| in degrees.
+    /// Pixel size along x in degrees.
     pub dx_deg: f64,
-    /// |CDELT2| in degrees.
+    /// Pixel size along y in degrees.
     pub dy_deg: f64,
     pub beam: Beam,
     pub unit: BrightnessUnit,
@@ -83,7 +82,7 @@ pub fn read_fits_header(path: &Path) -> Result<FitsImageHeader, FitsError> {
         );
     }
     let hdu = fptr.primary_hdu()?;
-    let (dx_deg, dy_deg) = pixel_scales(&mut fptr, &hdu)?;
+    let (dx_deg, dy_deg) = pixel_scale_deg(&mut fptr)?;
     let beam = read_header_beam(&mut fptr)?.ok_or(FitsError::MissingKeyword("BMAJ".into()))?;
     Ok(FitsImageHeader {
         path: path.to_path_buf(),
@@ -108,7 +107,7 @@ pub fn read_fits<T: CubeElem>(path: &Path) -> Result<FitsImageData<T>, FitsError
 /// Read the first plane of the image `header` describes.
 pub fn read_fits_plane<T: CubeElem>(header: &FitsImageHeader) -> Result<Array2<T>, FitsError> {
     let mut fptr = FitsFile::open(&header.path)?;
-    let data = read_pixels(&mut fptr, 0, header.nx * header.ny)?;
+    let data = T::read_section(&mut fptr, 0, header.nx * header.ny)?;
     Ok(Array2::from_shape_vec((header.ny, header.nx), data)?)
 }
 
@@ -148,42 +147,6 @@ pub(crate) fn create_output(
     let geom = HeaderGeom::read(template)?;
     let bitpix = if geom.bitpix > 0 { -32 } else { geom.bitpix };
     create_cube_open(template, output, bitpix, dims.unwrap_or(&geom.dims))
-}
-
-/// Pixels `start..end` of the primary image.
-///
-/// Float images are read through fitsio: atfits 1.1 has cfitsio null-check
-/// every float pixel, which doubles the read time (1.0 s against 0.46 s for a
-/// 1 GB cube). Integer images need atfits' BLANK handling.
-pub(crate) fn read_pixels<T: CubeElem>(
-    fptr: &mut FitsFile,
-    start: usize,
-    end: usize,
-) -> Result<Vec<T>, FitsError> {
-    let hdu = fptr.primary_hdu()?;
-    if let HduInfo::ImageInfo {
-        image_type: ImageType::Float | ImageType::Double,
-        ..
-    } = hdu.info
-    {
-        Ok(T::read_float(fptr, &hdu, start, end)?)
-    } else {
-        Ok(T::read_section(fptr, start, end)?)
-    }
-}
-
-/// `(|CDELT1|, |CDELT2|)` in degrees.
-pub(crate) fn pixel_scales(fptr: &mut FitsFile, hdu: &FitsHdu) -> Result<(f64, f64), FitsError> {
-    let mut read = |key: &str| {
-        hdu.read_key::<f64>(fptr, key).map(f64::abs).map_err(|_| {
-            FitsError::MissingKeyword(if hdu.read_key::<f64>(fptr, "CD1_1").is_ok() {
-                format!("{key} (CD-matrix headers are not supported; add CDELT1/CDELT2)")
-            } else {
-                key.to_string()
-            })
-        })
-    };
-    Ok((read("CDELT1")?, read("CDELT2")?))
 }
 
 /// BMAJ/BMIN/BPA from the primary header, or `None` without BMAJ. BMIN

@@ -4,7 +4,7 @@
 :start-after: <!-- SPHINX-START -->
 ```
 
-## Table of contents
+## Contents
 
 ```{toctree}
 :maxdepth: 1
@@ -18,10 +18,4 @@ performance.md
 
 The Rust crate is documented separately on
 [docs.rs/convolve-rs](https://docs.rs/convolve-rs). The Python API on this
-site is a thin binding over it.
-
-## Indices and tables
-
-- {ref}`genindex`
-- {ref}`modindex`
-- {ref}`search`
+site is a binding over it.

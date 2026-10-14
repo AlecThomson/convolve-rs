@@ -112,8 +112,7 @@ plt.show()
 
 ## NaN handling
 
-NaN pixels propagate through the convolution rather than poisoning the whole
-image:
+NaN pixels stay blank, and the rest of the image is smoothed as usual:
 
 ```{code-cell} ipython3
 image_nan = image.copy()
@@ -150,6 +149,5 @@ with fits.open("image.fits") as hdul:
     fits.writeto("smoothed.fits", smoothed, header, overwrite=True)
 ```
 
-For batch processing of many images or large cubes, prefer the
-[`convolvers` CLI](cli.md): it parallelises across images/channels and
-handles beamlogs and CASA multi-beam tables.
+For many images or large cubes, use the [`convolvers` CLI](cli.md). It runs
+images or channels in parallel and reads beamlogs and CASA multi-beam tables.
