@@ -647,7 +647,6 @@ mod tests {
 
     #[test]
     fn test_fftfreq() {
-        // Match numpy: fftfreq(4, 1) = [0, 0.25, -0.5, -0.25]
         let f = fftfreq(4, 1.0);
         let expected = [0.0, 0.25, -0.5, -0.25];
         for (a, b) in f.iter().zip(expected.iter()) {
@@ -655,8 +654,8 @@ mod tests {
         }
     }
 
-    /// Forward then inverse in-place transform (no filter) recovers the image,
-    /// for even and odd widths (the Nyquist handling differs) and both precisions.
+    /// A flat filter returns the image, for even and odd widths (the Nyquist
+    /// bin differs) and both precisions.
     fn roundtrip<T: FftFloat + std::fmt::Debug>(nrows: usize, ncols: usize, tol: f64) {
         let data: Vec<T> = (0..nrows * ncols)
             .map(|k| cast_saturating::<T>(((k * 7) % 13) as f64 - 6.0))
@@ -713,10 +712,8 @@ mod tests {
         }
     }
 
-    /// Straightforward reference: full complex 2-D FFT of the NaN-filled image,
-    /// multiply by `gaussft` on the full grid, inverse, take the real part, and
-    /// blank where the convolved NaN mask reaches the threshold. This is the
-    /// algorithm as `racs_tools` first wrote it, before any memory saving.
+    /// Reference: full complex 2D FFTs of the zero-filled image and the NaN
+    /// mask, multiplied by `gaussft` on the full grid.
     fn reference(image: &Array2<f64>, old: &Beam, new: &Beam, dx: f64) -> Array2<f64> {
         let (nrows, ncols) = image.dim();
         let u = fftfreq(nrows, dx.to_radians());
@@ -773,9 +770,8 @@ mod tests {
         img
     }
 
-    /// The in-place, on-the-fly-filter, blocked-column convolution matches the
-    /// naive full-FFT reference, including odd dimensions, rotated beams, NaN
-    /// blanking, and widths that leave a partial final column block.
+    /// Matches the reference for odd sizes, rotated beams, NaNs, and widths
+    /// that leave a partial column block.
     #[test]
     fn test_convolve_uv_matches_full_fft_reference() {
         let dx = 2.5 / 3600.0;
@@ -809,8 +805,7 @@ mod tests {
         }
     }
 
-    /// Convolving an owned plane in its own buffer gives bit-identical output to
-    /// convolving a borrowed one, with and without NaNs.
+    /// Owned and borrowed inputs give identical output.
     #[test]
     fn test_owned_matches_borrowed() {
         let dx = 2.5 / 3600.0;
@@ -828,8 +823,7 @@ mod tests {
         }
     }
 
-    /// A non-standard-layout (transposed) input is convolved as the logical
-    /// image, not as its memory order.
+    /// A transposed input is convolved as the logical image.
     #[test]
     fn test_owned_non_standard_layout() {
         let dx = 2.5 / 3600.0;
@@ -1035,10 +1029,8 @@ mod tests {
         assert!((result.scaling_factor - 1.0).abs() < 1e-10);
     }
 
-    /// Convolving a point source yields a Gaussian whose integral equals the
-    /// filter's DC gain (`scaling_factor` = g_ratio, which `convolve_uv` bakes
-    /// into the image) and whose peak sits at the source pixel. Anchors the FFT
-    /// path to a known answer.
+    /// A point source convolves to a Gaussian peaked on the source whose sum
+    /// is the filter's DC gain.
     #[test]
     fn test_convolve_uv_point_source_flux_and_peak() {
         let (n, dx) = (64usize, 2.0 / 3600.0);
@@ -1051,15 +1043,12 @@ mod tests {
         let res = convolve_uv(&img, &old, &new, dx, dx, None).unwrap();
         let total: f64 = res.image.iter().sum();
 
-        // The UV filter has DC gain g_ratio (= scaling_factor), so a unit point
-        // source convolves to a Gaussian whose pixels sum to that gain.
         assert!(
             (total - res.scaling_factor).abs() < 1e-6,
             "integral {total} != DC gain {}",
             res.scaling_factor
         );
 
-        // Peak stays at the source pixel and is the image maximum.
         let peak = res.image[(n / 2, n / 2)];
         assert!(peak > 0.0);
         for &v in res.image.iter() {
@@ -1067,8 +1056,7 @@ mod tests {
         }
     }
 
-    /// f32 and f64 convolutions of the same data must agree to f32 precision —
-    /// confirms the precision-generic path is consistent.
+    /// f32 and f64 agree to f32 precision.
     #[test]
     fn test_convolve_uv_f32_matches_f64() {
         let (n, dx) = (48usize, 2.5 / 3600.0);
@@ -1090,10 +1078,8 @@ mod tests {
         }
     }
 
-    /// A solid NaN region larger than the kernel must stay blanked in the
-    /// output (the convolved mask reaches the filter's DC gain ≥ 1 there), while
-    /// data far from it stays finite. Isolated single NaNs are intentionally
-    /// interpolated over, so the test uses a block.
+    /// A NaN block wider than the kernel stays blank inside; far pixels stay
+    /// finite. (Isolated NaNs are interpolated over.)
     #[test]
     fn test_convolve_uv_propagates_nans() {
         let (n, dx) = (48usize, 2.5 / 3600.0);
@@ -1101,7 +1087,6 @@ mod tests {
         let new = Beam::from_arcsec(12.0, 12.0, 0.0).unwrap();
 
         let mut img = Array2::<f32>::from_elem((n, n), 1.0);
-        // Blank a solid block in one corner, several kernel-widths across.
         for i in 0..12 {
             for j in 0..12 {
                 img[(i, j)] = f32::NAN;
@@ -1109,14 +1094,11 @@ mod tests {
         }
 
         let res = convolve_uv(&img, &old, &new, dx, dx, None).unwrap();
-        // The interior of the blanked block stays NaN…
         assert!(res.image[(3, 3)].is_nan(), "block interior should stay NaN");
-        // …while a pixel far from the block stays finite.
         assert!(res.image[(n - 1, n - 1)].is_finite());
     }
 
-    /// Reusing one `FftPlans` across calls must give bit-identical output to the
-    /// per-call planning path. Guards the Tier-0 plan-cache optimisation.
+    /// Shared plans give the same output as per-call plans.
     #[test]
     fn test_with_plans_matches_per_call() {
         let (n, dx) = (32usize, 2.5 / 3600.0);

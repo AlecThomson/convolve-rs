@@ -1,13 +1,9 @@
 # Algorithm background
 
-This page summarises the maths implemented in convolve-rs. Everything here is
-a standard result for combining Gaussian point-spread functions — see Wild
-(1970, *Aust. J. Phys.* 23, 113) for the radio-astronomy form. The same
-formulae underpin
+The beam algebra is the standard one for Gaussian point-spread functions
+(Wild 1970, *Aust. J. Phys.* 23, 113), as used by
 [radio_beam](https://github.com/radio-astro-tools/radio-beam) and
-[RACS-tools](https://github.com/alecthomson/RACS-tools); convolve-rs is an
-independent implementation in terms of the covariance matrix and its
-eigendecomposition.
+[RACS-tools](https://github.com/alecthomson/RACS-tools).
 
 ## Beam algebra
 
@@ -68,9 +64,8 @@ implemented in {func}`convolve_rs.gauss_factor`.
 
 ## UV-plane convolution
 
-Rather than convolving with an image-domain kernel — which becomes numerically
-unreliable when the convolving kernel is undersampled (comparable to or
-smaller than a pixel) — convolve-rs works in the Fourier (UV) plane, following
+An image-domain kernel is unreliable when it is comparable to or smaller than
+a pixel, so convolve-rs works in the Fourier (UV) plane, following
 the "robust" mode of RACS-tools:
 
 1. FFT the input image.
@@ -84,7 +79,7 @@ reaches 0.99. RACS-tools uses 1; the lower value keeps NaN pixels blank when
 the beams are nearly equal and round-off leaves the mask just under 1.
 
 Because the image is real-valued, a real-input FFT is used along the
-contiguous axis, halving spectrum memory — the dominant cost for large images.
+contiguous axis, which halves the spectrum's memory.
 
 ## Common beam
 
@@ -94,7 +89,8 @@ matching `radio_beam.Beams.common_beam(method='pts')`:
 
 - **Two beams**: the analytic CASA algorithm (`ia.commonbeam`): transform to a
   frame where the larger beam is circular, take the enclosing ellipse, and
-  transform back.
+  transform back. If the result does not contain both beams, the many-beam
+  fit is used instead.
 - **Many beams**: sample points on each beam-ellipse boundary, take the convex
   hull, and find the minimum-volume enclosing ellipse with the Khachiyan
   algorithm. The ellipses are inflated by a small `epsilon` first so the

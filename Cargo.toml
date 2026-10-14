@@ -40,7 +40,7 @@ python = ["dep:pyo3", "dep:numpy"]
 # Stable-ABI build for distributable wheels: maturin builds a single
 # `cp310-abi3` wheel per platform (works on Python >=3.10) and can build
 # without a Python interpreter present, which cross-compiled (e.g. aarch64)
-# wheels require. Mutually exclusive with `stubgen` — pyo3-stub-gen references
+# wheels require. Mutually exclusive with `stubgen`: pyo3-stub-gen references
 # datetime types that don't exist in the limited API.
 abi3 = ["python", "pyo3/abi3-py310"]
 # Regenerate the .pyi type stubs (dev only, e.g. `cargo build --features stubgen`).

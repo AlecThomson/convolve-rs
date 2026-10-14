@@ -1,7 +1,7 @@
 use convolve_rs::cube_io;
 /// Integration tests for convolve-rs, validating against MIRIAD.
 ///
-/// The MIRIAD test (`test_smooth_matches_miriad`) mirrors the Python `test_2d.py`
+/// The MIRIAD test (`test_smooth_matches_miriad`) follows the Python `test_2d.py`
 /// fixture: a 100×100 Gaussian image with BMAJ=20", BMIN=10", BPA=10°, pixel
 /// scale 2.5"/pix, smoothed to 40"×40"@0°.
 ///
@@ -279,7 +279,7 @@ fn test_beam_deconvolve_test_params() {
 /// Note: g_ratio = sqrt(Ω_new / Ω_old).  For smoothing to a *larger* beam,
 /// Ω_new > Ω_old, so g_ratio > 1.  The final Jy/beam scaling is g_ratio²
 /// (applied as g_ratio once inside g_final, and once more in smooth()), which
-/// equals Ω_new / Ω_old — the correct ratio for Jy/beam units.
+/// equals Ω_new / Ω_old, the correct ratio for Jy/beam units.
 #[test]
 fn test_gaussft_dc_equals_g_ratio() {
     let old = Beam::from_arcsec(OLD_BMAJ, OLD_BMIN, OLD_BPA).unwrap();
@@ -572,7 +572,7 @@ fn test_smooth_matches_miriad() {
 /// Compare our Kelvin (brightness-temperature) smoothing against MIRIAD,
 /// natively: the input FITS is written with `BUNIT=K`, so MIRIAD `convol`
 /// performs a straight (surface-brightness-preserving) convolution with no
-/// Jy/beam flux scaling — exactly what [`BrightnessUnit::Kelvin`] does.
+/// Jy/beam flux scaling, which is what [`BrightnessUnit::Kelvin`] does.
 ///
 /// Skips automatically if the MIRIAD binaries are not present on the system.
 #[test]
@@ -645,7 +645,7 @@ fn test_kelvin_matches_miriad() {
 
 // ── Additional common-beam tests ──────────────────────────────────────────────
 
-/// Three different elliptical beams — common beam must enclose all three.
+/// Three different elliptical beams: the common beam must enclose all three.
 #[test]
 fn test_common_beam_three_different() {
     let b1 = Beam::from_arcsec(20.0, 10.0, 30.0).unwrap();
@@ -977,7 +977,7 @@ fn test_cube_channel_beam_area_ratio() {
 
 /// Compare our per-channel UV convolution against MIRIAD `convol options=cube`.
 ///
-/// Mirrors the Python `test_robust_3d` in RACS-tools/tests/test_3d.py:
+/// Follows the Python `test_robust_3d` in RACS-tools/tests/test_3d.py:
 ///   - 4D CASAMBM cube, all channels BMAJ=50", BMIN=10", BPA=0°, pix=2.5"/pix
 ///   - Target beam: BMAJ=60", BMIN=60", BPA=0°
 ///   - MIRIAD: `convol options=cube` (per-channel beam from BEAMS table)

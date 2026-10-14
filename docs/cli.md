@@ -1,8 +1,7 @@
 # CLI usage
 
-The `convolvers` binary is the command-line interface, a port of `beamcon_2D`
-and `beamcon_3D` from
-[RACS-tools](https://github.com/alecthomson/RACS-tools). Install it with:
+`convolvers 2d` and `convolvers 3d` do the jobs of `beamcon_2D` and
+`beamcon_3D`. Install with:
 
 ```sh
 cargo install convolve-rs

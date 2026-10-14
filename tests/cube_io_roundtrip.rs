@@ -200,7 +200,7 @@ fn natural_mode_write_channel_and_beams() {
     }
 }
 
-/// CASAMBM must be a FITS *logical* (readable as `bool`), not a quoted string —
+/// CASAMBM must be a FITS *logical* (readable as `bool`), not a quoted string:
 /// casacore/CARTA read it with `asBool` and fail to open the cube otherwise.
 /// Also pins the BEAMS-table column units that casacore needs.
 #[test]
@@ -247,7 +247,7 @@ fn casambm_is_logical_not_string() {
 
 // ── End-to-end CLI smoke tests ─────────────────────────────────────────────────
 //
-// Drive the actual `convolvers` binary on a synthetic cube — the same path that
+// Drive the actual `convolvers` binary on a synthetic cube, the same path that
 // hit the cfitsio 302 crash.  These exercise argument parsing, the full
 // init → smooth → write pipeline, and beamlog output.
 
@@ -263,7 +263,7 @@ fn make_varied_cube(path: &std::path::Path) {
         .open()
         .unwrap();
     let hdu = f.primary_hdu().unwrap();
-    // A single bright central pixel per channel — well-defined to convolve.
+    // A single bright central pixel per channel; well-defined to convolve.
     let mut data = vec![0.0f32; NX * NY * NFREQ];
     for c in 0..NFREQ {
         data[c * NX * NY + (NY / 2) * NX + NX / 2] = 1.0;
@@ -338,7 +338,7 @@ fn cli_total_mode_smooths_cube() {
     assert!(common.major_arcsec() >= 16.0 + (NFREQ as f64 - 1.0));
 
     // Every channel the streaming writer produced must hold real, finite pixels
-    // (a point source convolved to a Gaussian) — not zeros or NaNs.
+    // (a point source convolved to a Gaussian), not zeros or NaNs.
     for c in 0..NFREQ {
         let plane = read_channel::<f32>(&out, c, &meta);
         assert!(
@@ -580,7 +580,7 @@ fn make_cube_masked_chan1(path: &std::path::Path) {
 }
 
 /// A masked-beam channel must be written as NaN (explicit no-data), while the
-/// valid channels stay finite — never zero-filled or corrupted to infinity by a
+/// valid channels stay finite, never zero-filled or corrupted to infinity by a
 /// divide-by-zero in the analytic UV filter.
 #[test]
 fn cli_masked_channel_is_blanked_not_infinite() {
@@ -680,7 +680,7 @@ fn cli_verbose_logs_per_channel_beams() {
     );
 }
 
-/// Build a 4D cube in CASA axis order — RA, DEC, STOKES, FREQ — with one Stokes
+/// Build a 4D cube in CASA axis order (RA, DEC, STOKES, FREQ) with one Stokes
 /// plane, a varying beam per channel (via BEAMS), and the reference channel on
 /// axis 4.
 fn make_casa_order_cube(path: &std::path::Path) {

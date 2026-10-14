@@ -12,23 +12,20 @@ use crate::common_beam::common_beam as rust_common_beam;
 use crate::convolve_uv::FftFloat;
 use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
 
-/// A 2-D Gaussian representation of a radio telescope's PSF (beam).
-///
-/// All axes use FITS conventions: FWHM major and minor axes in degrees,
-/// position angle in degrees East of North.
+fn value_error(e: impl std::fmt::Display) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
+/// A 2D elliptical Gaussian beam (PSF).
 ///
 /// Args:
 ///     major_deg: FWHM major axis in degrees (FITS BMAJ).
-///     minor_deg: FWHM minor axis in degrees (FITS BMIN). Must be <= major_deg.
+///     minor_deg: FWHM minor axis in degrees (FITS BMIN), at most ``major_deg``.
 ///     pa_deg: Position angle in degrees East of North (FITS BPA).
 ///
 /// Raises:
-///     ValueError: If minor_deg > major_deg or any value is non-finite.
-///
-/// See Also:
-///     Beam.from_arcsec: Construct from arcsecond axes.
-///     Beam.from_fits_header: Construct from an astropy FITS header.
-///     Beam.from_radio_beam: Construct from a ``radio_beam.Beam`` object.
+///     ValueError: If ``minor_deg > major_deg``, an axis is negative, or a
+///         value is not finite.
 ///
 /// Examples:
 ///     >>> from convolve_rs import Beam
@@ -55,26 +52,14 @@ impl PyBeam {
     fn new(major_deg: f64, minor_deg: f64, pa_deg: f64) -> PyResult<Self> {
         Beam::new(major_deg, minor_deg, pa_deg)
             .map(|inner| Self { inner })
-            .map_err(|e| PyValueError::new_err(e.to_string()))
+            .map_err(value_error)
     }
 
-    /// Construct a Beam from arcsecond axes.
-    ///
-    /// Args:
-    ///     major_arcsec: FWHM major axis in arcseconds.
-    ///     minor_arcsec: FWHM minor axis in arcseconds. Must be <= major_arcsec.
-    ///     pa_deg: Position angle in degrees East of North.
-    ///
-    /// Returns:
-    ///     Beam: The constructed beam.
-    ///
-    /// Raises:
-    ///     ValueError: If minor_arcsec > major_arcsec or any value is non-finite.
+    /// A beam from FWHM axes in arcseconds and a PA in degrees.
     ///
     /// Examples:
     ///     >>> from convolve_rs import Beam
-    ///     >>> beam = Beam.from_arcsec(18.0, 14.4, 30.0)
-    ///     >>> beam.major_deg
+    ///     >>> Beam.from_arcsec(18.0, 14.4, 30.0).major_deg
     ///     0.005
     #[classmethod]
     fn from_arcsec<'py>(
@@ -83,8 +68,7 @@ impl PyBeam {
         minor_arcsec: f64,
         pa_deg: f64,
     ) -> PyResult<Bound<'py, PyBeam>> {
-        let beam = Beam::from_arcsec(major_arcsec, minor_arcsec, pa_deg)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let beam = Beam::from_arcsec(major_arcsec, minor_arcsec, pa_deg).map_err(value_error)?;
         new_instance(cls, beam)
     }
 
@@ -118,34 +102,17 @@ impl PyBeam {
         self.inner.minor_arcsec()
     }
 
-    /// Solid angle of the beam in steradians.
-    ///
-    /// Computed as ``(pi / (4 ln 2)) * major_rad * minor_rad``.
-    ///
-    /// Returns:
-    ///     float: Beam solid angle in steradians.
+    /// Solid angle in steradians, ``pi / (4 ln 2) * major_rad * minor_rad``.
     fn area_sr(&self) -> f64 {
         self.inner.area_sr()
     }
 
-    /// Deconvolve ``other`` from ``self`` (i.e. ``self`` = result ⊛ ``other``).
-    ///
-    /// Subtracts the Gaussian covariance matrices and reads off the residual
-    /// ellipse (Wild 1970).
-    ///
-    /// Args:
-    ///     other (Beam): The PSF to deconvolve from this beam.
-    ///
-    /// Returns:
-    ///     Beam: The deconvolved beam.
+    /// The beam that, convolved with ``other``, gives this one.
     ///
     /// Raises:
-    ///     ValueError: If ``other`` is larger than ``self`` and deconvolution
-    ///         is impossible.
+    ///     ValueError: If ``other`` does not fit inside this beam.
     ///
     /// Examples:
-    ///     Deconvolution inverts convolution:
-    ///
     ///     >>> from convolve_rs import Beam
     ///     >>> a = Beam.from_arcsec(3.0, 3.0, 0.0)
     ///     >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
@@ -161,24 +128,13 @@ impl PyBeam {
             .borrow()
             .inner
             .deconvolve(&other.inner)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            .map_err(value_error)?;
         new_instance(&slf.get_type(), beam)
     }
 
-    /// Convolve ``self`` with ``other``.
-    ///
-    /// Adds the Gaussian covariance matrices and reads off the resulting
-    /// ellipse (Wild 1970).
-    ///
-    /// Args:
-    ///     other (Beam): The beam to convolve with.
-    ///
-    /// Returns:
-    ///     Beam: The convolved beam.
+    /// This beam convolved with ``other``.
     ///
     /// Examples:
-    ///     Convolving two circular beams adds their axes in quadrature:
-    ///
     ///     >>> from convolve_rs import Beam
     ///     >>> a = Beam.from_arcsec(3.0, 3.0, 0.0)
     ///     >>> b = Beam.from_arcsec(4.0, 4.0, 0.0)
@@ -199,7 +155,7 @@ impl PyBeam {
     }
 
     fn __str__(&self) -> String {
-        format!("{}", self.inner)
+        self.inner.to_string()
     }
 }
 
@@ -210,27 +166,17 @@ fn new_instance<'py>(cls: &Bound<'py, PyType>, beam: Beam) -> PyResult<Bound<'py
         .downcast_into::<PyBeam>()?)
 }
 
-/// Find the smallest beam that every beam in ``beams`` can be convolved to.
+/// The smallest beam every beam in ``beams`` can be convolved to.
 ///
-/// Uses the 2-beam analytic CASA algorithm when ``len(beams) == 2``, otherwise
-/// the Khachiyan minimum-volume-enclosing-ellipse algorithm — the same as
-/// ``radio_beam.Beams.common_beam(method='pts')``.
-///
-/// Args:
-///     beams (list[Beam]): Input beams. Must contain at least one element.
-///     tolerance (float): Convergence tolerance for the Khachiyan algorithm.
-///         Default ``1e-4``.
-///     nsamps (int): Number of points sampled from each beam ellipse boundary.
-///         Default 200.
-///     epsilon (float): Fractional padding added to each beam before the MVE
-///         fit, to ensure the common beam can be marginally deconvolved from
-///         all inputs. Default ``5e-4``.
+/// Uses the CASA formula for two beams and otherwise the minimum-volume
+/// ellipse fit of ``radio_beam.Beams.common_beam(method='pts')``, with the
+/// same ``tolerance``, ``nsamps`` and ``epsilon``.
 ///
 /// Returns:
-///     Beam: The smallest common beam, of the same class as ``beams[0]``.
+///     Beam: The common beam, of the same class as ``beams[0]``.
 ///
 /// Raises:
-///     ValueError: If ``beams`` is empty or no valid common beam is found.
+///     ValueError: If ``beams`` is empty or no common beam is found.
 ///
 /// Examples:
 ///     >>> from convolve_rs import Beam, common_beam
@@ -238,8 +184,6 @@ fn new_instance<'py>(cls: &Bound<'py, PyType>, beam: Beam) -> PyResult<Bound<'py
 ///     >>> b2 = Beam.from_arcsec(12.0, 6.0, 60.0)
 ///     >>> cb = common_beam([b1, b2])
 ///     >>> cb.major_arcsec >= 12.0
-///     True
-///     >>> cb.area_sr() >= max(b1.area_sr(), b2.area_sr())
 ///     True
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
@@ -251,62 +195,40 @@ fn common_beam<'py>(
     epsilon: f64,
 ) -> PyResult<Bound<'py, PyBeam>> {
     let rust_beams: Vec<Beam> = beams.iter().map(|b| b.borrow().inner).collect();
-    let beam = rust_common_beam(&rust_beams, tolerance, nsamps, epsilon)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let beam = rust_common_beam(&rust_beams, tolerance, nsamps, epsilon).map_err(value_error)?;
     new_instance(&beams[0].get_type(), beam)
 }
 
-/// Resolve a FITS `BUNIT` string to a [`BrightnessUnit`], warning (and assuming
-/// Jy/beam) when the string is given but not recognised.
 fn resolve_unit(py: Python<'_>, bunit: Option<&str>) -> PyResult<BrightnessUnit> {
-    match bunit {
-        Some(s) => match BrightnessUnit::parse(s) {
-            Some(unit) => Ok(unit),
-            None => {
-                let msg = std::ffi::CString::new(format!(
-                    "Could not determine brightness unit from bunit={s:?}; \
-                     assuming Jy/beam (flux scaling applied). Pass a recognised \
-                     unit (e.g. 'Jy/beam' or 'K') to silence this warning."
-                ))?;
-                PyErr::warn(py, &py.get_type::<PyUserWarning>(), &msg, 2)?;
-                Ok(BrightnessUnit::JyPerBeam)
-            }
-        },
-        None => Ok(BrightnessUnit::default()),
+    let Some(s) = bunit else {
+        return Ok(BrightnessUnit::default());
+    };
+    if let Some(unit) = BrightnessUnit::parse(s) {
+        return Ok(unit);
     }
+    let msg = std::ffi::CString::new(BrightnessUnit::unrecognised_message(s))?;
+    PyErr::warn(py, &py.get_type::<PyUserWarning>(), &msg, 2)?;
+    Ok(BrightnessUnit::JyPerBeam)
 }
 
-/// Convolve one already-extracted `T`-typed array and box the result as a numpy
-/// array of the same dtype. Shared by the f32 and f64 arms of [`smooth`] so the
-/// two precisions cannot drift apart.
-///
-/// The input is read straight from numpy's buffer (in whatever layout it has)
-/// rather than copied, and the GIL is released for the convolution so other
-/// Python threads, e.g. a thread-pool executor smoothing several planes at once,
-/// run in parallel with it. The result is handed to numpy without a copy.
-#[allow(clippy::too_many_arguments)]
-fn smooth_typed<'py, T>(
+/// Smooth a numpy array in its own dtype, with the GIL released so other
+/// Python threads can run.
+fn smooth_typed<'py, T: FftFloat + numpy::Element>(
     py: Python<'py>,
     arr: PyReadonlyArray2<'py, T>,
-    old_beam: &Beam,
-    new_beam: &Beam,
-    dx_deg: f64,
-    dy_deg: f64,
+    beams: (&Beam, &Beam),
+    (dx_deg, dy_deg): (f64, f64),
     unit: BrightnessUnit,
-) -> PyResult<Bound<'py, PyAny>>
-where
-    T: FftFloat + numpy::Element,
-{
+) -> PyResult<Bound<'py, PyAny>> {
     let view = arr.as_array();
     let out = py
-        .detach(|| rust_smooth(view, old_beam, new_beam, dx_deg, dy_deg, unit, None))
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        .detach(|| rust_smooth(view, beams.0, beams.1, dx_deg, dy_deg, unit, None))
+        .map_err(value_error)?;
     Ok(out.into_pyarray(py).into_any())
 }
 
-/// `image` in native byte order: FITS data is big-endian (numpy dtype ``>f4``),
-/// which the typed extraction below does not accept, so such an array is
-/// converted once. Native-order arrays (and non-arrays) are returned as is.
+/// `image` in native byte order. FITS data is big-endian, which numpy's typed
+/// extraction rejects.
 fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let Ok(dtype) = image.getattr("dtype") else {
         return Ok(image.clone());
@@ -320,65 +242,41 @@ fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAn
 
 /// Smooth an image from ``old_beam`` to ``new_beam``.
 ///
-/// Convolves ``image`` in the UV plane and applies the flux scaling
-/// appropriate for ``bunit`` so that the output is in the same units as the
-/// input: Jy/beam images get the Gaussian beam-area factor, Kelvin
-/// (brightness temperature) images conserve surface brightness and are left
-/// unscaled.
+/// Jy/beam images are scaled by the beam-area ratio so they stay in Jy/beam;
+/// Kelvin images are not scaled. The GIL is released while the image is
+/// convolved, so calls from several threads run in parallel.
 ///
 /// Args:
-///     image (numpy.ndarray): Input image, shape ``(ny, nx)``, dtype
-///         ``float32`` or ``float64`` in either byte order (so data straight
-///         from ``astropy.io.fits``, which is big-endian, is accepted). The
-///         convolution runs in the input's precision and the output keeps the
-///         same precision, in native byte order. The GIL is released while
-///         the image is convolved, so calls from several threads run in
-///         parallel; do not modify the array from another thread meanwhile.
-///     old_beam (Beam): Current (input) restoring beam.
-///     new_beam (Beam): Target (output) restoring beam. ``old_beam``
-///         convolved with some Gaussian must give ``new_beam``.
-///     dx_deg (float): Pixel size along the x (RA) axis in degrees
-///         (FITS CDELT1; the sign is ignored).
-///     dy_deg (float): Pixel size along the y (Dec) axis in degrees
-///         (FITS CDELT2; the sign is ignored).
-///     cutoff_arcsec (float, optional): If given, raise ``ValueError`` when
-///         the BMAJ of ``old_beam`` exceeds this value in arcseconds.
-///     bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
-///         Kelvin (e.g. ``"K"``), surface brightness is conserved and no flux
-///         scaling is applied; if it denotes Jy/beam, the Gaussian
-///         flux-scaling factor is applied. An unrecognised string emits a
-///         ``UserWarning`` and is treated as Jy/beam. Defaults to Jy/beam.
+///     image (numpy.ndarray): 2D ``float32`` or ``float64`` array, in either
+///         byte order. The output has the same dtype in native byte order.
+///     old_beam (Beam): Current beam.
+///     new_beam (Beam): Target beam; ``old_beam`` convolved with some
+///         Gaussian must give it.
+///     dx_deg (float): Pixel size along x in degrees (CDELT1; sign ignored).
+///     dy_deg (float): Pixel size along y in degrees (CDELT2; sign ignored).
+///     cutoff_arcsec (float, optional): Raise ``ValueError`` if the BMAJ of
+///         ``old_beam`` exceeds this.
+///     bunit (str, optional): FITS ``BUNIT``. ``"K"`` means no flux scaling;
+///         an unrecognised value warns and is treated as Jy/beam (the default).
 ///
 /// Returns:
-///     numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same precision as
-///         the input (``float32`` or ``float64``), native byte order. An
-///         all-NaN image is returned unchanged.
+///     numpy.ndarray: The smoothed image. An all-NaN image is returned as is.
 ///
 /// Raises:
 ///     ValueError: If ``new_beam`` cannot be reached from ``old_beam``,
 ///         ``old_beam`` has zero size, its BMAJ exceeds ``cutoff_arcsec``, or
-///         ``image`` is not a 2-D float array.
-///
-/// Warns:
-///     UserWarning: If ``bunit`` is given but not recognised as either a
-///         Kelvin or Jy/beam unit (Jy/beam is then assumed).
+///         ``image`` is not a 2D float array.
 ///
 /// Examples:
-///     Smoothing a flat Jy/beam image from a 10″ to a 20″ circular beam
-///     scales pixel values by the beam-area ratio (4); in Kelvin, surface
-///     brightness is conserved:
-///
 ///     >>> import numpy as np
 ///     >>> from convolve_rs import Beam, smooth
 ///     >>> image = np.ones((64, 64), dtype=np.float32)
 ///     >>> old = Beam.from_arcsec(10.0, 10.0, 0.0)
 ///     >>> new = Beam.from_arcsec(20.0, 20.0, 0.0)
 ///     >>> dx = 2.5 / 3600.0
-///     >>> jy = smooth(image, old, new, dx, dx)
-///     >>> round(float(jy[32, 32]), 3)
+///     >>> round(float(smooth(image, old, new, dx, dx)[32, 32]), 3)
 ///     4.0
-///     >>> k = smooth(image, old, new, dx, dx, bunit="K")
-///     >>> round(float(k[32, 32]), 3)
+///     >>> round(float(smooth(image, old, new, dx, dx, bunit="K")[32, 32]), 3)
 ///     1.0
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
@@ -394,74 +292,41 @@ fn smooth<'py>(
     cutoff_arcsec: Option<f64>,
     bunit: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let bmaj = old_beam.inner.major_arcsec();
     if let Some(cutoff) = cutoff_arcsec
-        && old_beam.inner.major_arcsec() > cutoff
+        && bmaj > cutoff
     {
         return Err(PyValueError::new_err(format!(
-            "old_beam BMAJ ({:.2}\") exceeds the cutoff ({cutoff}\")",
-            old_beam.inner.major_arcsec()
+            "old_beam BMAJ ({bmaj:.2}\") exceeds the cutoff ({cutoff}\")"
         )));
     }
     let unit = resolve_unit(py, bunit)?;
     let image = &native_byte_order(image)?;
-
-    // Dispatch on the input dtype so the convolution runs at the array's native
-    // precision and the output keeps that dtype. f32 (the common case) is tried
-    // first; f64 arrays take the f64 path.
+    let beams = (&old_beam.inner, &new_beam.inner);
     if let Ok(arr) = image.extract::<PyReadonlyArray2<f32>>() {
-        return smooth_typed(
-            py,
-            arr,
-            &old_beam.inner,
-            &new_beam.inner,
-            dx_deg,
-            dy_deg,
-            unit,
-        );
+        return smooth_typed(py, arr, beams, (dx_deg, dy_deg), unit);
     }
     if let Ok(arr) = image.extract::<PyReadonlyArray2<f64>>() {
-        return smooth_typed(
-            py,
-            arr,
-            &old_beam.inner,
-            &new_beam.inner,
-            dx_deg,
-            dy_deg,
-            unit,
-        );
+        return smooth_typed(py, arr, beams, (dx_deg, dy_deg), unit);
     }
-
     Err(PyValueError::new_err(
         "image must be a 2-D float32 or float64 numpy array",
     ))
 }
 
-/// Compute the flux-scaling factor for a Jy/beam convolution.
-///
-/// Returns the factor by which pixel values must be multiplied after
-/// convolving a Jy/beam image from ``orig_beam`` to ``conv_beam``.
-///
-/// Args:
-///     conv_beam (Beam): The convolving beam (the kernel applied on top of
-///         ``orig_beam``).
-///     orig_beam (Beam): The original restoring beam of the image.
-///     dx_arcsec (float): Pixel size along the x axis in arcseconds.
-///     dy_arcsec (float): Pixel size along the y axis in arcseconds.
+/// The factor that keeps a Jy/beam image in Jy/beam after convolving it from
+/// ``orig_beam`` with the kernel ``conv_beam``. Pixel sizes are in arcsec.
 ///
 /// Returns:
-///     tuple: ``(fac, amp, bmaj_out, bmin_out, bpa_out_deg)`` where
-///         ``fac`` is the pixel scaling factor, ``amp`` is the Gaussian kernel
-///         integral, and the remaining three are the output beam parameters
-///         (major/minor FWHM in arcseconds, PA in degrees).
+///     tuple: ``(fac, amp, bmaj, bmin, bpa)``: the pixel factor, the kernel
+///     amplitude, and the resulting beam (arcsec, arcsec, degrees).
 ///
 /// Examples:
 ///     >>> from convolve_rs import Beam, gauss_factor
 ///     >>> conv = Beam.from_arcsec(5.0, 5.0, 0.0)
 ///     >>> orig = Beam.from_arcsec(10.0, 10.0, 0.0)
 ///     >>> fac, amp, bmaj, bmin, bpa = gauss_factor(conv, orig, 2.5, 2.5)
-///     >>> fac > 0.0
-///     True
-///     >>> round(bmaj, 5)  # √(10² + 5²)
+///     >>> round(bmaj, 5)
 ///     11.18034
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
@@ -489,10 +354,9 @@ pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 #[cfg(feature = "stubgen")]
 #[pyfunction]
 fn _generate_stubs() -> PyResult<()> {
-    // CARGO_MANIFEST_DIR is only set by Cargo; fall back to cwd when called from Python
+    // CARGO_MANIFEST_DIR is only set by cargo.
     if std::env::var("CARGO_MANIFEST_DIR").is_err() {
-        let cwd = std::env::current_dir()
-            .map_err(|e| PyValueError::new_err(format!("cannot get cwd: {e}")))?;
+        let cwd = std::env::current_dir().map_err(value_error)?;
         #[allow(unused_unsafe)]
         unsafe {
             std::env::set_var("CARGO_MANIFEST_DIR", cwd);
