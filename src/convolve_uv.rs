@@ -24,14 +24,16 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftNum, FftPlanner, num_complex::Complex};
 use thiserror::Error;
 
-use crate::beam::{Beam, gauss_factor};
+use crate::beam::Beam;
 
 #[derive(Debug, Error)]
 pub enum ConvolveError {
-    #[error("image is entirely NaN")]
-    AllNaN,
-    #[error("beam larger than cutoff — image blanked")]
+    #[error("input beam BMAJ exceeds the cutoff")]
     AboveCutoff,
+    #[error("input beam {0} has zero size")]
+    ZeroSizeBeam(Beam),
+    #[error("target beam {new} cannot be reached by convolving {old}")]
+    Unreachable { old: Beam, new: Beam },
 }
 
 /// Floating-point element type a convolution can run in: `f32` or `f64`.
@@ -145,8 +147,12 @@ impl<T: FftFloat> PlaneInput<'_, T> {
         let zero_nan = |x: T| if x.is_nan() { T::zero() } else { x };
         match self {
             PlaneInput::Owned(a) if a.is_standard_layout() => {
+                let len = a.len();
                 let (mut buf, offset) = a.into_raw_vec_and_offset();
-                debug_assert_eq!(offset.unwrap_or(0), 0);
+                // A sliced array keeps its parent's buffer; in standard layout
+                // its elements are the `len` values starting at `offset`.
+                buf.drain(..offset.unwrap_or(0));
+                buf.truncate(len);
                 for x in buf.iter_mut() {
                     *x = zero_nan(*x);
                 }
@@ -305,6 +311,15 @@ pub(crate) fn convolve_plane<T: FftFloat>(
             scaling_factor: 1.0,
         });
     }
+    if !(old_beam.major_deg > 0.0 && old_beam.minor_deg > 0.0) {
+        return Err(ConvolveError::ZeroSizeBeam(*old_beam));
+    }
+    if !new_beam.contains(old_beam) {
+        return Err(ConvolveError::Unreachable {
+            old: *old_beam,
+            new: *new_beam,
+        });
+    }
 
     let (nrows, ncols) = image.view().dim();
     assert_eq!(
@@ -317,19 +332,11 @@ pub(crate) fn convolve_plane<T: FftFloat>(
 
     let nan_count = image.view().iter().filter(|x| x.is_nan()).count();
 
-    // All-NaN fast path.
+    let taper = UvTaper::new(old_beam, new_beam);
     if nan_count == nrows * ncols {
-        // Compute the convolving beam (new² - old² in quadrature) and flux scaling.
-        let conv_beam = new_beam.deconvolve_or_zero(old_beam);
-        let (fac, ..) = gauss_factor(
-            &conv_beam,
-            old_beam,
-            dx_deg.abs() * 3600.0,
-            dy_deg.abs() * 3600.0,
-        );
         return Ok(ConvolutionResult {
             image: image.into_owned(),
-            scaling_factor: fac,
+            scaling_factor: taper.ratio,
         });
     }
 
@@ -339,12 +346,13 @@ pub(crate) fn convolve_plane<T: FftFloat>(
     // `fftfreq` rather than using `rfftfreq` so the filter is evaluated at exactly
     // the frequencies the equivalent full FFT assigns to bins 0..nhalf (incl. the
     // signed Nyquist), keeping results aligned with the full-FFT port.
-    let taper = UvTaper::new(old_beam, new_beam);
+    // Rows run along y (CDELT2), columns along x (CDELT1). Only the magnitudes
+    // matter: passing a negative CDELT1 to fftfreq would mirror the PA.
     let grid = UvGrid::new(
         nrows,
         ncols,
-        dx_deg.to_radians(),
-        dy_deg.to_radians(),
+        dy_deg.abs().to_radians(),
+        dx_deg.abs().to_radians(),
         &taper,
     );
     let npix = (nrows * ncols) as f64;
@@ -362,11 +370,9 @@ pub(crate) fn convolve_plane<T: FftFloat>(
                 .map(|x| if x.is_nan() { T::one() } else { T::zero() }),
         );
         convolve_in_place(&mut mask, &taper, taper.ratio / npix, &grid, plans);
-        // A fully-NaN-covered pixel reaches the filter's DC gain (g_ratio ≥ 1) in
-        // the convolved mask; isolated NaNs stay well below 1 and are interpolated
-        // over. The threshold sits just under 1 so that f32 round-off — which can
-        // leave a solid-NaN interior at ~0.999 when the beams are nearly equal
-        // (g_ratio ≈ 1) — does not silently un-blank a masked region.
+        // Blank where the convolved mask reaches 0.99 rather than 1. With nearly
+        // equal beams (g_ratio ≈ 1) a solid NaN region sits at 1 minus round-off
+        // and the NaN pixels on its edge just under 1; both must stay blank.
         let blank_threshold = T::one() - cast_saturating::<T>(1e-2);
         Bitset::from_predicate(&mask, |m| m >= blank_threshold)
     });
@@ -523,10 +529,16 @@ struct UvGrid {
 }
 
 impl UvGrid {
-    fn new(nrows: usize, ncols: usize, dx_rad: f64, dy_rad: f64, taper: &UvTaper) -> Self {
-        let u = fftfreq(nrows, dx_rad);
+    fn new(
+        nrows: usize,
+        ncols: usize,
+        row_step_rad: f64,
+        col_step_rad: f64,
+        taper: &UvTaper,
+    ) -> Self {
+        let u = fftfreq(nrows, row_step_rad);
         let au2 = u.iter().map(|&u| taper.a * u * u).collect();
-        let mut v = fftfreq(ncols, dy_rad);
+        let mut v = fftfreq(ncols, col_step_rad);
         v.truncate(ncols / 2 + 1);
         Self { u, au2, v }
     }
@@ -893,6 +905,137 @@ mod tests {
         let b = convolve_uv_owned_with_plans(img, &old, &new, dx, dx, None, &plans).unwrap();
         for (x, y) in a.image.iter().zip(b.image.iter()) {
             assert_eq!(x.to_bits(), y.to_bits());
+        }
+    }
+
+    /// A row-sliced owned array keeps its parent's buffer at an offset; the
+    /// owned path must convolve the slice, not the parent's leading rows.
+    #[test]
+    fn test_owned_sliced_rows() {
+        use ndarray::s;
+        let dx = 2.5 / 3600.0;
+        let old = Beam::from_arcsec(6.0, 6.0, 0.0).unwrap();
+        let new = Beam::from_arcsec(11.0, 9.0, 15.0).unwrap();
+        for nans in [false, true] {
+            let parent = test_image(48, 30, nans);
+            for sl in [s![5..45, ..], s![..40, ..]] {
+                let owned = parent.clone().slice_move(sl);
+                assert!(owned.is_standard_layout());
+                let plans = FftPlans::<f64>::new(40, 30);
+                let want =
+                    convolve_uv_with_plans(&owned.to_owned(), &old, &new, dx, dx, None, &plans)
+                        .unwrap();
+                let got =
+                    convolve_uv_owned_with_plans(owned, &old, &new, dx, dx, None, &plans).unwrap();
+                for (a, b) in want.image.iter().zip(got.image.iter()) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+            }
+        }
+    }
+
+    /// The sign of a pixel size must not change the result (CDELT1 is
+    /// normally negative).
+    #[test]
+    fn test_negative_pixel_size_keeps_pa() {
+        let old = Beam::from_arcsec(8.0, 5.0, 30.0).unwrap();
+        let new = Beam::from_arcsec(16.0, 9.0, 70.0).unwrap();
+        let img = test_image(40, 36, false);
+        let d = 2.0 / 3600.0;
+        let pos = convolve_uv(&img, &old, &new, d, d, None).unwrap().image;
+        for (dx, dy) in [(-d, d), (d, -d), (-d, -d)] {
+            let got = convolve_uv(&img, &old, &new, dx, dy, None).unwrap().image;
+            for (a, b) in pos.iter().zip(got.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "dx={dx} dy={dy}");
+            }
+        }
+    }
+
+    /// Second moments (arcsec²) along columns (x) and rows (y) of `img`.
+    fn moments(img: &Array2<f64>, dx_as: f64, dy_as: f64) -> (f64, f64) {
+        let total: f64 = img.sum();
+        let (mut cy, mut cx) = (0.0, 0.0);
+        for ((i, j), &v) in img.indexed_iter() {
+            cy += v * i as f64;
+            cx += v * j as f64;
+        }
+        let (cy, cx) = (cy / total, cx / total);
+        let (mut vy, mut vx) = (0.0, 0.0);
+        for ((i, j), &v) in img.indexed_iter() {
+            vy += v * (i as f64 - cy).powi(2);
+            vx += v * (j as f64 - cx).powi(2);
+        }
+        (vx / total * dx_as * dx_as, vy / total * dy_as * dy_as)
+    }
+
+    /// With rectangular pixels the kernel has the same angular size along x
+    /// and y; rows use CDELT2 and columns CDELT1.
+    #[test]
+    fn test_non_square_pixels() {
+        let old = Beam::from_arcsec(6.0, 6.0, 0.0).unwrap();
+        let new = Beam::from_arcsec(12.0, 12.0, 0.0).unwrap();
+        let (dx_as, dy_as) = (1.5, 3.0);
+        let mut img = Array2::<f64>::zeros((64, 96));
+        img[(32, 48)] = 1.0;
+        let res = convolve_uv(&img, &old, &new, dx_as / 3600.0, dy_as / 3600.0, None).unwrap();
+        let (vx, vy) = moments(&res.image, dx_as, dy_as);
+        let fwhm_to_sigma = 1.0 / (8.0 * 2f64.ln()).sqrt();
+        let want = (144.0 - 36.0) * fwhm_to_sigma * fwhm_to_sigma;
+        assert!((vx / want - 1.0).abs() < 1e-3, "x variance {vx} vs {want}");
+        assert!((vy / want - 1.0).abs() < 1e-3, "y variance {vy} vs {want}");
+    }
+
+    #[test]
+    fn test_unreachable_and_zero_beams_are_errors() {
+        let img = test_image(16, 16, false);
+        let d = 2.0 / 3600.0;
+        let small = Beam::from_arcsec(10.0, 10.0, 0.0).unwrap();
+        let big = Beam::from_arcsec(20.0, 10.0, 0.0).unwrap();
+        assert!(matches!(
+            convolve_uv(&img, &big, &small, d, d, None),
+            Err(ConvolveError::Unreachable { .. })
+        ));
+        assert!(matches!(
+            convolve_uv(&img, &Beam::zero(), &small, d, d, None),
+            Err(ConvolveError::ZeroSizeBeam(_))
+        ));
+        // A one-dimensional kernel is fine.
+        let round = Beam::from_arcsec(20.0, 20.0, 0.0).unwrap();
+        assert!(convolve_uv(&img, &big, &round, d, d, None).is_ok());
+    }
+
+    /// An all-NaN image comes back as is, with the same scaling factor a
+    /// finite image would get.
+    #[test]
+    fn test_all_nan_scaling_factor() {
+        let d = 2.5 / 3600.0;
+        let old = Beam::from_arcsec(10.0, 10.0, 0.0).unwrap();
+        let new = Beam::from_arcsec(20.0, 20.0, 0.0).unwrap();
+        let nan = Array2::from_elem((16, 16), f32::NAN);
+        let res = convolve_uv(&nan, &old, &new, d, d, None).unwrap();
+        assert!(res.image.iter().all(|x| x.is_nan()));
+        assert!((res.scaling_factor - 2.0).abs() < 1e-12);
+    }
+
+    /// With nearly equal beams the kernel is narrower than a pixel, so every
+    /// NaN input pixel must still be NaN in the output, including the edge of
+    /// a blanked block, where the mask falls just short of 1.
+    #[test]
+    fn test_near_equal_beams_keep_nan_block() {
+        let d = 2.5 / 3600.0;
+        let old = Beam::from_arcsec(10.0, 10.0, 0.0).unwrap();
+        let new = Beam::from_arcsec(10.000001, 10.0, 0.0).unwrap();
+        assert!(!old.approx_eq(&new));
+        let n = 256;
+        let mut img = test_image(n, n, false).mapv(|x| x as f32);
+        for i in 64..192 {
+            for j in 64..192 {
+                img[(i, j)] = f32::NAN;
+            }
+        }
+        let out = convolve_uv(&img, &old, &new, d, d, None).unwrap().image;
+        for (x, y) in img.iter().zip(out.iter()) {
+            assert_eq!(x.is_nan(), y.is_nan());
         }
     }
 

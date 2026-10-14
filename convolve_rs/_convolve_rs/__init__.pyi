@@ -174,7 +174,7 @@ def common_beam(beams: typing.Sequence[Beam], tolerance: builtins.float = 0.0001
             all inputs. Default ``5e-4``.
     
     Returns:
-        Beam: The smallest common beam.
+        Beam: The smallest common beam, of the same class as ``beams[0]``.
     
     Raises:
         ValueError: If ``beams`` is empty or no valid common beam is found.
@@ -240,14 +240,14 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
             the image is convolved, so calls from several threads run in
             parallel; do not modify the array from another thread meanwhile.
         old_beam (Beam): Current (input) restoring beam.
-        new_beam (Beam): Target (output) restoring beam. Must be larger than
-            ``old_beam``.
+        new_beam (Beam): Target (output) restoring beam. ``old_beam``
+            convolved with some Gaussian must give ``new_beam``.
         dx_deg (float): Pixel size along the x (RA) axis in degrees
-            (FITS CDELT1, may be negative).
+            (FITS CDELT1; the sign is ignored).
         dy_deg (float): Pixel size along the y (Dec) axis in degrees
-            (FITS CDELT2).
-        cutoff_arcsec (float, optional): If given, raise ``ValueError`` if the
-            deconvolved kernel FWHM exceeds this value in arcseconds.
+            (FITS CDELT2; the sign is ignored).
+        cutoff_arcsec (float, optional): If given, raise ``ValueError`` when
+            the BMAJ of ``old_beam`` exceeds this value in arcseconds.
         bunit (str, optional): FITS ``BUNIT`` brightness unit. If it denotes
             Kelvin (e.g. ``"K"``), surface brightness is conserved and no flux
             scaling is applied; if it denotes Jy/beam, the Gaussian
@@ -256,11 +256,13 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
     
     Returns:
         numpy.ndarray: Smoothed image, shape ``(ny, nx)``, same precision as
-            the input (``float32`` or ``float64``), native byte order.
+            the input (``float32`` or ``float64``), native byte order. An
+            all-NaN image is returned unchanged.
     
     Raises:
-        ValueError: If ``new_beam`` is smaller than ``old_beam``, all pixels
-            are NaN, or the kernel exceeds ``cutoff_arcsec``.
+        ValueError: If ``new_beam`` cannot be reached from ``old_beam``,
+            ``old_beam`` has zero size, its BMAJ exceeds ``cutoff_arcsec``, or
+            ``image`` is not a 2-D float array.
     
     Warns:
         UserWarning: If ``bunit`` is given but not recognised as either a

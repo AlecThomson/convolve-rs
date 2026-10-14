@@ -198,10 +198,8 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     let nx = naxis1 as usize;
     let ny = naxis2 as usize;
 
-    let cdelt1: f64 = hdu.read_key(&mut fptr, "CDELT1")?;
-    let cdelt2: f64 = hdu.read_key(&mut fptr, "CDELT2")?;
-    let dx_deg = cdelt1.abs();
-    let dy_deg = cdelt2.abs();
+    let (dx_deg, dy_deg) =
+        crate::fits_io::pixel_scales(&mut fptr, &hdu).map_err(CubeError::MissingKeyword)?;
 
     // Reference channel for the spectral axis. cfitsio truncates a fractional
     // CRPIX (e.g. 144.5) to an integer, as racs_tools' `int(crpix)` does.
@@ -330,27 +328,39 @@ fn read_casambm_beams(path: &Path, nfreq: usize) -> Result<Vec<Option<Beam>>, Cu
         });
     }
 
-    let tiny = f32::MIN_POSITIVE as f64;
-    let beams = bmaj
-        .iter()
-        .zip(bmin.iter())
-        .zip(bpa.iter())
-        .map(|((&maj_as, &min_as), &pa_deg)| {
-            let maj_deg = maj_as as f64 / 3600.0;
-            let min_deg = min_as as f64 / 3600.0;
-            let pa = pa_deg as f64;
-            // Treat tiny/zero beams as masked. `<=` (not `<`) so the `tiny`
-            // sentinel that `init_output_cube` writes for a masked channel is
-            // detected as masked on read-back — otherwise it round-trips to a
-            // bogus ~1e-38° beam.
-            if maj_deg <= tiny || !maj_deg.is_finite() {
-                None
-            } else {
-                Beam::new(maj_deg, min_deg.max(tiny), pa).ok()
-            }
+    let beams = (0..nfreq)
+        .map(|c| {
+            beam_from_row(
+                f64::from(bmaj[c]),
+                f64::from(bmin[c]),
+                f64::from(bpa[c]),
+                c,
+                path,
+            )
         })
         .collect();
     Ok(beams)
+}
+
+/// Beam from one row of a beam table (arcsec, arcsec, deg).
+///
+/// Returns `None` for a masked channel: any non-finite value, or an axis no
+/// larger than the `f32::MIN_POSITIVE` sentinel written for masked channels.
+/// Swapped axes are fixed with a warning.
+fn beam_from_row(maj: f64, min: f64, pa: f64, chan: usize, path: &Path) -> Option<Beam> {
+    let tiny = f64::from(f32::MIN_POSITIVE);
+    if !(maj.is_finite() && min.is_finite() && pa.is_finite()) || maj <= tiny || min <= tiny {
+        return None;
+    }
+    if min > maj {
+        tracing::warn!(
+            "{}: channel {chan} has BMIN > BMAJ ({min}\" > {maj}\"); swapping the axes",
+            path.display()
+        );
+        let pa = if pa > 0.0 { pa - 90.0 } else { pa + 90.0 };
+        return Beam::from_arcsec(min, maj, pa).ok();
+    }
+    Beam::from_arcsec(maj, min, pa).ok()
 }
 
 // ── Reading / writing channel planes ─────────────────────────────────────────
@@ -694,7 +704,6 @@ pub fn init_output_cube(
 pub fn read_beamlog(path: &Path) -> Result<Vec<Beam>, CubeError> {
     let content = std::fs::read_to_string(path)?;
     let mut beams = Vec::new();
-    let tiny = f64::from(f32::MIN_POSITIVE);
 
     for (i, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -718,13 +727,8 @@ pub fn read_beamlog(path: &Path) -> Result<Vec<Beam>, CubeError> {
         let bmaj_as = parse(fields[1], "BMAJ")?;
         let bmin_as = parse(fields[2], "BMIN")?;
         let bpa_deg = parse(fields[3], "BPA")?;
-
-        let beam = if bmaj_as <= tiny || !bmaj_as.is_finite() {
-            Beam::zero()
-        } else {
-            Beam::from_arcsec(bmaj_as, bmin_as.max(tiny), bpa_deg)?
-        };
-        beams.push(beam);
+        let chan = beams.len();
+        beams.push(beam_from_row(bmaj_as, bmin_as, bpa_deg, chan, path).unwrap_or(Beam::zero()));
     }
     Ok(beams)
 }

@@ -56,7 +56,10 @@ pub use convolve_uv::{
     ConvolutionResult, ConvolveError, FftFloat, FftPlans, convolve_uv,
     convolve_uv_owned_with_plans, convolve_uv_with_plans, fftfreq, gaussft,
 };
-pub use fits_io::{FitsError, FitsImageData, output_path, read_fits, write_fits};
+pub use fits_io::{
+    FitsError, FitsImageData, FitsImageHeader, output_path, read_fits, read_fits_header,
+    read_fits_plane, write_fits,
+};
 pub use smooth::{BrightnessUnit, SmoothError, smooth, smooth_owned_with_plans, smooth_with_plans};
 
 #[cfg(feature = "python")]

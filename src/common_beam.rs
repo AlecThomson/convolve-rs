@@ -4,7 +4,7 @@
 //! - [`find_commonbeam_between`]: analytic CASA algorithm for exactly 2 beams.
 //! - [`common_manybeams_mve`]: Khachiyan minimum-volume-enclosing-ellipsoid for N beams.
 //! - [`common_beam`]: dispatcher that picks the appropriate algorithm.
-use crate::beam::{Beam, BeamError, deconvolve_deg};
+use crate::beam::{Beam, BeamError};
 use thiserror::Error;
 
 const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
@@ -55,6 +55,12 @@ pub fn common_beam(
     if beams.is_empty() {
         return Err(CommonBeamError::NoBeans);
     }
+    if beams
+        .iter()
+        .any(|b| !(b.major_deg.is_finite() && b.minor_deg.is_finite() && b.pa_deg.is_finite()))
+    {
+        return Err(CommonBeamError::Beam(BeamError::NotFinite));
+    }
     if beams.len() == 1 {
         return Ok(beams[0]);
     }
@@ -67,6 +73,7 @@ pub fn common_beam(
 
     if beams.len() == 2
         && let Ok(b) = find_commonbeam_between(&beams[0], &beams[1])
+        && fits_in_beam(beams, &b)
     {
         return Ok(b);
     }
@@ -88,9 +95,7 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
         (beam2, beam1)
     };
 
-    // If the large beam already contains the small beam, large beam is the answer.
-    let deconv = large_beam.deconvolve_or_zero(small_beam);
-    if deconv.is_finite() {
+    if large_beam.contains(small_beam) {
         return Ok(*large_beam);
     }
 
@@ -280,11 +285,7 @@ fn convex_hull_2d(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
     let pivot = pts
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            a[1].partial_cmp(&b[1])
-                .unwrap()
-                .then(a[0].partial_cmp(&b[0]).unwrap())
-        })
+        .min_by(|(_, a), (_, b)| a[1].total_cmp(&b[1]).then(a[0].total_cmp(&b[0])))
         .map(|(i, _)| i)
         .unwrap();
 
@@ -295,7 +296,7 @@ fn convex_hull_2d(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
     sorted.sort_by(|a, b| {
         let angle_a = (a[1] - pivot_pt[1]).atan2(a[0] - pivot_pt[0]);
         let angle_b = (b[1] - pivot_pt[1]).atan2(b[0] - pivot_pt[0]);
-        angle_a.partial_cmp(&angle_b).unwrap()
+        angle_a.total_cmp(&angle_b)
     });
 
     let mut hull: Vec<[f64; 2]> = vec![pivot_pt];
@@ -351,7 +352,7 @@ fn min_vol_ellipse(
         let j = m
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
             .unwrap();
         let maximum = m[j];
@@ -542,31 +543,14 @@ fn normalise(v: [f64; 2]) -> [f64; 2] {
 pub fn largest_beam(beams: &[Beam]) -> Beam {
     beams
         .iter()
-        .max_by(|a, b| a.area_sr().partial_cmp(&b.area_sr()).unwrap())
+        .max_by(|a, b| a.area_sr().total_cmp(&b.area_sr()))
         .copied()
         .unwrap()
 }
 
-/// True if all beams can be deconvolved from `large_beam`.
+/// True if every beam in `beams` can be convolved up to `large_beam`.
 pub fn fits_in_beam(beams: &[Beam], large_beam: &Beam) -> bool {
-    beams.iter().all(|b| {
-        if b.approx_eq(large_beam) {
-            return true;
-        }
-        let result = deconvolve_deg(
-            large_beam.major_deg,
-            large_beam.minor_deg,
-            large_beam.pa_deg,
-            b.major_deg,
-            b.minor_deg,
-            b.pa_deg,
-            true,
-        );
-        match result {
-            Ok((maj, min, _)) => maj > 0.0 && min > 0.0,
-            Err(_) => false,
-        }
-    })
+    beams.iter().all(|b| large_beam.contains(b))
 }
 
 #[cfg(test)]
@@ -588,5 +572,57 @@ mod tests {
         assert!(
             result.major_deg >= b1.major_deg.max(b2.major_deg) || fits_in_beam(&[b1, b2], &result)
         );
+    }
+
+    /// A target whose major axis equals an input's major axis still contains
+    /// it; the kernel is one-dimensional.
+    #[test]
+    fn test_equal_major_axis_fits() {
+        let target = Beam::from_arcsec(20.0, 20.0, 0.0).unwrap();
+        for pa in [0.0, 37.0, 90.0, -45.0] {
+            let b = Beam::from_arcsec(20.0, 10.0, pa).unwrap();
+            assert!(fits_in_beam(&[b], &target), "PA {pa}");
+        }
+        let common = common_beam(
+            &[target, Beam::from_arcsec(20.0, 10.0, 0.0).unwrap()],
+            1e-4,
+            200,
+            5e-4,
+        )
+        .unwrap();
+        assert!(common.approx_eq(&target), "got {common}");
+    }
+
+    #[test]
+    fn test_nan_beam_is_an_error_not_a_panic() {
+        let good = Beam::from_arcsec(10.0, 8.0, 0.0).unwrap();
+        let bad = Beam {
+            major_deg: f64::NAN,
+            minor_deg: 1e-3,
+            pa_deg: 0.0,
+        };
+        for beams in [vec![good, bad], vec![good, bad, good]] {
+            assert!(common_beam(&beams, 1e-4, 200, 5e-4).is_err());
+        }
+        assert!(!fits_in_beam(&[bad], &good));
+    }
+
+    /// The CASA two-beam solution is only used if it contains both inputs.
+    #[test]
+    fn test_two_beam_result_contains_inputs() {
+        for (a, b) in [
+            ((10.0, 8.0, 30.0), (12.0, 6.0, 60.0)),
+            // The CASA formula gives 19.6255"x8.0238" here, which does
+            // not contain the first beam.
+            (
+                (17.134150314045915, 7.278818100904679, -4.1357805889849),
+                (17.230792491993967, 4.380913928098483, 14.758744881833891),
+            ),
+        ] {
+            let b1 = Beam::from_arcsec(a.0, a.1, a.2).unwrap();
+            let b2 = Beam::from_arcsec(b.0, b.1, b.2).unwrap();
+            let common = common_beam(&[b1, b2], 1e-4, 200, 5e-4).unwrap();
+            assert!(fits_in_beam(&[b1, b2], &common), "{common}");
+        }
     }
 }

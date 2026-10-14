@@ -40,6 +40,10 @@ In this representation the beam operations are linear:
   residual stays positive-definite. If it does not, the source beam is smaller
   than the PSF and deconvolution fails.
 
+A target beam can be reached from an input beam when the residual is positive
+semi-definite. The convolving kernel may then be a line (e.g. 20″×10″ to
+20″×20″), which the UV-plane filter handles without trouble.
+
 The resulting axes and position angle are read off the eigen-pairs of $C$.
 
 ## Flux scaling
@@ -76,7 +80,8 @@ the "robust" mode of RACS-tools:
 
 NaN pixels are handled by zero-filling the data, convolving a NaN mask through
 the same filter, and re-blanking every output pixel where the smeared mask
-reaches 1.
+reaches 0.99. RACS-tools uses 1; the lower value keeps NaN pixels blank when
+the beams are nearly equal and round-off leaves the mask just under 1.
 
 Because the image is real-valued, a real-input FFT is used along the
 contiguous axis, halving spectrum memory — the dominant cost for large images.

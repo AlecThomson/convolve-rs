@@ -135,7 +135,7 @@ fn write_test_fits(
 
 /// Read image data from a FITS file.
 fn read_fits_pixels(path: &Path) -> Vec<f32> {
-    let data = convolve_rs::read_fits(path).expect("read_fits_pixels failed");
+    let data = convolve_rs::read_fits::<f32>(path).expect("read_fits_pixels failed");
     data.image.into_raw_vec_and_offset().0
 }
 

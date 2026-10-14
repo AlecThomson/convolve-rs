@@ -12,8 +12,9 @@ use convolve_rs::{
     beam::Beam,
     common_beam::{common_beam, fits_in_beam},
     convolve_uv::FftPlans,
+    cube_io::PixelType,
     cube_io::{self, CubeElem, CubeMeta, CubeMode},
-    fits_io::{output_path, read_fits, write_fits},
+    fits_io::{FitsImageHeader, output_path, read_fits_header, read_fits_plane, write_fits},
     smooth::smooth_owned_with_plans,
 };
 
@@ -129,7 +130,8 @@ struct BeamLogEntry2D {
     filename: PathBuf,
     old_beam: Beam,
     new_beam: Beam,
-    conv_beam: Beam,
+    /// `None` for a blanked image.
+    conv_beam: Option<Beam>,
 }
 
 fn cmd_2d(args: TwoDArgs) -> Result<()> {
@@ -137,50 +139,43 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
 
     let files = collect_files(&args.infile, args.listfile)?;
     let target_beam = parse_target_beam(&args.shared)?;
+    let cutoff = args.shared.cutoff;
 
     let sp = spinner(format!(
         "Reading beam parameters from {} file(s)…",
         files.len()
     ));
-    let all_beams: Vec<Beam> = files
+    let headers: Vec<FitsImageHeader> = files
         .iter()
-        .map(|f| {
-            let data = read_fits(f).with_context(|| format!("reading {}", f.display()))?;
-            if let Some(cutoff) = args.shared.cutoff
-                && data.beam.major_arcsec() > cutoff
-            {
-                sp.suspend(|| {
-                    warn!(
-                        "{}: BMAJ={:.1}\" > cutoff={:.1}\" — will be blanked",
-                        f.display(),
-                        data.beam.major_arcsec(),
-                        cutoff
-                    )
-                });
-            }
-            Ok(data.beam)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|f| read_fits_header(f).with_context(|| format!("reading {}", f.display())))
+        .collect::<Result<_>>()?;
     sp.finish_and_clear();
-
-    let mut common = match target_beam {
-        Some(b) => {
-            if !fits_in_beam(&all_beams, &b) {
-                bail!("target beam is too small — some images cannot reach it");
-            }
-            b
+    for h in &headers {
+        if !usable_beam(&h.beam, None) {
+            warn!(
+                "{}: beam {} has zero size; will be blanked",
+                h.path.display(),
+                h.beam
+            );
+        } else if !usable_beam(&h.beam, cutoff) {
+            warn!(
+                "{}: BMAJ={:.1}\" > cutoff={:.1}\"; will be blanked",
+                h.path.display(),
+                h.beam.major_arcsec(),
+                cutoff.unwrap_or_default()
+            );
         }
+    }
+
+    let valid: Vec<Beam> = headers
+        .iter()
+        .map(|h| h.beam)
+        .filter(|b| usable_beam(b, cutoff))
+        .collect();
+    anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
+    let common = match target_beam {
+        Some(b) => b,
         None => {
-            let valid: Vec<Beam> = all_beams
-                .iter()
-                .filter(|b| {
-                    b.is_finite()
-                        && !b.is_zero()
-                        && args.shared.cutoff.is_none_or(|c| b.major_arcsec() <= c)
-                })
-                .cloned()
-                .collect();
-            anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
             let sp = spinner("Solving for the common beam…");
             let cb = common_beam(
                 &valid,
@@ -190,11 +185,10 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             )
             .context("could not find common beam")?;
             sp.finish_and_clear();
-            cb
+            round_common_beam(cb, &valid)?
         }
     };
-
-    common = apply_beam_rounding(common, args.shared.circularise)?;
+    let common = finish_target(common, &valid, args.shared.circularise)?;
 
     info!("Common beam: {common}");
 
@@ -202,52 +196,43 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
         // Emit the result on stdout (tracing logs to stderr) so `--dryrun` stays
         // machine-readable for callers that capture it.
         println!("{common}");
-        info!("Dry run — no files written.");
+        info!("Dry run: no files written.");
         return Ok(());
     }
 
     let pb = progress_bar(files.len() as u64);
 
-    let results: Vec<BeamLogEntry2D> = files
+    let results: Vec<BeamLogEntry2D> = headers
         .par_iter()
-        .zip(all_beams.par_iter())
-        .map(|(file, old_beam)| {
-            pb.suspend(|| debug!("Reading {}", file.display()));
-            let data = read_fits(file).with_context(|| format!("reading {}", file.display()))?;
+        .map(|header| {
+            let file = &header.path;
             let out = output_path(
                 file,
                 Some(&args.shared.suffix),
                 args.shared.prefix.as_deref(),
                 args.shared.outdir.as_deref(),
             );
-            let conv_beam = common.deconvolve_or_zero(old_beam);
-            pb.suspend(|| {
-                debug!(
-                    "{}: current {old_beam} | target {common} | kernel {conv_beam}",
-                    file.display()
-                )
-            });
-            // Owned: the image is smoothed in the buffer it was read into.
-            let plans = FftPlans::new(data.image.nrows(), data.image.ncols());
-            let smoothed = smooth_owned_with_plans(
-                data.image,
-                old_beam,
-                &common,
-                data.dx_deg,
-                data.dy_deg,
-                args.shared.cutoff,
-                data.unit,
-                &plans,
-            )
-            .with_context(|| format!("smoothing {}", file.display()))?;
-            pb.suspend(|| debug!("Writing {}", out.display()));
-            write_fits(&smoothed, &out, file, &common, data.is_4d)
-                .with_context(|| format!("writing {}", out.display()))?;
+            let old_beam = header.beam;
+            let conv_beam =
+                usable_beam(&old_beam, cutoff).then(|| common.deconvolve_or_zero(&old_beam));
+            if let Some(conv_beam) = conv_beam {
+                pb.suspend(|| {
+                    debug!(
+                        "{}: current {old_beam} | target {common} | kernel {conv_beam}",
+                        file.display()
+                    )
+                });
+            }
+            let blank = conv_beam.is_none();
+            match header.dtype {
+                PixelType::F32 => smooth_image::<f32>(header, &out, &common, blank),
+                PixelType::F64 => smooth_image::<f64>(header, &out, &common, blank),
+            }?;
             pb.suspend(|| info!("{} → {}", file.display(), out.display()));
             pb.inc(1);
             Ok(BeamLogEntry2D {
                 filename: out,
-                old_beam: *old_beam,
+                old_beam,
                 new_beam: common,
                 conv_beam,
             })
@@ -262,9 +247,12 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             "# FileName OldBMAJ[deg] OldBMIN[deg] OldBPA[deg] TargetBMAJ[deg] TargetBMIN[deg] TargetBPA[deg] ConvBMAJ[deg] ConvBMIN[deg] ConvBPA[deg]\n",
         );
         for e in &results {
+            let conv = e.conv_beam.map_or("nan nan nan".to_string(), |b| {
+                format!("{} {} {}", b.major_deg, b.minor_deg, b.pa_deg)
+            });
             writeln!(
                 out,
-                "{} {} {} {} {} {} {} {} {} {}",
+                "{} {} {} {} {} {} {} {conv}",
                 e.filename.display(),
                 e.old_beam.major_deg,
                 e.old_beam.minor_deg,
@@ -272,9 +260,6 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
                 e.new_beam.major_deg,
                 e.new_beam.minor_deg,
                 e.new_beam.pa_deg,
-                e.conv_beam.major_deg,
-                e.conv_beam.minor_deg,
-                e.conv_beam.pa_deg,
             )?;
         }
         std::fs::write(log_path, out)?;
@@ -282,6 +267,37 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Smooth one image to `target` at pixel precision `T`, or write it as NaN if
+/// `blank` is set.
+fn smooth_image<T: CubeElem>(
+    header: &FitsImageHeader,
+    out: &Path,
+    target: &Beam,
+    blank: bool,
+) -> Result<()> {
+    let file = &header.path;
+    let image = if blank {
+        Array2::from_elem((header.ny, header.nx), T::nan())
+    } else {
+        let data =
+            read_fits_plane::<T>(header).with_context(|| format!("reading {}", file.display()))?;
+        let plans = FftPlans::new(header.ny, header.nx);
+        smooth_owned_with_plans(
+            data,
+            &header.beam,
+            target,
+            header.dx_deg,
+            header.dy_deg,
+            None,
+            header.unit,
+            &plans,
+        )
+        .with_context(|| format!("smoothing {}", file.display()))?
+    };
+    write_fits(&image, out, file, target, header.is_4d)
+        .with_context(|| format!("writing {}", out.display()))
 }
 
 // ── 3D subcommand ─────────────────────────────────────────────────────────────
@@ -371,11 +387,9 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
             .iter()
             .flat_map(|m| m.beams.iter())
             .filter_map(|b| *b)
-            .filter(|b| b.is_finite() && !b.is_zero())
+            .filter(|b| usable_beam(b, args.shared.cutoff))
             .collect();
-        if !fits_in_beam(&all_valid, &b) {
-            bail!("target beam is too small — some channels cannot reach it");
-        }
+        let b = finish_target(b, &all_valid, args.shared.circularise)?;
         vec![Some(b); nfreq]
     } else {
         let mode = match args.mode {
@@ -570,11 +584,11 @@ fn process_cube<T: CubeElem>(
             // it is written as explicit no-data rather than left as the output's
             // zero-fill or corrupted to infinity.
             let old_beam = match meta.beams[c] {
-                Some(b) if !b.is_zero() => b,
+                Some(b) if usable_beam(&b, None) => b,
                 _ => return send(nan_plane()),
             };
             let target = match target_beams[c] {
-                Some(b) if !b.is_zero() => b,
+                Some(b) if usable_beam(&b, None) => b,
                 _ => return send(nan_plane()),
             };
 
@@ -643,15 +657,15 @@ fn compute_target_beams(
                 let valid: Vec<Beam> = metas
                     .iter()
                     .filter_map(|m| m.beams[c])
-                    .filter(|b| b.is_finite() && !b.is_zero())
-                    .filter(|b| cutoff.is_none_or(|cut| b.major_arcsec() <= cut))
+                    .filter(|b| usable_beam(b, cutoff))
                     .collect();
                 if valid.is_empty() {
                     return Ok(None);
                 }
                 let cb = common_beam(&valid, tolerance, nsamps, epsilon)
                     .with_context(|| format!("finding common beam for channel {c}"))?;
-                Ok(Some(apply_beam_rounding(cb, circularise)?))
+                let cb = round_common_beam(cb, &valid)?;
+                Ok(Some(finish_target(cb, &valid, circularise)?))
             })
             .collect(),
         CubeMode::Total => {
@@ -659,8 +673,7 @@ fn compute_target_beams(
                 .iter()
                 .flat_map(|m| m.beams.iter())
                 .filter_map(|b| *b)
-                .filter(|b| b.is_finite() && !b.is_zero())
-                .filter(|b| cutoff.is_none_or(|cut| b.major_arcsec() <= cut))
+                .filter(|b| usable_beam(b, cutoff))
                 .collect();
             anyhow::ensure!(
                 !valid.is_empty(),
@@ -668,7 +681,8 @@ fn compute_target_beams(
             );
             let cb = common_beam(&valid, tolerance, nsamps, epsilon)
                 .context("finding total common beam")?;
-            let cb = apply_beam_rounding(cb, circularise)?;
+            let cb = round_common_beam(cb, &valid)?;
+            let cb = finish_target(cb, &valid, circularise)?;
             Ok(vec![Some(cb); nfreq])
         }
     }
@@ -712,18 +726,41 @@ fn parse_target_beam(args: &SharedArgs) -> Result<Option<Beam>> {
     }
 }
 
-fn apply_beam_rounding(b: Beam, circularise: bool) -> Result<Beam> {
-    let b = Beam::from_arcsec(
-        ceil_to(b.major_arcsec(), 1),
-        ceil_to(b.minor_arcsec(), 1),
-        round_up(b.pa_deg, 2),
-    )
-    .context("rounding common beam")?;
-    if circularise {
-        Beam::from_arcsec(b.major_arcsec(), b.major_arcsec(), 0.0).context("circularising beam")
+/// True for a beam that can be convolved and is within the cutoff (arcsec).
+fn usable_beam(b: &Beam, cutoff: Option<f64>) -> bool {
+    b.is_finite() && b.minor_deg > 0.0 && cutoff.is_none_or(|c| b.major_arcsec() <= c)
+}
+
+/// Round a computed common beam up to 0.1″ axes and 0.01° PA, as racs_tools
+/// does. If the rotated PA leaves an input outside, add another 0.1″.
+fn round_common_beam(b: Beam, inputs: &[Beam]) -> Result<Beam> {
+    let round = |step: f64| {
+        Beam::from_arcsec(
+            ceil_to(b.major_arcsec() + step, 1),
+            ceil_to(b.minor_arcsec() + step, 1),
+            ceil_to(b.pa_deg, 2),
+        )
+        .context("rounding common beam")
+    };
+    let rounded = round(0.0)?;
+    if fits_in_beam(inputs, &rounded) {
+        Ok(rounded)
     } else {
-        Ok(b)
+        round(0.1)
     }
+}
+
+/// Circularise `b` if asked, then check every input beam can reach it.
+fn finish_target(b: Beam, inputs: &[Beam], circularise: bool) -> Result<Beam> {
+    let b = if circularise {
+        Beam::from_arcsec(b.major_arcsec(), b.major_arcsec(), 0.0).context("circularising beam")?
+    } else {
+        b
+    };
+    if !fits_in_beam(inputs, &b) {
+        bail!("target beam {b} is too small: some inputs cannot be convolved to it");
+    }
+    Ok(b)
 }
 
 fn progress_bar(total: u64) -> ProgressBar {
@@ -756,12 +793,9 @@ fn spinner(msg: impl Into<String>) -> ProgressBar {
     pb
 }
 
-fn ceil_to(x: f64, precision: i32) -> f64 {
-    let factor = 10_f64.powi(precision);
-    (x * factor).ceil() / factor
-}
-
-fn round_up(x: f64, decimals: i32) -> f64 {
+/// Round `x` up to `decimals` places, ignoring round-off below 1e-9 of the
+/// last place (so 30.500000000000004 stays 30.5).
+fn ceil_to(x: f64, decimals: i32) -> f64 {
     let factor = 10_f64.powi(decimals);
-    (x * factor).ceil() / factor
+    (x * factor - 1e-9).ceil() / factor
 }
