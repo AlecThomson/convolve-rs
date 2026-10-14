@@ -815,22 +815,40 @@ fn beams_table_nan_and_swapped_axes() {
     assert!((beams[2].major_arcsec() - 18.0).abs() < 1e-9);
 }
 
-/// A header with only a CD matrix gets an error that says so.
+/// Pixel sizes come from the CD matrix when the header has no CDELT.
 #[test]
-fn cd_matrix_header_is_reported() {
+fn cd_matrix_header() {
     let dir = workdir("cd_matrix");
     let path = dir.join("in.fits");
-    make_cube(&path);
-    {
-        let mut f = FitsFile::edit(&path).unwrap();
-        let hdu = f.primary_hdu().unwrap();
-        atfits_rs::delete_key(&mut f, "CDELT1").unwrap();
-        atfits_rs::delete_key(&mut f, "CDELT2").unwrap();
-        hdu.write_key(&mut f, "CD1_1", -0.001f64).unwrap();
-        hdu.write_key(&mut f, "CD2_2", 0.001f64).unwrap();
+    let rot = 30f64.to_radians();
+    // Unrotated, then rotated by 30 deg with 1" x 2" pixels.
+    let cases = [
+        ([-0.001, 0.0, 0.0, 0.001], (0.001, 0.001)),
+        (
+            [
+                -0.001 * rot.cos(),
+                -0.002 * rot.sin(),
+                -0.001 * rot.sin(),
+                0.002 * rot.cos(),
+            ],
+            (0.001, 0.002),
+        ),
+    ];
+    for (cd, (dx, dy)) in cases {
+        make_cube(&path);
+        {
+            let mut f = FitsFile::edit(&path).unwrap();
+            let hdu = f.primary_hdu().unwrap();
+            atfits_rs::delete_key(&mut f, "CDELT1").unwrap();
+            atfits_rs::delete_key(&mut f, "CDELT2").unwrap();
+            for (key, v) in ["CD1_1", "CD1_2", "CD2_1", "CD2_2"].into_iter().zip(cd) {
+                hdu.write_key(&mut f, key, v).unwrap();
+            }
+        }
+        let meta = cube_io::read_cube_meta(&path).unwrap();
+        assert!((meta.dx_deg - dx).abs() < 1e-12, "{}", meta.dx_deg);
+        assert!((meta.dy_deg - dy).abs() < 1e-12, "{}", meta.dy_deg);
     }
-    let err = cube_io::read_cube_meta(&path).unwrap_err().to_string();
-    assert!(err.contains("CD-matrix"), "{err}");
 }
 
 /// An explicit target is checked only against channels within the cutoff.

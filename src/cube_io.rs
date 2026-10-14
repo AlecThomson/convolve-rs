@@ -7,10 +7,9 @@
 //!   3. BMAJ/BMIN/BPA in the primary header, used for every channel.
 use std::path::{Path, PathBuf};
 
-use atfits_rs::{update_key_f64, update_key_logical};
+use atfits_rs::{key_bool, pixel_scale_deg, update_key_f64, update_key_logical};
 use fitsio::{
     FitsFile,
-    hdu::FitsHdu,
     tables::{ColumnDataType, ColumnDescription},
 };
 use ndarray::Array2;
@@ -18,45 +17,15 @@ use thiserror::Error;
 
 use crate::beam::{Beam, BeamError};
 use crate::convolve_uv::FftFloat;
-use crate::fits_io::{
-    FitsError, create_output, pixel_scales, read_header_beam, read_pixels, read_unit,
-};
+use crate::fits_io::{FitsError, create_output, read_header_beam, read_unit};
 use crate::smooth::BrightnessUnit;
 
 pub use atfits_rs::PixelType;
 
 /// Pixel types a plane is read, convolved and written in: `f32` or `f64`.
-pub trait CubeElem: atfits_rs::CubeElem + FftFloat {
-    /// Read pixels `start..end` of a float image without null checks.
-    fn read_float(
-        fptr: &mut FitsFile,
-        hdu: &FitsHdu,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<Self>, fitsio::errors::Error>;
-}
+pub trait CubeElem: atfits_rs::CubeElem + FftFloat {}
 
-impl CubeElem for f32 {
-    fn read_float(
-        fptr: &mut FitsFile,
-        hdu: &FitsHdu,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<Self>, fitsio::errors::Error> {
-        hdu.read_section(fptr, start, end)
-    }
-}
-
-impl CubeElem for f64 {
-    fn read_float(
-        fptr: &mut FitsFile,
-        hdu: &FitsHdu,
-        start: usize,
-        end: usize,
-    ) -> Result<Vec<Self>, fitsio::errors::Error> {
-        hdu.read_section(fptr, start, end)
-    }
-}
+impl<T: atfits_rs::CubeElem + FftFloat> CubeElem for T {}
 
 #[derive(Debug, Error)]
 pub enum CubeError {
@@ -98,9 +67,9 @@ pub struct CubeMeta {
     pub ny: usize,
     pub nfreq: usize,
     pub nstokes: usize,
-    /// |CDELT1| in degrees.
+    /// Pixel size along x in degrees.
     pub dx_deg: f64,
-    /// |CDELT2| in degrees.
+    /// Pixel size along y in degrees.
     pub dy_deg: f64,
     /// CRPIX of the spectral axis, truncated to a whole pixel as racs_tools
     /// does. Picks the channel whose beam goes in the output header; may lie
@@ -154,7 +123,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
         _ => (1, dims[2], 3),
     };
 
-    let (dx_deg, dy_deg) = pixel_scales(&mut fptr, &hdu)?;
+    let (dx_deg, dy_deg) = pixel_scale_deg(&mut fptr)?;
     let crpix_freq = atfits_rs::key_f64(&mut fptr, &format!("CRPIX{freq_axis}"))?
         .unwrap_or(1.0)
         .floor();
@@ -162,15 +131,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     let unit = read_unit(&mut fptr, &hdu, path);
 
     // CASA writes CASAMBM as a logical, but some tools write a string.
-    let casambm = hdu
-        .read_key::<bool>(&mut fptr, "CASAMBM")
-        .ok()
-        .or_else(|| {
-            hdu.read_key::<String>(&mut fptr, "CASAMBM")
-                .ok()
-                .map(|s| matches!(s.trim(), "T" | "TRUE"))
-        })
-        .unwrap_or(false);
+    let casambm = key_bool(&mut fptr, "CASAMBM")?.unwrap_or(false);
 
     let beamlog = beamlog_path(path);
     let beams = if casambm {
@@ -278,7 +239,7 @@ impl CubeReader {
         meta: &CubeMeta,
     ) -> Result<Array2<T>, CubeError> {
         let (start, end) = meta.channel_range(chan);
-        let data = read_pixels(&mut self.fptr, start, end)?;
+        let data = T::read_section(&mut self.fptr, start, end)?;
         Ok(Array2::from_shape_vec((meta.ny, meta.nx), data)?)
     }
 }
