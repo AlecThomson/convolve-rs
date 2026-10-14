@@ -14,7 +14,7 @@
 //! `scripts/profile_cube.sh`.
 use std::hint::black_box;
 
-use convolve_rs::{Beam, FftFloat, FftPlans, convolve_uv, convolve_uv_with_plans};
+use convolve_rs::{Beam, FftFloat, FftPlans, convolve_uv};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ndarray::Array2;
 use num_traits::cast;
@@ -114,7 +114,7 @@ fn bench_cube_throughput(c: &mut Criterion) {
         let plans = FftPlans::<f32>::new(n, n);
         b.iter(|| {
             for p in &planes {
-                let r = convolve_uv_with_plans(p, &old, &new, DX, DX, None, &plans).unwrap();
+                let r = convolve_uv(p, &old, &new, DX, DX, Some(&plans)).unwrap();
                 black_box(r.image[(0, 0)]);
             }
         })

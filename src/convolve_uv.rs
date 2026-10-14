@@ -1,25 +1,15 @@
-//! FFT-based UV-plane beam convolution.
+//! FFT-based UV-plane convolution of an image from one Gaussian beam to
+//! another, following the "robust" mode of `racs_tools.convolve_uv`.
 //!
-//! This is a port of `racs_tools.convolve_uv.convolve` and `racs_tools.gaussft.gaussft`.
-//! The "robust" mode is implemented: the FT of the convolving Gaussian is computed
-//! analytically at each UV point (no kernel image needed), which handles NaNs gracefully.
-//!
-//! The convolution is generic over the floating-point element type [`FftFloat`]
-//! (`f32` or `f64`): the transforms run in the **same precision as the input
-//! image**, so f32 data (the common radio-astronomy case) is transformed in f32
-//! — roughly half the memory traffic and compute of an f64 transform — while
-//! genuine f64 data is honoured exactly. Plans and scratch buffers are reused
-//! across calls via [`FftPlans`], which matters when convolving every channel of
-//! a cube at the same image size.
-//!
-//! Peak memory is about one image on top of the input (none at all for an owned,
-//! NaN-free plane — see [`convolve_uv_owned_with_plans`]): the real FFT runs in
-//! place, the filter is evaluated on the fly rather than stored, and the NaN mask
-//! is reduced to a bitset before the image is transformed.
+//! The filter is evaluated analytically at each UV point instead of being
+//! stored, and the transforms run in the image's own precision ([`FftFloat`]).
+//! Peak memory is about one image on top of the input, and none for an owned,
+//! NaN-free plane.
 use std::sync::Arc;
 
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, CowArray, Ix2};
 use num_traits::{Float, cast};
+use rayon::prelude::*;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftNum, FftPlanner, num_complex::Complex};
 use thiserror::Error;
@@ -28,30 +18,32 @@ use crate::beam::Beam;
 
 #[derive(Debug, Error)]
 pub enum ConvolveError {
-    #[error("input beam BMAJ exceeds the cutoff")]
-    AboveCutoff,
     #[error("input beam {0} has zero size")]
     ZeroSizeBeam(Beam),
     #[error("target beam {new} cannot be reached by convolving {old}")]
     Unreachable { old: Beam, new: Beam },
+    #[error("FFT plans are for {plans:?} images but the image is {image:?}")]
+    PlanSize {
+        plans: (usize, usize),
+        image: (usize, usize),
+    },
+    #[error("FFT failed: {0}")]
+    Fft(String),
 }
 
-/// Floating-point element type a convolution can run in: `f32` or `f64`.
-///
-/// `FftNum` makes it usable by `rustfft`/`realfft`; `Float` provides the NaN
-/// handling and numeric casts the convolution needs. Sealed in practice to the
-/// two IEEE types `rustfft` supports.
-pub trait FftFloat: FftNum + Float {}
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// Element type a convolution runs in: `f32` or `f64`.
+pub trait FftFloat: FftNum + Float + sealed::Sealed {}
 impl FftFloat for f32 {}
 impl FftFloat for f64 {}
 
-/// Cast an `f64` to `T`, saturating to ±∞ when the value is outside `T`'s finite
-/// range instead of panicking.
-///
-/// [`num_traits::cast`] returns `None` for out-of-range values (e.g. an `f64`
-/// filter coefficient or flux factor exceeding `f32::MAX`); saturating to
-/// infinity matches the old `value as f32` behaviour and lets the convolution
-/// produce an inf/NaN pixel rather than aborting the whole run mid-cube.
+/// Cast to `T`, saturating to ±∞ outside its range, so an f64 value too large
+/// for f32 gives an infinite pixel rather than a panic.
 pub(crate) fn cast_saturating<T: FftFloat>(value: f64) -> T {
     cast::<f64, T>(value).unwrap_or_else(|| {
         if value.is_sign_negative() {
@@ -63,20 +55,16 @@ pub(crate) fn cast_saturating<T: FftFloat>(value: f64) -> T {
 }
 
 pub struct ConvolutionResult<T = f32> {
-    /// Convolved image (NaNs propagated from input).
+    /// Convolved image, with NaNs where the input's NaNs spread to.
     pub image: Array2<T>,
-    /// Flux scaling factor for Jy/beam.
+    /// `√(Ω_new/Ω_old)`, the DC gain of the filter, already applied to `image`.
     pub scaling_factor: f64,
 }
 
-/// Cached FFT plans for a fixed `(nrows, ncols)` image size.
+/// FFT plans for one image size, shareable across threads.
 ///
-/// `rustfft`/`realfft` plans are `Arc<dyn …>` and `Send + Sync`, so a single
-/// `FftPlans` can be built once per cube and **shared by reference** across the
-/// rayon workers that convolve channels in parallel — each call brings its own
-/// scratch, so only the (immutable) plans are shared. Building plans is the
-/// expensive part of a transform; reusing them avoids re-planning on every
-/// channel.
+/// Planning is the expensive part of a small transform, so build these once
+/// per cube and pass them to every channel.
 pub struct FftPlans<T: FftNum = f32> {
     nrows: usize,
     ncols: usize,
@@ -88,110 +76,36 @@ pub struct FftPlans<T: FftNum = f32> {
 }
 
 impl<T: FftNum> FftPlans<T> {
-    /// Plan the forward/inverse real (row) and complex (column) FFTs for an
-    /// `nrows × ncols` image. Reuse this across all channels of a cube.
     pub fn new(nrows: usize, ncols: usize) -> Self {
         let mut rplanner = RealFftPlanner::<T>::new();
-        let r2c = rplanner.plan_fft_forward(ncols);
-        let c2r = rplanner.plan_fft_inverse(ncols);
-
         let mut cplanner = FftPlanner::<T>::new();
-        let col_fwd = cplanner.plan_fft_forward(nrows);
-        let col_inv = cplanner.plan_fft_inverse(nrows);
-
         Self {
             nrows,
             ncols,
             nhalf: ncols / 2 + 1,
-            r2c,
-            c2r,
-            col_fwd,
-            col_inv,
+            r2c: rplanner.plan_fft_forward(ncols),
+            c2r: rplanner.plan_fft_inverse(ncols),
+            col_fwd: cplanner.plan_fft_forward(nrows),
+            col_inv: cplanner.plan_fft_inverse(nrows),
         }
     }
 
-    /// Image dimensions `(nrows, ncols)` these plans were built for.
+    /// `(nrows, ncols)` these plans were built for.
     pub fn dim(&self) -> (usize, usize) {
         (self.nrows, self.ncols)
     }
 }
 
-/// The image handed to the convolution: either borrowed, in which case one
-/// working buffer is allocated for the output, or owned, in which case the
-/// transform runs in the caller's own buffer and nothing image-sized is
-/// allocated at all (for an image without NaNs).
-pub(crate) enum PlaneInput<'a, T> {
-    Borrowed(ArrayView2<'a, T>),
-    Owned(Array2<T>),
-}
-
-impl<T: FftFloat> PlaneInput<'_, T> {
-    fn view(&self) -> ArrayView2<'_, T> {
-        match self {
-            PlaneInput::Borrowed(v) => v.view(),
-            PlaneInput::Owned(a) => a.view(),
-        }
-    }
-
-    fn into_owned(self) -> Array2<T> {
-        match self {
-            PlaneInput::Borrowed(v) => v.to_owned(),
-            PlaneInput::Owned(a) => a,
-        }
-    }
-
-    /// Row-major working buffer holding the image with NaNs zero-filled. A new
-    /// buffer is allocated with room for `capacity` values, so growing it to
-    /// hold the spectrum never reallocates.
-    fn into_zero_filled_vec(self, capacity: usize) -> Vec<T> {
-        let zero_nan = |x: T| if x.is_nan() { T::zero() } else { x };
-        match self {
-            PlaneInput::Owned(a) if a.is_standard_layout() => {
-                let len = a.len();
-                let (mut buf, offset) = a.into_raw_vec_and_offset();
-                // A sliced array keeps its parent's buffer; in standard layout
-                // its elements are the `len` values starting at `offset`.
-                buf.drain(..offset.unwrap_or(0));
-                buf.truncate(len);
-                for x in buf.iter_mut() {
-                    *x = zero_nan(*x);
-                }
-                buf
-            }
-            other => {
-                let mut buf = Vec::with_capacity(capacity);
-                buf.extend(other.view().iter().map(|&x| zero_nan(x)));
-                buf
-            }
-        }
-    }
-}
-
-/// Extra flux scaling applied to the output on top of the filter's own DC gain
-/// (`g_ratio`), folded into the filter so it costs no extra pass over the image.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OutputGain {
-    /// Leave the output as the filter produced it (what [`convolve_uv`] returns).
-    Unit,
-    /// Multiply by `g_ratio` once more (Jy/beam).
-    Ratio,
-    /// Divide the filter's `g_ratio` back out (Kelvin).
-    InverseRatio,
-}
-
 /// Convolve `image` from `old_beam` to `new_beam` in the UV plane.
 ///
-/// `dx_deg` / `dy_deg` are the pixel sizes in degrees (FITS |CDELT1|, |CDELT2|).
-/// `cutoff_arcsec` blanks images whose current beam exceeds this size.
+/// `dx_deg` and `dy_deg` are the pixel sizes (CDELT1, CDELT2); their sign is
+/// ignored. Pass `plans` to reuse FFT plans across images of the same size.
+/// An owned image is transformed in its own buffer.
 ///
-/// The returned [`ConvolutionResult::scaling_factor`] is `√(Ω_new/Ω_old)`; see
-/// [`crate::smooth::smooth`] for how this becomes the Jy/beam or Kelvin factor.
+/// # Errors
 ///
-/// This builds FFT plans for the image size on each call. To convolve many
-/// images of the same size (e.g. cube channels), build an [`FftPlans`] once and
-/// call [`convolve_uv_with_plans`] to reuse it.
-///
-/// # Examples
+/// If `old_beam` has zero size, `new_beam` cannot be reached from it, or
+/// `plans` were built for another image size.
 ///
 /// ```
 /// use convolve_rs::{Beam, convolve_uv};
@@ -203,115 +117,46 @@ pub(crate) enum OutputGain {
 /// let dx = 2.5 / 3600.0;
 ///
 /// let result = convolve_uv(&image, &old, &new, dx, dx, None)?;
-/// // √(Ω_new/Ω_old) = √4 = 2 for a doubling of both axes.
 /// assert!((result.scaling_factor - 2.0).abs() < 1e-9);
 /// assert_eq!(result.image.dim(), (64, 64));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn convolve_uv<T: FftFloat>(
-    image: &Array2<T>,
+pub fn convolve_uv<'a, T: FftFloat>(
+    image: impl Into<CowArray<'a, T, Ix2>>,
     old_beam: &Beam,
     new_beam: &Beam,
     dx_deg: f64,
     dy_deg: f64,
-    cutoff_arcsec: Option<f64>,
+    plans: Option<&FftPlans<T>>,
 ) -> Result<ConvolutionResult<T>, ConvolveError> {
-    let (nrows, ncols) = image.dim();
-    let plans = FftPlans::<T>::new(nrows, ncols);
-    convolve_uv_with_plans(
-        image,
+    convolve_with_gain(
+        image.into(),
         old_beam,
         new_beam,
-        dx_deg,
-        dy_deg,
-        cutoff_arcsec,
-        &plans,
-    )
-}
-
-/// Like [`convolve_uv`], but reuses pre-built [`FftPlans`] instead of planning
-/// per call. `plans` must have been built for `image`'s dimensions.
-pub fn convolve_uv_with_plans<T: FftFloat>(
-    image: &Array2<T>,
-    old_beam: &Beam,
-    new_beam: &Beam,
-    dx_deg: f64,
-    dy_deg: f64,
-    cutoff_arcsec: Option<f64>,
-    plans: &FftPlans<T>,
-) -> Result<ConvolutionResult<T>, ConvolveError> {
-    convolve_plane(
-        PlaneInput::Borrowed(image.view()),
-        old_beam,
-        new_beam,
-        dx_deg,
-        dy_deg,
-        cutoff_arcsec,
-        OutputGain::Unit,
+        (dx_deg, dy_deg),
         plans,
+        |ratio| ratio,
     )
 }
 
-/// Like [`convolve_uv_with_plans`], but takes ownership of `image` and
-/// transforms in its buffer, so the only image-sized allocation is the one the
-/// NaN mask needs (none at all for an image without NaNs). Use this when the
-/// input plane is not needed afterwards, e.g. a cube channel just read from disk.
-pub fn convolve_uv_owned_with_plans<T: FftFloat>(
-    image: Array2<T>,
+/// [`convolve_uv`] with the filter's DC gain set to `gain(g_ratio)`, where
+/// `g_ratio = √(Ω_new/Ω_old)`. Folding the flux scaling into the filter saves
+/// a pass over the image.
+pub(crate) fn convolve_with_gain<T: FftFloat>(
+    image: CowArray<'_, T, Ix2>,
     old_beam: &Beam,
     new_beam: &Beam,
-    dx_deg: f64,
-    dy_deg: f64,
-    cutoff_arcsec: Option<f64>,
-    plans: &FftPlans<T>,
+    (dx_deg, dy_deg): (f64, f64),
+    plans: Option<&FftPlans<T>>,
+    gain: impl Fn(f64) -> f64,
 ) -> Result<ConvolutionResult<T>, ConvolveError> {
-    convolve_plane(
-        PlaneInput::Owned(image),
-        old_beam,
-        new_beam,
-        dx_deg,
-        dy_deg,
-        cutoff_arcsec,
-        OutputGain::Unit,
-        plans,
-    )
-}
-
-/// The convolution behind every public entry point.
-///
-/// Peak memory is kept to roughly one image on top of the input: the real FFT
-/// runs in place in a single buffer (the half spectrum of an `nrows × ncols`
-/// real image is `nrows × (ncols/2 + 1)` complex values, which fits in that
-/// buffer with only two extra values per row), the filter is evaluated on the
-/// fly rather than stored, and the NaN mask is convolved *first*, in its own
-/// buffer that is freed before the image's is needed, leaving only a bitset of
-/// the pixels to blank.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn convolve_plane<T: FftFloat>(
-    image: PlaneInput<'_, T>,
-    old_beam: &Beam,
-    new_beam: &Beam,
-    dx_deg: f64,
-    dy_deg: f64,
-    cutoff_arcsec: Option<f64>,
-    gain: OutputGain,
-    plans: &FftPlans<T>,
-) -> Result<ConvolutionResult<T>, ConvolveError> {
-    // Cutoff check.
-    if let Some(cutoff) = cutoff_arcsec
-        && old_beam.major_arcsec() > cutoff
-    {
-        return Err(ConvolveError::AboveCutoff);
-    }
-
-    // Beams identical → no-op with unit scaling.
     if old_beam.approx_eq(new_beam) {
         return Ok(ConvolutionResult {
             image: image.into_owned(),
             scaling_factor: 1.0,
         });
     }
-    if !(old_beam.major_deg() > 0.0 && old_beam.minor_deg() > 0.0) {
+    if !old_beam.has_area() {
         return Err(ConvolveError::ZeroSizeBeam(*old_beam));
     }
     if !new_beam.contains(old_beam) {
@@ -321,121 +166,130 @@ pub(crate) fn convolve_plane<T: FftFloat>(
         });
     }
 
-    let (nrows, ncols) = image.view().dim();
-    assert_eq!(
-        plans.dim(),
-        (nrows, ncols),
-        "FftPlans built for {:?} but image is {:?}",
-        plans.dim(),
-        (nrows, ncols)
-    );
-
-    let nan_count = image.view().iter().filter(|x| x.is_nan()).count();
+    let dim = image.dim();
+    let local_plans;
+    let plans = match plans {
+        Some(p) => p,
+        None => {
+            local_plans = FftPlans::new(dim.0, dim.1);
+            &local_plans
+        }
+    };
+    if plans.dim() != dim {
+        return Err(ConvolveError::PlanSize {
+            plans: plans.dim(),
+            image: dim,
+        });
+    }
 
     let taper = UvTaper::new(old_beam, new_beam);
-    if nan_count == nrows * ncols {
+    let nan_count = image.iter().filter(|x| x.is_nan()).count();
+    if nan_count == image.len() {
         return Ok(ConvolutionResult {
             image: image.into_owned(),
             scaling_factor: taper.ratio,
         });
     }
 
-    // UV coordinates: fftfreq(n, d_rad) where d_rad = pixel_size_in_radians.
-    // The data is real, so we use a real-input FFT: the column (ncols) axis only
-    // needs its non-negative half, `nhalf = ncols/2 + 1` bins. We slice the full
-    // `fftfreq` rather than using `rfftfreq` so the filter is evaluated at exactly
-    // the frequencies the equivalent full FFT assigns to bins 0..nhalf (incl. the
-    // signed Nyquist), keeping results aligned with the full-FFT port.
     // Rows run along y (CDELT2), columns along x (CDELT1). Only the magnitudes
     // matter: passing a negative CDELT1 to fftfreq would mirror the PA.
     let grid = UvGrid::new(
-        nrows,
-        ncols,
+        dim,
         dy_deg.abs().to_radians(),
         dx_deg.abs().to_radians(),
         &taper,
     );
-    let npix = (nrows * ncols) as f64;
-    let spectrum_len = nrows * 2 * (ncols / 2 + 1);
-
-    // Convolve the NaN mask with the same filter to find where the blanking
-    // spreads to. Done before the image so its buffer is gone by the time the
-    // image's is needed.
-    let blank = (nan_count > 0).then(|| {
-        let mut mask: Vec<T> = Vec::with_capacity(spectrum_len);
-        mask.extend(
-            image
-                .view()
-                .iter()
-                .map(|x| if x.is_nan() { T::one() } else { T::zero() }),
-        );
-        convolve_in_place(&mut mask, &taper, taper.ratio / npix, &grid, plans);
-        // Blank where the convolved mask reaches 0.99 rather than 1. With nearly
-        // equal beams (g_ratio ≈ 1) a solid NaN region sits at 1 minus round-off
-        // and the NaN pixels on its edge just under 1; both must stay blank.
-        let blank_threshold = T::one() - cast_saturating::<T>(1e-2);
-        Bitset::from_predicate(&mask, |m| m >= blank_threshold)
-    });
-
-    let out_gain = match gain {
-        OutputGain::Unit => taper.ratio,
-        OutputGain::Ratio => taper.ratio * taper.ratio,
-        OutputGain::InverseRatio => 1.0,
+    // Done before the image is unpacked, so the mask's buffer is freed first.
+    let blank = if nan_count > 0 {
+        Some(nan_spread(image.view(), &taper, &grid, plans)?)
+    } else {
+        None
     };
-    let mut buf = image.into_zero_filled_vec(spectrum_len);
-    convolve_in_place(&mut buf, &taper, out_gain / npix, &grid, plans);
 
+    let mut buf = zero_filled(image, plans);
+    let npix = (dim.0 * dim.1) as f64;
+    convolve_in_place(&mut buf, &taper, gain(taper.ratio) / npix, &grid, plans)?;
     if let Some(blank) = blank {
         blank.for_each_set(|k| buf[k] = T::nan());
     }
 
-    let out =
-        Array2::from_shape_vec((nrows, ncols), buf).expect("shape mismatch in convolve_uv output");
-
     Ok(ConvolutionResult {
-        image: out,
+        image: Array2::from_shape_vec(dim, buf).map_err(|e| ConvolveError::Fft(e.to_string()))?,
         scaling_factor: taper.ratio,
     })
 }
 
-// ── gaussft ───────────────────────────────────────────────────────────────────
+/// Pixels to blank: where the NaN mask, convolved like the image, reaches
+/// 0.99. racs_tools uses 1; with nearly equal beams (g_ratio ≈ 1) a solid NaN
+/// region sits at 1 minus round-off and the NaN pixels on its edge just under
+/// 1, and both must stay blank.
+fn nan_spread<T: FftFloat>(
+    image: ArrayView2<'_, T>,
+    taper: &UvTaper,
+    grid: &UvGrid,
+    plans: &FftPlans<T>,
+) -> Result<Bitset, ConvolveError> {
+    let mut mask = Vec::with_capacity(spectrum_len(plans));
+    mask.extend(
+        image
+            .iter()
+            .map(|x| if x.is_nan() { T::one() } else { T::zero() }),
+    );
+    let npix = (plans.nrows * plans.ncols) as f64;
+    convolve_in_place(&mut mask, taper, taper.ratio / npix, grid, plans)?;
+    let threshold = T::one() - cast_saturating::<T>(1e-2);
+    Ok(Bitset::from_predicate(&mask, |m| m >= threshold))
+}
 
-/// The UV-plane filter that deconvolves one Gaussian beam and re-convolves with
-/// another, reduced to the coefficients of a single quadratic form.
-///
-/// `racs_tools.gaussft` evaluates `g_ratio · exp(g_arg − dg_arg)`, where each
-/// argument is `−2π² ((σx u_r)² + (σy v_r)²)` in coordinates rotated by that
-/// beam's position angle. Expanding the rotations, each argument is a quadratic
-/// form `a u² + b uv + c v²`, so their difference is too. Collapsing both into
-/// one set of coefficients makes each filter value a few multiply-adds and one
-/// `exp`, cheap enough to evaluate on the fly instead of storing the filter.
+fn spectrum_len<T: FftNum>(plans: &FftPlans<T>) -> usize {
+    plans.nrows * 2 * plans.nhalf
+}
+
+/// The image row-major with NaNs set to zero. An owned standard-layout image
+/// is reused in place.
+fn zero_filled<T: FftFloat>(image: CowArray<'_, T, Ix2>, plans: &FftPlans<T>) -> Vec<T> {
+    let zero_nan = |x: T| if x.is_nan() { T::zero() } else { x };
+    if image.is_view() || !image.is_standard_layout() {
+        let mut buf = Vec::with_capacity(spectrum_len(plans));
+        buf.extend(image.iter().map(|&x| zero_nan(x)));
+        return buf;
+    }
+    let image = image.into_owned();
+    let len = image.len();
+    let (mut buf, offset) = image.into_raw_vec_and_offset();
+    // A sliced array keeps its parent's buffer; in standard layout its
+    // elements are the `len` values starting at `offset`.
+    buf.drain(..offset.unwrap_or(0));
+    buf.truncate(len);
+    for x in buf.iter_mut() {
+        *x = zero_nan(*x);
+    }
+    buf
+}
+
+/// The UV filter `racs_tools.gaussft` evaluates, `g_ratio · exp(g_arg − dg_arg)`,
+/// reduced to one quadratic form `a u² + b uv + c v²` in the exponent so it
+/// is cheap enough to evaluate on the fly.
 #[derive(Clone, Copy, Debug)]
 struct UvTaper {
     a: f64,
     b: f64,
     c: f64,
-    /// Amplitude ratio (= flux scaling factor = DC gain of the filter).
+    /// DC gain, `√(Ω_new/Ω_old)`.
     ratio: f64,
 }
 
 impl UvTaper {
     fn new(old_beam: &Beam, new_beam: &Beam) -> Self {
-        let deg2rad = std::f64::consts::PI / 180.0;
-        let fwhm_to_sigma = 2.0 * (2.0 * 2_f64.ln()).sqrt(); // = 2*sqrt(2*ln2)
-
-        // New beam (target) and old beam (input PSF) as Gaussian sigmas.
-        let sx = new_beam.major_deg() * deg2rad / fwhm_to_sigma;
-        let sy = new_beam.minor_deg() * deg2rad / fwhm_to_sigma;
-        let sx_in = old_beam.major_deg() * deg2rad / fwhm_to_sigma;
-        let sy_in = old_beam.minor_deg() * deg2rad / fwhm_to_sigma;
-
-        // Amplitude ratio (= flux scaling factor).
-        let g_amp = (2.0 * std::f64::consts::PI * sx * sy).sqrt();
-        let dg_amp = (2.0 * std::f64::consts::PI * sx_in * sy_in).sqrt();
+        use std::f64::consts::PI;
+        let fwhm_to_sigma = 2.0 * (2.0 * 2_f64.ln()).sqrt();
+        let sigma = |fwhm_deg: f64| fwhm_deg.to_radians() / fwhm_to_sigma;
+        let (sx, sy) = (sigma(new_beam.major_deg()), sigma(new_beam.minor_deg()));
+        let (sx_in, sy_in) = (sigma(old_beam.major_deg()), sigma(old_beam.minor_deg()));
 
         // (σx u_r)² + (σy v_r)² with u_r = u cos θ − v sin θ, v_r = u sin θ + v cos θ.
         let form = |sx: f64, sy: f64, pa_deg: f64| {
-            let (s, c) = (pa_deg * deg2rad).sin_cos();
+            let (s, c) = pa_deg.to_radians().sin_cos();
             let (sx2, sy2) = (sx * sx, sy * sy);
             (
                 sx2 * c * c + sy2 * s * s,
@@ -445,31 +299,23 @@ impl UvTaper {
         };
         let (a, b, c) = form(sx, sy, new_beam.pa_deg());
         let (a_in, b_in, c_in) = form(sx_in, sy_in, old_beam.pa_deg());
-        let k = -2.0 * std::f64::consts::PI * std::f64::consts::PI;
-
+        let k = -2.0 * PI * PI;
         Self {
             a: k * (a - a_in),
             b: k * (b - b_in),
             c: k * (c - c_in),
-            ratio: g_amp / dg_amp,
+            ratio: (2.0 * PI * sx * sy).sqrt() / (2.0 * PI * sx_in * sy_in).sqrt(),
         }
     }
 
-    /// Filter value at `(u, v)`, including the DC gain `ratio`.
     fn at(&self, u: f64, v: f64) -> f64 {
         self.ratio * (self.a * u * u + self.b * u * v + self.c * v * v).exp()
     }
 }
 
-/// Compute the UV-plane filter that deconvolves `old_beam` and re-convolves with
-/// `new_beam`. Direct port of `racs_tools.gaussft.gaussft`.
-///
-/// `u_freqs` has length `nrows`, `v_freqs` has length `ncols` (or `nhalf` for a
-/// half-spectrum / real-FFT layout). The filter is real-valued, so it is returned
-/// as `Vec<f64>` of length `nrows * v_freqs.len()` in row-major order.
-///
-/// The convolution itself never materialises this array — it evaluates the
-/// same filter on the fly — so this is for inspection and testing.
+/// The UV filter from `old_beam` to `new_beam` at every `(u, v)`, row-major,
+/// and its DC gain, as `racs_tools.gaussft` returns them. For inspection and
+/// testing; the convolution evaluates the filter on the fly.
 pub fn gaussft(
     old_beam: &Beam,
     new_beam: &Beam,
@@ -484,13 +330,7 @@ pub fn gaussft(
     (g_final, taper.ratio)
 }
 
-// ── FFT helpers ───────────────────────────────────────────────────────────────
-
-/// numpy-compatible `fftfreq(n, d)`.
-///
-/// For even n the Nyquist bin (index n/2) is listed as negative, matching numpy.
-///
-/// # Examples
+/// numpy's `fftfreq(n, d)`, including its negative Nyquist bin for even `n`.
 ///
 /// ```
 /// use convolve_rs::fftfreq;
@@ -500,38 +340,35 @@ pub fn gaussft(
 /// ```
 pub fn fftfreq(n: usize, d: f64) -> Vec<f64> {
     let val = 1.0 / (n as f64 * d);
-    let m = n.div_ceil(2); // ceiling(n/2): positive-frequency count
-    let mut freqs = vec![0.0_f64; n];
-    for (i, freq) in freqs.iter_mut().enumerate().take(m) {
-        *freq = i as f64 * val;
-    }
-    for (i, freq) in freqs.iter_mut().enumerate().take(n).skip(m) {
-        *freq = (i as f64 - n as f64) * val;
-    }
-    freqs
+    let m = n.div_ceil(2);
+    (0..n)
+        .map(|i| {
+            if i < m {
+                i as f64 * val
+            } else {
+                (i as f64 - n as f64) * val
+            }
+        })
+        .collect()
 }
 
-/// Columns transformed together in the column pass. The half spectrum is stored
-/// row-major, so a single column is `nrows` values each a full row apart; gathering
-/// a block of adjacent columns at once reads whole cache lines instead of one
-/// value per line, which is what makes the column pass cheap on wide images.
+/// Columns transformed together in the column pass, so each gather reads
+/// whole cache lines of the row-major spectrum.
 const COL_BLOCK: usize = 16;
 
-/// The UV coordinates of the half spectrum, with the parts of the filter's
-/// exponent that depend on only one of them precomputed.
+/// UV coordinates of the half spectrum, with `a·u²` precomputed per row.
 struct UvGrid {
-    /// `u` for each of the `nrows` rows.
     u: Vec<f64>,
-    /// `a·u²` for each row.
     au2: Vec<f64>,
-    /// `v` for each of the `nhalf` columns of the half spectrum.
+    /// `v` for the `ncols/2 + 1` columns of the half spectrum. Taken from the
+    /// full `fftfreq` rather than `rfftfreq`, so the Nyquist bin keeps the
+    /// sign the full transform gives it.
     v: Vec<f64>,
 }
 
 impl UvGrid {
     fn new(
-        nrows: usize,
-        ncols: usize,
+        (nrows, ncols): (usize, usize),
         row_step_rad: f64,
         col_step_rad: f64,
         taper: &UvTaper,
@@ -544,7 +381,7 @@ impl UvGrid {
     }
 }
 
-/// A packed set of pixel indices (one bit per pixel).
+/// One bit per pixel.
 struct Bitset {
     words: Vec<u64>,
 }
@@ -574,88 +411,102 @@ impl Bitset {
     }
 }
 
-/// View a buffer of reals as the complex values it stores in pairs.
 fn as_complex<T: FftFloat>(re: &[T]) -> &[Complex<T>] {
-    assert!(re.len().is_multiple_of(2));
-    // SAFETY: `Complex<T>` is `#[repr(C)] { re: T, im: T }`, so it has the size of
-    // two `T`s and the alignment of one, and any pair of initialised `T`s is a
-    // valid value. The length is halved, so the view covers exactly `re`.
+    debug_assert!(re.len().is_multiple_of(2));
+    // SAFETY: `Complex<T>` is `#[repr(C)] { re: T, im: T }`: two `T`s with the
+    // alignment of one. The view covers the first `2 * (len / 2)` values.
     unsafe { std::slice::from_raw_parts(re.as_ptr().cast(), re.len() / 2) }
 }
 
-/// Mutable form of [`as_complex`].
 fn as_complex_mut<T: FftFloat>(re: &mut [T]) -> &mut [Complex<T>] {
-    assert!(re.len().is_multiple_of(2));
-    // SAFETY: as for `as_complex`; the exclusive borrow of `re` is carried over.
+    debug_assert!(re.len().is_multiple_of(2));
+    // SAFETY: as for `as_complex`, carrying over the exclusive borrow.
     unsafe { std::slice::from_raw_parts_mut(re.as_mut_ptr().cast(), re.len() / 2) }
 }
 
-/// Convolve the real `nrows × ncols` image held row-major in `buf` with the
-/// UV-plane filter, in place. The filter applied is `gain · exp(…)`: the shape of
-/// [`UvTaper`] with unit DC gain, times `gain`.
+fn fft_error(e: impl std::fmt::Display) -> ConvolveError {
+    ConvolveError::Fft(e.to_string())
+}
+
+/// Convolve the `nrows × ncols` row-major image in `buf` with `gain ·` the
+/// unit-gain filter, in place. `gain` must include the inverse FFT's `1/N`.
 ///
-/// The buffer is grown by two values per row to hold the half spectrum, the
-/// forward real FFT runs in place, the filter is applied during the column
-/// pass, and the inverse writes the image back over the spectrum before the
-/// buffer is shrunk to the image again. `gain` must include the `1/N`
-/// normalisation of the inverse FFT.
+/// The buffer grows by two values per row to hold the half spectrum. On Linux
+/// that remaps rather than copies (0.9 ms against 180 ms for a copy at 8192²,
+/// measured).
 fn convolve_in_place<T: FftFloat>(
     buf: &mut Vec<T>,
     taper: &UvTaper,
     gain: f64,
     grid: &UvGrid,
     plans: &FftPlans<T>,
-) {
-    let (nrows, ncols, nhalf) = (plans.nrows, plans.ncols, plans.nhalf);
-    debug_assert_eq!(buf.len(), nrows * ncols);
-    // A large buffer is its own mapping, so growing it this little is a remap
-    // rather than a copy.
-    buf.resize(nrows * 2 * nhalf, T::zero());
+) -> Result<(), ConvolveError> {
+    let (nrows, ncols) = (plans.nrows, plans.ncols);
+    let stride = 2 * plans.nhalf;
+    buf.resize(nrows * stride, T::zero());
+    // Called from a rayon worker, the caller is already parallel over planes;
+    // the in-place row passes then avoid two copies of the image.
+    let parallel_rows = rayon::current_thread_index().is_none();
 
-    forward_rows_in_place(plans, buf);
-    filter_columns(plans, as_complex_mut(buf), taper, gain, grid);
-    inverse_rows_in_place(plans, buf);
-
+    if parallel_rows {
+        // Space rows out to the half-spectrum stride so each transforms
+        // independently.
+        for i in (1..nrows).rev() {
+            buf.copy_within(i * ncols..(i + 1) * ncols, i * stride);
+        }
+        forward_rows(plans, buf)?;
+    } else {
+        forward_rows_in_place(plans, buf)?;
+    }
+    filter_columns(plans, as_complex_mut(buf), taper, gain, grid)?;
+    if parallel_rows {
+        inverse_rows(plans, buf)?;
+        for i in 1..nrows {
+            buf.copy_within(i * stride..i * stride + ncols, i * ncols);
+        }
+    } else {
+        inverse_rows_in_place(plans, buf)?;
+    }
     buf.truncate(nrows * ncols);
+    Ok(())
 }
 
-/// Row-wise real→complex FFT, in place.
-///
-/// On entry the first `nrows · ncols` values of `buf` are the image, row-major;
-/// on exit `buf` holds the `nrows × nhalf` half spectrum, row-major. Spectrum row
-/// `i` starts at real offset `2·nhalf·i ≥ ncols·i`, so writing it can only
-/// overwrite image rows `≥ i`; going from the last row to the first, those have
-/// all been transformed already (row `i` itself is copied out first).
-fn forward_rows_in_place<T: FftFloat>(plans: &FftPlans<T>, buf: &mut [T]) {
-    let (nrows, ncols, nhalf) = (plans.nrows, plans.ncols, plans.nhalf);
+/// Sequential [`forward_rows`] on the packed image. Spectrum row `i` starts at
+/// `2·nhalf·i ≥ ncols·i`, so it can only overwrite image rows `≥ i`; going from
+/// the last row up, those are already transformed.
+fn forward_rows_in_place<T: FftFloat>(
+    plans: &FftPlans<T>,
+    buf: &mut [T],
+) -> Result<(), ConvolveError> {
+    let (ncols, stride) = (plans.ncols, 2 * plans.nhalf);
     let mut scratch = plans.r2c.make_scratch_vec();
     let mut inrow = plans.r2c.make_input_vec();
-    for i in (0..nrows).rev() {
+    for i in (0..plans.nrows).rev() {
         inrow.copy_from_slice(&buf[i * ncols..(i + 1) * ncols]);
-        let out = as_complex_mut(&mut buf[2 * nhalf * i..2 * nhalf * (i + 1)]);
+        let out = as_complex_mut(&mut buf[stride * i..stride * (i + 1)]);
         plans
             .r2c
             .process_with_scratch(&mut inrow, out, &mut scratch)
-            .expect("r2c FFT");
+            .map_err(fft_error)?;
     }
+    Ok(())
 }
 
-/// Row-wise complex→real FFT, in place: the inverse of [`forward_rows_in_place`].
-///
-/// Image row `i` ends at real offset `ncols·(i + 1) ≤ 2·nhalf·(i + 1)`, so writing
-/// it can only overwrite spectrum rows `≤ i`; going from the first row to the
-/// last, those have all been transformed already.
-fn inverse_rows_in_place<T: FftFloat>(plans: &FftPlans<T>, buf: &mut [T]) {
-    let (nrows, ncols, nhalf) = (plans.nrows, plans.ncols, plans.nhalf);
+/// Sequential [`inverse_rows`] that packs the image as it goes. Image row `i`
+/// ends at `ncols·(i + 1) ≤ 2·nhalf·(i + 1)`, so it can only overwrite
+/// spectrum rows `≤ i`, which are already transformed.
+fn inverse_rows_in_place<T: FftFloat>(
+    plans: &FftPlans<T>,
+    buf: &mut [T],
+) -> Result<(), ConvolveError> {
+    let (ncols, nhalf) = (plans.ncols, plans.nhalf);
+    let stride = 2 * nhalf;
     let mut scratch = plans.c2r.make_scratch_vec();
     let mut inrow = plans.c2r.make_input_vec();
-    let even = ncols.is_multiple_of(2);
-    for i in 0..nrows {
-        inrow.copy_from_slice(as_complex(&buf[2 * nhalf * i..2 * nhalf * (i + 1)]));
-        // c2r requires the DC (and, for even ncols, Nyquist) bins to be purely
-        // real; they are up to rounding, so zero the imaginary parts explicitly.
+    for i in 0..plans.nrows {
+        inrow.copy_from_slice(as_complex(&buf[stride * i..stride * (i + 1)]));
         inrow[0].im = T::zero();
-        if even {
+        if ncols.is_multiple_of(2) {
             inrow[nhalf - 1].im = T::zero();
         }
         plans
@@ -665,63 +516,128 @@ fn inverse_rows_in_place<T: FftFloat>(plans: &FftPlans<T>, buf: &mut [T]) {
                 &mut buf[i * ncols..(i + 1) * ncols],
                 &mut scratch,
             )
-            .expect("c2r FFT");
+            .map_err(fft_error)?;
+    }
+    Ok(())
+}
+
+/// Real-to-complex FFT of every row; row `i` starts at `i * 2 * nhalf`.
+fn forward_rows<T: FftFloat>(plans: &FftPlans<T>, buf: &mut [T]) -> Result<(), ConvolveError> {
+    let ncols = plans.ncols;
+    buf.par_chunks_mut(2 * plans.nhalf).try_for_each_init(
+        || (plans.r2c.make_input_vec(), plans.r2c.make_scratch_vec()),
+        |(inrow, scratch), row| {
+            inrow.copy_from_slice(&row[..ncols]);
+            plans
+                .r2c
+                .process_with_scratch(inrow, as_complex_mut(row), scratch)
+                .map_err(fft_error)
+        },
+    )
+}
+
+/// Complex-to-real FFT of every half-spectrum row, leaving each image row at
+/// the start of its slot.
+fn inverse_rows<T: FftFloat>(plans: &FftPlans<T>, buf: &mut [T]) -> Result<(), ConvolveError> {
+    let (ncols, nhalf) = (plans.ncols, plans.nhalf);
+    let even = ncols.is_multiple_of(2);
+    buf.par_chunks_mut(2 * nhalf).try_for_each_init(
+        || {
+            (
+                plans.c2r.make_input_vec(),
+                plans.c2r.make_output_vec(),
+                plans.c2r.make_scratch_vec(),
+            )
+        },
+        |(inrow, outrow, scratch), row| {
+            inrow.copy_from_slice(as_complex(row));
+            // c2r wants the DC and (even ncols) Nyquist bins exactly real.
+            inrow[0].im = T::zero();
+            if even {
+                inrow[nhalf - 1].im = T::zero();
+            }
+            plans
+                .c2r
+                .process_with_scratch(inrow, outrow, scratch)
+                .map_err(fft_error)?;
+            row[..ncols].copy_from_slice(outrow);
+            Ok(())
+        },
+    )
+}
+
+/// Raw pointer to the spectrum, shared by the column-block tasks.
+#[derive(Clone, Copy)]
+struct SpectrumPtr<T>(*mut Complex<T>);
+// SAFETY: each task only touches the columns of its own block (see
+// `filter_columns`), so no element is accessed by two threads.
+unsafe impl<T: Send> Send for SpectrumPtr<T> {}
+unsafe impl<T: Send> Sync for SpectrumPtr<T> {}
+
+impl<T> SpectrumPtr<T> {
+    /// A method rather than field access, so closures capture the whole
+    /// (`Sync`) wrapper instead of the raw pointer.
+    fn get(self) -> *mut Complex<T> {
+        self.0
     }
 }
 
-/// Column-wise forward FFT, filter, and inverse FFT of the `nrows × nhalf` half
-/// spectrum, a block of [`COL_BLOCK`] columns at a time.
-///
-/// Each block is gathered into a contiguous tile once, transformed, multiplied
-/// by `gain ·` the filter (evaluated on the fly, never stored), transformed back
-/// and scattered, so the spectrum is traversed once rather than three times.
+/// Column FFT, filter and inverse column FFT of the `nrows × nhalf` half
+/// spectrum, [`COL_BLOCK`] columns per task.
 fn filter_columns<T: FftFloat>(
     plans: &FftPlans<T>,
     spectrum: &mut [Complex<T>],
     taper: &UvTaper,
     gain: f64,
     grid: &UvGrid,
-) {
+) -> Result<(), ConvolveError> {
     let (nrows, nhalf) = (plans.nrows, plans.nhalf);
+    if spectrum.len() != nrows * nhalf {
+        return Err(ConvolveError::Fft("spectrum has the wrong size".into()));
+    }
     let zero = Complex::new(T::zero(), T::zero());
     let scratch_len = plans
         .col_fwd
         .get_inplace_scratch_len()
         .max(plans.col_inv.get_inplace_scratch_len());
-    let mut scratch = vec![zero; scratch_len];
-    let mut tile = vec![zero; COL_BLOCK * nrows];
+    let ptr = SpectrumPtr(spectrum.as_mut_ptr());
 
-    for j0 in (0..nhalf).step_by(COL_BLOCK) {
-        let width = COL_BLOCK.min(nhalf - j0);
-        let tile = &mut tile[..width * nrows];
+    (0..nhalf.div_ceil(COL_BLOCK))
+        .into_par_iter()
+        .for_each_init(
+            || (vec![zero; COL_BLOCK * nrows], vec![zero; scratch_len]),
+            |(tile, scratch), block| {
+                let j0 = block * COL_BLOCK;
+                let width = COL_BLOCK.min(nhalf - j0);
+                let tile = &mut tile[..width * nrows];
+                // SAFETY: `i * nhalf + j0 + k` is in bounds for `i < nrows` and
+                // `j0 + k < nhalf`, and this block is the only one using columns
+                // `j0..j0 + width`. The `&mut` borrow of `spectrum` outlives the loop.
+                let at = |i: usize, k: usize| unsafe { ptr.get().add(i * nhalf + j0 + k) };
 
-        // Gather: tile row k is spectrum column j0 + k.
-        for (i, row) in spectrum.chunks_exact(nhalf).enumerate() {
-            for (k, &s) in row[j0..j0 + width].iter().enumerate() {
-                tile[k * nrows + i] = s;
-            }
-        }
-
-        plans.col_fwd.process_with_scratch(tile, &mut scratch);
-
-        for (k, col) in tile.chunks_exact_mut(nrows).enumerate() {
-            let v = grid.v[j0 + k];
-            let (bv, cv2) = (taper.b * v, taper.c * v * v);
-            for ((s, &u), &au2) in col.iter_mut().zip(&grid.u).zip(&grid.au2) {
-                let g = gain * (au2 + bv * u + cv2).exp();
-                *s = s.scale(cast_saturating::<T>(g));
-            }
-        }
-
-        plans.col_inv.process_with_scratch(tile, &mut scratch);
-
-        // Scatter back.
-        for (i, row) in spectrum.chunks_exact_mut(nhalf).enumerate() {
-            for (k, s) in row[j0..j0 + width].iter_mut().enumerate() {
-                *s = tile[k * nrows + i];
-            }
-        }
-    }
+                for i in 0..nrows {
+                    for k in 0..width {
+                        tile[k * nrows + i] = unsafe { at(i, k).read() };
+                    }
+                }
+                plans.col_fwd.process_with_scratch(tile, scratch);
+                for (k, col) in tile.chunks_exact_mut(nrows).enumerate() {
+                    let v = grid.v[j0 + k];
+                    let (bv, cv2) = (taper.b * v, taper.c * v * v);
+                    for ((s, &u), &au2) in col.iter_mut().zip(&grid.u).zip(&grid.au2) {
+                        let g = gain * (au2 + bv * u + cv2).exp();
+                        *s = s.scale(cast_saturating::<T>(g));
+                    }
+                }
+                plans.col_inv.process_with_scratch(tile, scratch);
+                for i in 0..nrows {
+                    for k in 0..width {
+                        unsafe { at(i, k).write(tile[k * nrows + i]) };
+                    }
+                }
+            },
+        );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -747,23 +663,45 @@ mod tests {
             .collect();
         let plans = FftPlans::<T>::new(nrows, ncols);
         let mut buf = data.clone();
-        buf.resize(nrows * 2 * plans.nhalf, T::zero());
-        forward_rows_in_place(&plans, &mut buf);
-        // Column pass with a flat unit filter: a == b == c == 0.
         let flat = UvTaper {
             a: 0.0,
             b: 0.0,
             c: 0.0,
             ratio: 1.0,
         };
-        let grid = UvGrid::new(nrows, ncols, 1.0, 1.0, &flat);
+        let grid = UvGrid::new((nrows, ncols), 1.0, 1.0, &flat);
         let n = (nrows * ncols) as f64;
-        filter_columns(&plans, as_complex_mut(&mut buf), &flat, 1.0 / n, &grid);
-        inverse_rows_in_place(&plans, &mut buf);
-        buf.truncate(nrows * ncols);
+        convolve_in_place(&mut buf, &flat, 1.0 / n, &grid, &plans).unwrap();
         for (a, b) in data.iter().zip(buf.iter()) {
             let (a, b) = (a.to_f64().unwrap(), b.to_f64().unwrap());
             assert!((a - b).abs() < tol, "roundtrip {nrows}x{ncols}: {a} vs {b}");
+        }
+    }
+
+    /// The sequential row passes, used on rayon workers, give the same result
+    /// as the parallel ones.
+    #[test]
+    fn test_row_paths_agree() {
+        let dx = 2.5 / 3600.0;
+        let old = Beam::from_arcsec(6.0, 6.0, 0.0).unwrap();
+        let new = Beam::from_arcsec(11.0, 9.0, 15.0).unwrap();
+        for (r, c) in [(37, 36), (40, 71)] {
+            let img = test_image(r, c, true);
+            let outside = convolve_uv(&img, &old, &new, dx, dx, None).unwrap().image;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let inside = pool
+                .install(|| convolve_uv(&img, &old, &new, dx, dx, None))
+                .unwrap()
+                .image;
+            for (a, b) in outside.iter().zip(inside.iter()) {
+                assert_eq!(a.is_nan(), b.is_nan());
+                if !a.is_nan() {
+                    assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+                }
+            }
         }
     }
 
@@ -848,7 +786,7 @@ mod tests {
                 let img = test_image(r, c, nans);
                 let expected = reference(&img, &old, &new, dx);
                 let got = convolve_uv(&img, &old, &new, dx, dx, None).unwrap().image;
-                let got32 = convolve_uv(&img.mapv(|x| x as f32), &old, &new, dx, dx, None)
+                let got32 = convolve_uv(img.mapv(|x| x as f32), &old, &new, dx, dx, None)
                     .unwrap()
                     .image;
                 for ((&e, &g), &g32) in expected.iter().zip(got.iter()).zip(got32.iter()) {
@@ -881,9 +819,8 @@ mod tests {
         for nans in [false, true] {
             let img = test_image(45, 38, nans).mapv(|x| x as f32);
             let plans = FftPlans::<f32>::new(45, 38);
-            let borrowed = convolve_uv_with_plans(&img, &old, &new, dx, dx, None, &plans).unwrap();
-            let owned = convolve_uv_owned_with_plans(img.clone(), &old, &new, dx, dx, None, &plans)
-                .unwrap();
+            let borrowed = convolve_uv(&img, &old, &new, dx, dx, Some(&plans)).unwrap();
+            let owned = convolve_uv(img.clone(), &old, &new, dx, dx, Some(&plans)).unwrap();
             assert_eq!(borrowed.scaling_factor, owned.scaling_factor);
             for (a, b) in borrowed.image.iter().zip(owned.image.iter()) {
                 assert_eq!(a.to_bits(), b.to_bits(), "owned path changed output");
@@ -901,8 +838,8 @@ mod tests {
         let img = test_image(30, 41, true).reversed_axes(); // 41 x 30, column-major
         let plans = FftPlans::<f64>::new(41, 30);
         let std_layout = img.as_standard_layout().to_owned();
-        let a = convolve_uv_with_plans(&std_layout, &old, &new, dx, dx, None, &plans).unwrap();
-        let b = convolve_uv_owned_with_plans(img, &old, &new, dx, dx, None, &plans).unwrap();
+        let a = convolve_uv(&std_layout, &old, &new, dx, dx, Some(&plans)).unwrap();
+        let b = convolve_uv(img, &old, &new, dx, dx, Some(&plans)).unwrap();
         for (x, y) in a.image.iter().zip(b.image.iter()) {
             assert_eq!(x.to_bits(), y.to_bits());
         }
@@ -922,11 +859,8 @@ mod tests {
                 let owned = parent.clone().slice_move(sl);
                 assert!(owned.is_standard_layout());
                 let plans = FftPlans::<f64>::new(40, 30);
-                let want =
-                    convolve_uv_with_plans(&owned.to_owned(), &old, &new, dx, dx, None, &plans)
-                        .unwrap();
-                let got =
-                    convolve_uv_owned_with_plans(owned, &old, &new, dx, dx, None, &plans).unwrap();
+                let want = convolve_uv(owned.view(), &old, &new, dx, dx, Some(&plans)).unwrap();
+                let got = convolve_uv(owned, &old, &new, dx, dx, Some(&plans)).unwrap();
                 for (a, b) in want.image.iter().zip(got.image.iter()) {
                     assert_eq!(a.to_bits(), b.to_bits());
                 }
@@ -1037,6 +971,19 @@ mod tests {
         for (x, y) in img.iter().zip(out.iter()) {
             assert_eq!(x.is_nan(), y.is_nan());
         }
+    }
+
+    #[test]
+    fn test_wrong_plan_size_is_an_error() {
+        let img = test_image(16, 16, false);
+        let plans = FftPlans::<f64>::new(16, 17);
+        let old = Beam::from_arcsec(6.0, 6.0, 0.0).unwrap();
+        let new = Beam::from_arcsec(11.0, 9.0, 15.0).unwrap();
+        let d = 2.0 / 3600.0;
+        assert!(matches!(
+            convolve_uv(&img, &old, &new, d, d, Some(&plans)),
+            Err(ConvolveError::PlanSize { .. })
+        ));
     }
 
     #[test]
@@ -1180,7 +1127,7 @@ mod tests {
         let per_call = convolve_uv(&img, &old, &new, dx, dx, None).unwrap();
 
         let plans = FftPlans::<f32>::new(n, n);
-        let reused = convolve_uv_with_plans(&img, &old, &new, dx, dx, None, &plans).unwrap();
+        let reused = convolve_uv(&img, &old, &new, dx, dx, Some(&plans)).unwrap();
 
         for (a, b) in per_call.image.iter().zip(reused.image.iter()) {
             assert_eq!(a.to_bits(), b.to_bits(), "plan reuse changed output");

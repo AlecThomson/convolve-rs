@@ -10,7 +10,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
 use crate::convolve_uv::FftFloat;
-use crate::smooth::{BrightnessUnit, smooth_view};
+use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
 
 /// A 2-D Gaussian representation of a radio telescope's PSF (beam).
 ///
@@ -33,7 +33,7 @@ use crate::smooth::{BrightnessUnit, smooth_view};
 /// Examples:
 ///     >>> from convolve_rs import Beam
 ///     >>> beam = Beam(0.005, 0.004, 30.0)
-///     >>> beam.major_deg()
+///     >>> beam.major_deg
 ///     0.005
 ///     >>> round(beam.major_arcsec, 6)
 ///     18.0
@@ -74,7 +74,7 @@ impl PyBeam {
     /// Examples:
     ///     >>> from convolve_rs import Beam
     ///     >>> beam = Beam.from_arcsec(18.0, 14.4, 30.0)
-    ///     >>> beam.major_deg()
+    ///     >>> beam.major_deg
     ///     0.005
     #[classmethod]
     fn from_arcsec<'py>(
@@ -292,7 +292,6 @@ fn smooth_typed<'py, T>(
     new_beam: &Beam,
     dx_deg: f64,
     dy_deg: f64,
-    cutoff_arcsec: Option<f64>,
     unit: BrightnessUnit,
 ) -> PyResult<Bound<'py, PyAny>>
 where
@@ -300,17 +299,7 @@ where
 {
     let view = arr.as_array();
     let out = py
-        .detach(|| {
-            smooth_view(
-                view,
-                old_beam,
-                new_beam,
-                dx_deg,
-                dy_deg,
-                cutoff_arcsec,
-                unit,
-            )
-        })
+        .detach(|| rust_smooth(view, old_beam, new_beam, dx_deg, dy_deg, unit, None))
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(out.into_pyarray(py).into_any())
 }
@@ -405,6 +394,14 @@ fn smooth<'py>(
     cutoff_arcsec: Option<f64>,
     bunit: Option<&str>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(cutoff) = cutoff_arcsec
+        && old_beam.inner.major_arcsec() > cutoff
+    {
+        return Err(PyValueError::new_err(format!(
+            "old_beam BMAJ ({:.2}\") exceeds the cutoff ({cutoff}\")",
+            old_beam.inner.major_arcsec()
+        )));
+    }
     let unit = resolve_unit(py, bunit)?;
     let image = &native_byte_order(image)?;
 
@@ -419,7 +416,6 @@ fn smooth<'py>(
             &new_beam.inner,
             dx_deg,
             dy_deg,
-            cutoff_arcsec,
             unit,
         );
     }
@@ -431,7 +427,6 @@ fn smooth<'py>(
             &new_beam.inner,
             dx_deg,
             dy_deg,
-            cutoff_arcsec,
             unit,
         );
     }

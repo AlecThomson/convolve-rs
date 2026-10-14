@@ -361,8 +361,8 @@ fn test_smooth_beam_area_ratio() {
         &target,
         pix_deg,
         pix_deg,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .unwrap();
 
@@ -417,8 +417,8 @@ fn test_smooth_nan_propagation() {
         &target,
         pix_deg,
         pix_deg,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .unwrap();
 
@@ -528,8 +528,8 @@ fn test_smooth_matches_miriad() {
         &target,
         pix_deg,
         pix_deg,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .expect("Rust smooth failed");
 
@@ -605,8 +605,8 @@ fn test_kelvin_matches_miriad() {
         &target,
         pix_deg,
         pix_deg,
-        None,
         BrightnessUnit::Kelvin,
+        None,
     )
     .expect("Rust smooth failed");
 
@@ -880,7 +880,8 @@ fn test_cube_io_roundtrip() {
     assert!(meta.is_4d);
 
     for c in 0..nchan {
-        let plane = cube_io::read_channel(&path, c, &meta)
+        let plane = cube_io::CubeReader::open(&path)
+            .and_then(|mut r| r.read_channel::<f32>(c, &meta))
             .unwrap_or_else(|e| panic!("read_channel({c}) failed: {e}"));
         let expected = (c as f32 + 1.0) * 10.0;
         for &v in plane.iter() {
@@ -958,8 +959,8 @@ fn test_cube_channel_beam_area_ratio() {
             &target,
             pix_deg,
             pix_deg,
-            None,
             BrightnessUnit::JyPerBeam,
+            None,
         )
         .unwrap();
 
@@ -1022,8 +1023,8 @@ fn test_cube_smoothed_matches_miriad_3d() {
             &target,
             pix_deg,
             pix_deg,
-            None,
             BrightnessUnit::JyPerBeam,
+            None,
         )
         .expect("smooth failed");
         let rust_flat: Vec<f32> = rust_plane.into_raw_vec_and_offset().0;

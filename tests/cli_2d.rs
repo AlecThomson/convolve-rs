@@ -152,8 +152,8 @@ fn f64_image_keeps_precision() {
         &Beam::from_arcsec(20.0, 20.0, 0.0).unwrap(),
         PIX_DEG,
         PIX_DEG,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .unwrap();
     let out = dir.join("a.sm.fits");
@@ -186,8 +186,8 @@ fn four_d_image_uses_first_plane() {
         &Beam::from_arcsec(20.0, 20.0, 0.0).unwrap(),
         PIX_DEG,
         PIX_DEG,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .unwrap();
     let out = dir.join("a.sm.fits");

@@ -1,12 +1,7 @@
-//! Regression tests for cube output initialisation and per-channel writes.
-//!
-//! Guards against a bug where `init_output_cube` produced an output whose
-//! primary HDU had NAXIS=0 (the header was never copied), so the first
-//! `write_channel` failed with the misleading cfitsio error 302
-//! ("column number < 1 or > tfields").
+//! Cube I/O round trips and end-to-end `convolvers 3d` runs.
 
 use convolve_rs::beam::Beam;
-use convolve_rs::cube_io::{self, CubeMode};
+use convolve_rs::cube_io::{self, CubeElem, CubeMode, CubeReader, CubeWriter};
 use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 use ndarray::Array2;
@@ -65,6 +60,33 @@ fn make_cube(path: &std::path::Path) {
     t.write_col(&mut f, "POL", &[0i32; NFREQ]).unwrap();
 }
 
+/// Write `planes` (if any) to a new cube made from `input`'s header.
+fn write_cube<T: CubeElem>(
+    input: &std::path::Path,
+    out: &std::path::Path,
+    target: &[Option<Beam>],
+    mode: CubeMode,
+    meta: &cube_io::CubeMeta,
+    planes: &[Array2<T>],
+) -> Result<(), cube_io::CubeError> {
+    let mut w = CubeWriter::create(input, out, target, mode, meta)?;
+    for (c, p) in planes.iter().enumerate() {
+        w.write_channel(c, p, meta)?;
+    }
+    w.finish()
+}
+
+fn read_channel<T: CubeElem>(
+    path: &std::path::Path,
+    c: usize,
+    meta: &cube_io::CubeMeta,
+) -> Array2<T> {
+    CubeReader::open(path)
+        .unwrap()
+        .read_channel(c, meta)
+        .unwrap()
+}
+
 fn workdir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("convolve_rs_test_{name}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -85,7 +107,10 @@ fn total_mode_write_channel_roundtrip() {
 
     let out = dir.join("out.fits");
     let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
-    cube_io::init_output_cube(&path, &out, &target, CubeMode::Total, &meta).unwrap();
+    let planes: Vec<_> = (0..NFREQ)
+        .map(|c| Array2::from_elem((NY, NX), c as f32 + 0.5))
+        .collect();
+    write_cube(&path, &out, &target, CubeMode::Total, &meta, &planes).unwrap();
 
     // The output primary HDU must carry the copied 3D image structure.
     {
@@ -95,14 +120,9 @@ fn total_mode_write_channel_roundtrip() {
         assert_eq!(naxis, 3, "output primary HDU lost its NAXIS=3 structure");
     }
 
-    // Write each channel a distinct constant, then read it back.
-    for c in 0..NFREQ {
-        let plane = Array2::from_elem((NY, NX), c as f32 + 0.5);
-        cube_io::write_channel(&out, c, &plane, &meta).unwrap();
-    }
     let out_meta = cube_io::read_cube_meta(&out).unwrap();
     for c in 0..NFREQ {
-        let plane = cube_io::read_channel(&out, c, &out_meta).unwrap();
+        let plane = read_channel::<f32>(&out, c, &out_meta);
         assert!(plane.iter().all(|&v| (v - (c as f32 + 0.5)).abs() < 1e-6));
     }
 }
@@ -121,7 +141,7 @@ fn masked_target_beam_round_trips_as_none() {
     let target: Vec<Option<Beam>> = (0..NFREQ)
         .map(|c| (c != 1).then(|| Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()))
         .collect();
-    cube_io::init_output_cube(&path, &out, &target, CubeMode::Natural, &meta).unwrap();
+    write_cube::<f32>(&path, &out, &target, CubeMode::Natural, &meta, &[]).unwrap();
 
     let out_meta = cube_io::read_cube_meta(&out).unwrap();
     assert!(
@@ -143,7 +163,7 @@ fn output_equal_to_input_is_rejected() {
 
     let meta = cube_io::read_cube_meta(&path).unwrap();
     let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
-    let res = cube_io::init_output_cube(&path, &path, &target, CubeMode::Total, &meta);
+    let res = write_cube::<f32>(&path, &path, &target, CubeMode::Total, &meta, &[]);
     assert!(
         res.is_err(),
         "must refuse output that resolves to the input"
@@ -167,12 +187,10 @@ fn natural_mode_write_channel_and_beams() {
     let target: Vec<Option<Beam>> = (0..NFREQ)
         .map(|c| Some(Beam::from_arcsec(25.0 + c as f64, 20.0, 0.0).unwrap()))
         .collect();
-    cube_io::init_output_cube(&path, &out, &target, CubeMode::Natural, &meta).unwrap();
-
-    for c in 0..NFREQ {
-        let plane = Array2::from_elem((NY, NX), c as f32 + 0.5);
-        cube_io::write_channel(&out, c, &plane, &meta).unwrap();
-    }
+    let planes: Vec<_> = (0..NFREQ)
+        .map(|c| Array2::from_elem((NY, NX), c as f32 + 0.5))
+        .collect();
+    write_cube(&path, &out, &target, CubeMode::Natural, &meta, &planes).unwrap();
 
     // BEAMS extension must round-trip the per-channel target beams.
     let out_meta = cube_io::read_cube_meta(&out).unwrap();
@@ -195,7 +213,7 @@ fn casambm_is_logical_not_string() {
 
     // Total mode → CASAMBM = F (logical), single HDU.
     let total = dir.join("total.fits");
-    cube_io::init_output_cube(&path, &total, &target, CubeMode::Total, &meta).unwrap();
+    write_cube::<f32>(&path, &total, &target, CubeMode::Total, &meta, &[]).unwrap();
     {
         let mut f = FitsFile::edit(total.to_string_lossy().to_string()).unwrap();
         let hdu = f.primary_hdu().unwrap();
@@ -207,7 +225,7 @@ fn casambm_is_logical_not_string() {
 
     // Natural mode → CASAMBM = T (logical) + BEAMS table with column units.
     let nat = dir.join("natural.fits");
-    cube_io::init_output_cube(&path, &nat, &target, CubeMode::Natural, &meta).unwrap();
+    write_cube::<f32>(&path, &nat, &target, CubeMode::Natural, &meta, &[]).unwrap();
     {
         let mut f = FitsFile::edit(nat.to_string_lossy().to_string()).unwrap();
         let hdu = f.primary_hdu().unwrap();
@@ -322,7 +340,7 @@ fn cli_total_mode_smooths_cube() {
     // Every channel the streaming writer produced must hold real, finite pixels
     // (a point source convolved to a Gaussian) — not zeros or NaNs.
     for c in 0..NFREQ {
-        let plane = cube_io::read_channel(&out, c, &meta).unwrap();
+        let plane = read_channel::<f32>(&out, c, &meta);
         assert!(
             plane.iter().all(|v| v.is_finite()),
             "channel {c} has non-finite pixels"
@@ -426,19 +444,15 @@ fn f64_cube_detects_dtype_and_roundtrips() {
 
     let out = dir.join("out.fits");
     let target = vec![Some(Beam::from_arcsec(25.0, 20.0, 0.0).unwrap()); NFREQ];
-    cube_io::init_output_cube(&path, &out, &target, CubeMode::Total, &meta).unwrap();
-
     // 1 + 1e-10 is not representable in f32, so an f32 round-trip would lose it.
     let val = 1.0 + 1e-10_f64;
-    for c in 0..NFREQ {
-        let plane = Array2::from_elem((NY, NX), val);
-        cube_io::write_channel_as::<f64>(&out, c, &plane, &meta).unwrap();
-    }
+    let planes = vec![Array2::from_elem((NY, NX), val); NFREQ];
+    write_cube(&path, &out, &target, CubeMode::Total, &meta, &planes).unwrap();
 
     let out_meta = cube_io::read_cube_meta(&out).unwrap();
     assert_eq!(out_meta.dtype, PixelType::F64, "output kept BITPIX -64");
     for c in 0..NFREQ {
-        let plane = cube_io::read_channel_as::<f64>(&out, c, &out_meta).unwrap();
+        let plane = read_channel::<f64>(&out, c, &out_meta);
         assert!(
             plane.iter().all(|&v| v == val),
             "f64 channel {c} did not round-trip exactly"
@@ -470,7 +484,7 @@ fn cli_total_mode_smooths_f64_cube() {
     assert_eq!(meta.nfreq, NFREQ);
 
     for c in 0..NFREQ {
-        let plane = cube_io::read_channel_as::<f64>(&out, c, &meta).unwrap();
+        let plane = read_channel::<f64>(&out, c, &meta);
         assert!(
             plane.iter().all(|v| v.is_finite()),
             "channel {c} has non-finite pixels"
@@ -490,73 +504,6 @@ fn read_primary_beam_keys(path: &std::path::Path) -> (f64, f64, f64, bool) {
         hdu.read_key(&mut f, "BPA").unwrap(),
         hdu.read_key(&mut f, "CASAMBM").unwrap(),
     )
-}
-
-/// The streaming `CubeWriter::create`/`finish` path (handle held open, data unit
-/// written once) must produce output identical to the legacy create-close-reopen
-/// `init_output_cube` + `write_channel` path: same primary beam keywords, same
-/// CASAMBM logical, same per-channel BEAMS table, and the same channel pixels.
-/// This pins the performance refactor to byte-for-byte behaviour preservation.
-#[test]
-fn streaming_writer_matches_init_output_cube() {
-    for mode in [CubeMode::Total, CubeMode::Natural] {
-        let tag = if mode == CubeMode::Natural {
-            "stream_nat"
-        } else {
-            "stream_tot"
-        };
-        let dir = workdir(tag);
-        let path = dir.join("in.fits");
-        make_cube(&path);
-        let meta = cube_io::read_cube_meta(&path).unwrap();
-
-        // Distinct per-channel target beams so the BEAMS table is non-trivial.
-        let target: Vec<Option<Beam>> = (0..NFREQ)
-            .map(|c| Some(Beam::from_arcsec(25.0 + c as f64, 20.0, 5.0).unwrap()))
-            .collect();
-        let planes: Vec<Array2<f32>> = (0..NFREQ)
-            .map(|c| Array2::from_elem((NY, NX), c as f32 + 0.5))
-            .collect();
-
-        // Legacy path: init (create-close-reopen) then per-channel write.
-        let legacy = dir.join("legacy.fits");
-        cube_io::init_output_cube(&path, &legacy, &target, mode, &meta).unwrap();
-        for (c, plane) in planes.iter().enumerate() {
-            cube_io::write_channel(&legacy, c, plane, &meta).unwrap();
-        }
-
-        // Streaming path: single open handle from create through finish.
-        let stream = dir.join("stream.fits");
-        {
-            let mut w = cube_io::CubeWriter::create(&path, &stream, &target, mode, &meta).unwrap();
-            // Write out of order to mimic the parallel pipeline's arrival order.
-            for c in (0..NFREQ).rev() {
-                w.write_channel(c, &planes[c], &meta).unwrap();
-            }
-            w.finish().unwrap();
-        }
-
-        // Primary beam keywords + CASAMBM must match exactly.
-        assert_eq!(
-            read_primary_beam_keys(&legacy),
-            read_primary_beam_keys(&stream),
-            "{tag}: primary beam keywords differ between paths"
-        );
-
-        // BEAMS table (or its absence) and channel pixels must match.
-        let lm = cube_io::read_cube_meta(&legacy).unwrap();
-        let sm = cube_io::read_cube_meta(&stream).unwrap();
-        for c in 0..NFREQ {
-            assert_eq!(
-                lm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg())),
-                sm.beams[c].map(|b| (b.major_arcsec(), b.minor_arcsec(), b.pa_deg())),
-                "{tag}: channel {c} beam differs"
-            );
-            let lp = cube_io::read_channel(&legacy, c, &lm).unwrap();
-            let sp = cube_io::read_channel(&stream, c, &sm).unwrap();
-            assert_eq!(lp, sp, "{tag}: channel {c} pixels differ");
-        }
-    }
 }
 
 /// Build a 3D point-source cube with the given per-channel BEAMS table.
@@ -648,7 +595,7 @@ fn cli_masked_channel_is_blanked_not_infinite() {
     let meta = cube_io::read_cube_meta(&out).unwrap();
 
     // Masked channel 1: entirely NaN (blanked), with no infinities.
-    let masked = cube_io::read_channel(&out, 1, &meta).unwrap();
+    let masked = read_channel::<f32>(&out, 1, &meta);
     assert!(
         masked.iter().all(|v| v.is_nan()),
         "masked channel should be all-NaN, got finite/zero pixels"
@@ -656,7 +603,7 @@ fn cli_masked_channel_is_blanked_not_infinite() {
 
     // Valid channels: finite, non-empty, and crucially not infinite.
     for c in [0, 2] {
-        let plane = cube_io::read_channel(&out, c, &meta).unwrap();
+        let plane = read_channel::<f32>(&out, c, &meta);
         assert!(
             plane.iter().all(|v| v.is_finite()),
             "channel {c} has non-finite pixels"
@@ -794,11 +741,11 @@ fn casa_axis_order_cube_is_read_and_smoothed() {
     let out_meta = cube_io::read_cube_meta(&out).unwrap();
     assert_eq!((out_meta.nfreq, out_meta.nstokes), (NFREQ, 1));
     for c in 0..NFREQ {
-        let plane = cube_io::read_channel(&out, c, &out_meta).unwrap();
+        let plane = read_channel::<f32>(&out, c, &out_meta);
         // Channel c's point source had amplitude 1 + c, so the smoothed peaks
         // keep that order: the channels were not shuffled or mixed up.
         let peak = plane.iter().cloned().fold(f32::MIN, f32::max);
-        let first = cube_io::read_channel(&out, 0, &out_meta).unwrap();
+        let first = read_channel::<f32>(&out, 0, &out_meta);
         let first_peak = first.iter().cloned().fold(f32::MIN, f32::max);
         assert!(
             (peak / first_peak - (1.0 + c as f32)).abs() < 1e-3,
@@ -913,14 +860,12 @@ fn cli_target_ignores_cutoff_channels() {
     let out = dir.join("in.sm.fits");
     let meta = cube_io::read_cube_meta(&out).unwrap();
     assert!(
-        cube_io::read_channel(&out, 1, &meta)
-            .unwrap()
+        read_channel::<f32>(&out, 1, &meta)
             .iter()
             .all(|v| v.is_nan())
     );
     assert!(
-        cube_io::read_channel(&out, 0, &meta)
-            .unwrap()
+        read_channel::<f32>(&out, 0, &meta)
             .iter()
             .all(|v| v.is_finite())
     );
@@ -947,14 +892,46 @@ fn cli_integer_cube_writes_floats() {
     assert_eq!(bitpix, -32);
     let meta = cube_io::read_cube_meta(&out).unwrap();
     assert!(
-        cube_io::read_channel(&out, 1, &meta)
-            .unwrap()
+        read_channel::<f32>(&out, 1, &meta)
             .iter()
             .all(|v| v.is_nan())
     );
-    let plane = cube_io::read_channel(&out, 0, &meta).unwrap();
+    let plane = read_channel::<f32>(&out, 0, &meta);
     assert!(
         plane.iter().any(|v| v.fract() != 0.0),
         "values were rounded"
+    );
+}
+
+/// A channel over the cutoff is blanked even when the target could contain it.
+#[test]
+fn cli_cutoff_blanks_even_when_target_contains() {
+    let dir = workdir("cli_cutoff_contained");
+    let path = dir.join("in.fits");
+    make_cube_with_beams(
+        &path,
+        &[16.0, 30.0, 18.0],
+        &[12.0, 30.0, 14.0],
+        &[0.0, 0.0, 10.0],
+    );
+    let (ok, log) = run_cli(&[
+        "3d",
+        path.to_str().unwrap(),
+        "--cutoff",
+        "20",
+        "--bmaj",
+        "40",
+        "--bmin",
+        "40",
+        "--bpa",
+        "0",
+    ]);
+    assert!(ok, "{log}");
+    let out = dir.join("in.sm.fits");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    assert!(
+        read_channel::<f32>(&out, 1, &meta)
+            .iter()
+            .all(|v| v.is_nan())
     );
 }
