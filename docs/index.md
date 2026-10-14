@@ -17,7 +17,7 @@ performance.md
 ## Rust API
 
 The Rust crate is documented separately on
-[docs.rs/convolve-rs](https://docs.rs/convolve-rs) — the Python API on this
+[docs.rs/convolve-rs](https://docs.rs/convolve-rs). The Python API on this
 site is a thin binding over it.
 
 ## Indices and tables

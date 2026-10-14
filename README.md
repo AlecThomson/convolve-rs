@@ -63,7 +63,7 @@ This overwrites `convolve_rs/_convolve_rs.pyi` from the Rust annotations and doc
 
 **Python** tests need the compiled extension and the `test` extra (`pytest`,
 `radio-beam`, `astropy`). `uv sync` builds the maturin extension into `.venv`,
-so a plain `uvx pytest` won't work — it runs in an isolated env with neither the
+so a plain `uvx pytest` won't work: it runs in an isolated env with neither the
 module nor the deps:
 
 ```sh

@@ -6,19 +6,16 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use ndarray::Array2;
 use rayon::prelude::*;
-use tracing::{debug, info, warn};
+use tracing::{Level, debug, info, warn};
 
 use convolve_rs::{
     beam::Beam,
     common_beam::{common_beam, fits_in_beam},
     convolve_uv::FftPlans,
-    cube_io::PixelType,
-    cube_io::{self, CubeElem, CubeMeta, CubeMode},
+    cube_io::{self, CubeElem, CubeMeta, CubeMode, CubeReader, CubeWriter, PixelType},
     fits_io::{FitsImageHeader, output_path, read_fits_header, read_fits_plane, write_fits},
-    smooth::smooth_owned_with_plans,
+    smooth::smooth,
 };
-
-// ── Top-level CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(
@@ -42,14 +39,11 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    match Cli::parse().command {
         Commands::TwoD(args) => cmd_2d(args),
         Commands::ThreeD(args) => cmd_3d(args),
     }
 }
-
-// ── Shared args ────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug, Clone)]
 struct SharedArgs {
@@ -81,7 +75,7 @@ struct SharedArgs {
     #[arg(long)]
     circularise: bool,
 
-    /// Beam size cutoff in arcsec — blank images/channels with BMAJ larger than this.
+    /// Beam size cutoff in arcsec: blank images/channels with BMAJ larger than this.
     #[arg(short, long)]
     cutoff: Option<f64>,
 
@@ -106,7 +100,23 @@ struct SharedArgs {
     verbose: u8,
 }
 
-// ── 2D subcommand ─────────────────────────────────────────────────────────────
+impl SharedArgs {
+    fn output_for(&self, file: &Path) -> PathBuf {
+        output_path(
+            file,
+            Some(&self.suffix),
+            self.prefix.as_deref(),
+            self.outdir.as_deref(),
+        )
+    }
+
+    fn common_beam(&self, beams: &[Beam]) -> Result<Beam> {
+        let cb = common_beam(beams, self.tolerance, self.nsamps, self.epsilon)?;
+        round_common_beam(cb, beams)
+    }
+}
+
+// ── 2D ────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 struct TwoDArgs {
@@ -136,21 +146,68 @@ struct BeamLogEntry2D {
 
 fn cmd_2d(args: TwoDArgs) -> Result<()> {
     init_logging(args.shared.verbose);
-
     let files = collect_files(&args.infile, args.listfile)?;
-    let target_beam = parse_target_beam(&args.shared)?;
     let cutoff = args.shared.cutoff;
 
-    let sp = spinner(format!(
-        "Reading beam parameters from {} file(s)…",
-        files.len()
-    ));
+    let sp = spinner(format!("Reading headers of {} file(s)…", files.len()));
     let headers: Vec<FitsImageHeader> = files
-        .iter()
+        .par_iter()
         .map(|f| read_fits_header(f).with_context(|| format!("reading {}", f.display())))
         .collect::<Result<_>>()?;
     sp.finish_and_clear();
-    for h in &headers {
+    warn_blanked_images(&headers, cutoff);
+
+    let valid: Vec<Beam> = headers
+        .iter()
+        .map(|h| h.beam)
+        .filter(|b| usable_beam(b, cutoff))
+        .collect();
+    anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
+    let common = match parse_target_beam(&args.shared)? {
+        Some(b) => b,
+        None => {
+            let sp = spinner("Solving for the common beam…");
+            let cb = args.shared.common_beam(&valid)?;
+            sp.finish_and_clear();
+            cb
+        }
+    };
+    let common = finish_target(common, &valid, args.shared.circularise)?;
+    info!("Common beam: {common}");
+
+    if args.shared.dryrun {
+        // stdout, so callers can capture it; logs go to stderr.
+        println!("{common}");
+        info!("Dry run: no files written.");
+        return Ok(());
+    }
+
+    let pb = progress_bar(files.len() as u64);
+    let process = |header: &FitsImageHeader| -> Result<BeamLogEntry2D> {
+        let out = args.shared.output_for(&header.path);
+        let entry = smooth_image(header, &out, &common, cutoff)?;
+        pb.suspend(|| info!("{} → {}", header.path.display(), out.display()));
+        pb.inc(1);
+        Ok(entry)
+    };
+    // With fewer images than threads, smooth one at a time and let each
+    // convolution use the whole pool.
+    let results: Vec<BeamLogEntry2D> = if headers.len() >= rayon::current_num_threads() {
+        headers.par_iter().map(process).collect::<Result<_>>()?
+    } else {
+        headers.iter().map(process).collect::<Result<_>>()?
+    };
+    pb.finish_with_message("done");
+
+    if let Some(log_path) = &args.log {
+        write_2d_beamlog(log_path, &results)?;
+        info!("Beamlog written to {}", log_path.display());
+    }
+    Ok(())
+}
+
+fn warn_blanked_images(headers: &[FitsImageHeader], cutoff: Option<f64>) {
+    for h in headers {
         if !usable_beam(&h.beam, None) {
             warn!(
                 "{}: beam {} has zero size; will be blanked",
@@ -166,112 +223,37 @@ fn cmd_2d(args: TwoDArgs) -> Result<()> {
             );
         }
     }
-
-    let valid: Vec<Beam> = headers
-        .iter()
-        .map(|h| h.beam)
-        .filter(|b| usable_beam(b, cutoff))
-        .collect();
-    anyhow::ensure!(!valid.is_empty(), "all beams are flagged or invalid");
-    let common = match target_beam {
-        Some(b) => b,
-        None => {
-            let sp = spinner("Solving for the common beam…");
-            let cb = common_beam(
-                &valid,
-                args.shared.tolerance,
-                args.shared.nsamps,
-                args.shared.epsilon,
-            )
-            .context("could not find common beam")?;
-            sp.finish_and_clear();
-            round_common_beam(cb, &valid)?
-        }
-    };
-    let common = finish_target(common, &valid, args.shared.circularise)?;
-
-    info!("Common beam: {common}");
-
-    if args.shared.dryrun {
-        // Emit the result on stdout (tracing logs to stderr) so `--dryrun` stays
-        // machine-readable for callers that capture it.
-        println!("{common}");
-        info!("Dry run: no files written.");
-        return Ok(());
-    }
-
-    let pb = progress_bar(files.len() as u64);
-
-    let results: Vec<BeamLogEntry2D> = headers
-        .par_iter()
-        .map(|header| {
-            let file = &header.path;
-            let out = output_path(
-                file,
-                Some(&args.shared.suffix),
-                args.shared.prefix.as_deref(),
-                args.shared.outdir.as_deref(),
-            );
-            let old_beam = header.beam;
-            let conv_beam =
-                usable_beam(&old_beam, cutoff).then(|| common.deconvolve_or_zero(&old_beam));
-            if let Some(conv_beam) = conv_beam {
-                pb.suspend(|| {
-                    debug!(
-                        "{}: current {old_beam} | target {common} | kernel {conv_beam}",
-                        file.display()
-                    )
-                });
-            }
-            let blank = conv_beam.is_none();
-            match header.dtype {
-                PixelType::F32 => smooth_image::<f32>(header, &out, &common, blank),
-                PixelType::F64 => smooth_image::<f64>(header, &out, &common, blank),
-            }?;
-            pb.suspend(|| info!("{} → {}", file.display(), out.display()));
-            pb.inc(1);
-            Ok(BeamLogEntry2D {
-                filename: out,
-                old_beam,
-                new_beam: common,
-                conv_beam,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    pb.finish_with_message("done");
-
-    if let Some(log_path) = &args.log {
-        use std::fmt::Write as _;
-        let mut out = String::from(
-            "# FileName OldBMAJ[deg] OldBMIN[deg] OldBPA[deg] TargetBMAJ[deg] TargetBMIN[deg] TargetBPA[deg] ConvBMAJ[deg] ConvBMIN[deg] ConvBPA[deg]\n",
-        );
-        for e in &results {
-            let conv = e.conv_beam.map_or("nan nan nan".to_string(), |b| {
-                format!("{} {} {}", b.major_deg, b.minor_deg, b.pa_deg)
-            });
-            writeln!(
-                out,
-                "{} {} {} {} {} {} {} {conv}",
-                e.filename.display(),
-                e.old_beam.major_deg,
-                e.old_beam.minor_deg,
-                e.old_beam.pa_deg,
-                e.new_beam.major_deg,
-                e.new_beam.minor_deg,
-                e.new_beam.pa_deg,
-            )?;
-        }
-        std::fs::write(log_path, out)?;
-        info!("Beamlog written to {}", log_path.display());
-    }
-
-    Ok(())
 }
 
-/// Smooth one image to `target` at pixel precision `T`, or write it as NaN if
-/// `blank` is set.
-fn smooth_image<T: CubeElem>(
+/// Smooth one image to `target`, or write it as NaN if its beam is unusable.
+fn smooth_image(
+    header: &FitsImageHeader,
+    out: &Path,
+    target: &Beam,
+    cutoff: Option<f64>,
+) -> Result<BeamLogEntry2D> {
+    let old_beam = header.beam;
+    let conv_beam = usable_beam(&old_beam, cutoff).then(|| target.deconvolve_or_zero(&old_beam));
+    if let Some(conv) = conv_beam {
+        debug!(
+            "{}: current {old_beam} | target {target} | kernel {conv}",
+            header.path.display()
+        );
+    }
+    let blank = conv_beam.is_none();
+    match header.dtype {
+        PixelType::F32 => smooth_image_as::<f32>(header, out, target, blank),
+        PixelType::F64 => smooth_image_as::<f64>(header, out, target, blank),
+    }?;
+    Ok(BeamLogEntry2D {
+        filename: out.to_path_buf(),
+        old_beam,
+        new_beam: *target,
+        conv_beam,
+    })
+}
+
+fn smooth_image_as<T: CubeElem>(
     header: &FitsImageHeader,
     out: &Path,
     target: &Beam,
@@ -283,31 +265,56 @@ fn smooth_image<T: CubeElem>(
     } else {
         let data =
             read_fits_plane::<T>(header).with_context(|| format!("reading {}", file.display()))?;
-        let plans = FftPlans::new(header.ny, header.nx);
-        smooth_owned_with_plans(
+        smooth(
             data,
             &header.beam,
             target,
             header.dx_deg,
             header.dy_deg,
-            None,
             header.unit,
-            &plans,
+            None,
         )
         .with_context(|| format!("smoothing {}", file.display()))?
     };
-    write_fits(&image, out, file, target, header.is_4d)
-        .with_context(|| format!("writing {}", out.display()))
+    write_fits(&image, out, file, target).with_context(|| format!("writing {}", out.display()))
 }
 
-// ── 3D subcommand ─────────────────────────────────────────────────────────────
+fn write_2d_beamlog(path: &Path, entries: &[BeamLogEntry2D]) -> Result<()> {
+    let deg = |b: &Beam| format!("{} {} {}", b.major_deg(), b.minor_deg(), b.pa_deg());
+    let mut out = String::from(
+        "# FileName OldBMAJ[deg] OldBMIN[deg] OldBPA[deg] TargetBMAJ[deg] TargetBMIN[deg] \
+         TargetBPA[deg] ConvBMAJ[deg] ConvBMIN[deg] ConvBPA[deg]\n",
+    );
+    for e in entries {
+        let conv = e.conv_beam.as_ref().map_or("nan nan nan".into(), deg);
+        out += &format!(
+            "{} {} {} {conv}\n",
+            e.filename.display(),
+            deg(&e.old_beam),
+            deg(&e.new_beam)
+        );
+    }
+    std::fs::write(path, out)?;
+    Ok(())
+}
 
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+// ── 3D ────────────────────────────────────────────────────────────────────────
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum ModeArg {
     /// Per-channel common beam across all input cubes.
     Natural,
     /// Single common beam across all channels and cubes.
     Total,
+}
+
+impl From<ModeArg> for CubeMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::Natural => CubeMode::Natural,
+            ModeArg::Total => CubeMode::Total,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -330,371 +337,285 @@ struct ThreeDArgs {
 
 fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     init_logging(args.shared.verbose);
-
     let files = collect_files(&args.infile, args.listfile)?;
-
-    let sp = spinner(format!("Reading metadata from {} cube(s)…", files.len()));
-    let metas: Vec<CubeMeta> = files
-        .iter()
-        .map(|f| {
-            sp.suspend(|| debug!("Reading metadata + per-channel beams from {}", f.display()));
-            let m = cube_io::read_cube_meta(f)
-                .with_context(|| format!("reading metadata from {}", f.display()))?;
-            sp.suspend(|| {
-                debug!(
-                    "{}: {}×{} px, {} channels, {} Stokes",
-                    f.display(),
-                    m.nx,
-                    m.ny,
-                    m.nfreq,
-                    m.nstokes
-                )
-            });
-            Ok(m)
-        })
-        .collect::<Result<_>>()?;
-    sp.finish_and_clear();
-    info!(
-        "Read metadata from {} cube(s), {} channel(s) each",
-        files.len(),
-        metas[0].nfreq
-    );
-
+    let metas = read_cube_metas(&files)?;
     let nfreq = metas[0].nfreq;
-    for (f, m) in files.iter().zip(metas.iter()) {
-        anyhow::ensure!(
-            m.nfreq == nfreq,
-            "{}: expected {} channels, got {}",
-            f.display(),
-            nfreq,
-            m.nfreq
-        );
-        anyhow::ensure!(
-            m.nstokes <= 1,
-            "{}: {} Stokes planes are not supported — only Stokes 0 \
-             would be convolved while the other Stokes planes are written as \
-             zeros, producing a misleading cube. Extract a single Stokes plane \
-             first.",
-            f.display(),
-            m.nstokes
-        );
-    }
+    let mode = CubeMode::from(args.mode);
 
-    let target_beam = parse_target_beam(&args.shared)?;
-
-    let target_beams: Vec<Option<Beam>> = if let Some(b) = target_beam {
-        let all_valid: Vec<Beam> = metas
-            .iter()
-            .flat_map(|m| m.beams.iter())
-            .filter_map(|b| *b)
-            .filter(|b| usable_beam(b, args.shared.cutoff))
-            .collect();
-        let b = finish_target(b, &all_valid, args.shared.circularise)?;
-        vec![Some(b); nfreq]
-    } else {
-        let mode = match args.mode {
-            ModeArg::Natural => CubeMode::Natural,
-            ModeArg::Total => CubeMode::Total,
-        };
-        let sp = spinner(match mode {
-            CubeMode::Natural => "Solving for per-channel common beams…".to_string(),
-            CubeMode::Total => "Solving for the common beam across all channels…".to_string(),
-        });
-        let beams = compute_target_beams(
-            &metas,
-            mode,
-            args.shared.cutoff,
-            args.shared.circularise,
-            args.shared.tolerance,
-            args.shared.nsamps,
-            args.shared.epsilon,
-        )?;
-        sp.finish_and_clear();
-        beams
+    let target_beams = match parse_target_beam(&args.shared)? {
+        Some(b) => {
+            let valid: Vec<Beam> = metas
+                .iter()
+                .flat_map(|m| m.beams.iter().flatten())
+                .copied()
+                .filter(|b| usable_beam(b, args.shared.cutoff))
+                .collect();
+            vec![Some(finish_target(b, &valid, args.shared.circularise)?); nfreq]
+        }
+        None => {
+            let sp = spinner(match mode {
+                CubeMode::Natural => "Solving for per-channel common beams…",
+                CubeMode::Total => "Solving for the common beam across all channels…",
+            });
+            let beams = compute_target_beams(&metas, mode, &args.shared)?;
+            sp.finish_and_clear();
+            beams
+        }
     };
 
-    // Report the target beam(s).  In `total` mode (or with an explicit target) all
-    // channels share one beam, so print it directly.  In `natural` mode every channel
-    // has its own target, so summarise the count and defer the per-channel detail to
-    // verbose logging in the processing loop below.
-    let n_valid = target_beams.iter().filter(|b| b.is_some()).count();
-    let all_same = target_beams
-        .iter()
-        .filter_map(|b| *b)
-        .collect::<Vec<_>>()
-        .windows(2)
-        .all(|w| w[0] == w[1]);
-    match target_beams.iter().find_map(|b| *b) {
-        Some(b) if all_same => info!("Target beam (all channels): {b}"),
-        Some(b) => {
-            info!("Target beam varies per channel ({n_valid} valid channels); e.g. channel 0: {b}");
-            info!("Run with -v to log the current/target/kernel beam for every channel.");
-        }
-        None => {}
-    }
-
+    let all_same = report_targets(&target_beams);
     if args.shared.dryrun {
-        // Emit the resolved target beam(s) on stdout (tracing logs to stderr) so
-        // `--dryrun` stays machine-readable: one beam when all channels share it,
-        // otherwise one `<channel> <beam>` line per channel.
-        if all_same {
-            if let Some(b) = target_beams.iter().find_map(|b| *b) {
-                println!("{b}");
-            }
-        } else {
-            for (c, b) in target_beams.iter().enumerate() {
-                match b {
-                    Some(b) => println!("{c} {b}"),
-                    None => println!("{c} masked"),
+        // stdout, so callers can capture it: one beam if all channels share
+        // it, else one `<channel> <beam>` line per channel.
+        match target_beams.iter().find_map(|b| *b) {
+            Some(b) if all_same => println!("{b}"),
+            _ => {
+                for (c, b) in target_beams.iter().enumerate() {
+                    match b {
+                        Some(b) => println!("{c} {b}"),
+                        None => println!("{c} masked"),
+                    }
                 }
             }
         }
-        info!("Dry run — no files written.");
+        info!("Dry run: no files written.");
         return Ok(());
     }
 
-    let cube_mode = match args.mode {
-        ModeArg::Natural => CubeMode::Natural,
-        ModeArg::Total => CubeMode::Total,
-    };
-
     let pb = progress_bar((files.len() * nfreq) as u64);
-
-    for (file, meta) in files.iter().zip(metas.iter()) {
-        let out = output_path(
-            file,
-            Some(&args.shared.suffix),
-            args.shared.prefix.as_deref(),
-            args.shared.outdir.as_deref(),
-        );
-
-        // The output cube is created and held open by the writer thread inside
-        // `process_cube` (see `CubeWriter::create`): the single FITS handle stays
-        // open from creation through every channel write, so cfitsio writes the
-        // data unit exactly once instead of flushing a full pass of zeros on a
-        // create-close before the real planes overwrite it.  Announce the step.
+    for meta in &metas {
+        let file = &meta.path;
+        let out = args.shared.output_for(file);
         pb.suspend(|| info!("Initialising output cube {} …", out.display()));
         pb.set_message("processing");
-
-        // Stream channels through a bounded pipeline instead of materialising the
-        // whole cube in RAM (see `process_cube`).  Dispatch on the cube's pixel
-        // precision so the FFT runs at the data's native precision: f32 cubes
-        // (the common case) transform in f32, genuine f64 cubes in f64.
         match meta.dtype {
-            cube_io::PixelType::F32 => process_cube::<f32>(
-                file,
-                &out,
-                meta,
-                &target_beams,
-                cube_mode,
-                args.shared.cutoff,
-                &pb,
-            )?,
-            cube_io::PixelType::F64 => process_cube::<f64>(
-                file,
-                &out,
-                meta,
-                &target_beams,
-                cube_mode,
-                args.shared.cutoff,
-                &pb,
-            )?,
+            PixelType::F32 => {
+                process_cube::<f32>(&out, meta, &target_beams, mode, args.shared.cutoff, &pb)?
+            }
+            PixelType::F64 => {
+                process_cube::<f64>(&out, meta, &target_beams, mode, args.shared.cutoff, &pb)?
+            }
         }
-
-        let beamlog = {
-            let dir = out.parent().unwrap_or(Path::new("."));
-            let stem = out.file_stem().unwrap_or_default();
-            dir.join(format!("beamlog.{}.txt", stem.to_string_lossy()))
-        };
+        let beamlog = cube_io::beamlog_path(&out);
         cube_io::write_beamlog(&beamlog, &target_beams)
             .with_context(|| format!("writing beamlog {}", beamlog.display()))?;
-        pb.suspend(|| debug!("Beamlog written to {}", beamlog.display()));
-
         pb.suspend(|| info!("{} → {}", file.display(), out.display()));
     }
-
     pb.finish_with_message("done");
     Ok(())
 }
 
-/// Stream every channel of one cube through the bounded convolution pipeline at
-/// pixel precision `T`.
+/// Read every cube's metadata and check they can be smoothed together.
+fn read_cube_metas(files: &[PathBuf]) -> Result<Vec<CubeMeta>> {
+    let sp = spinner(format!("Reading metadata from {} cube(s)…", files.len()));
+    let metas: Vec<CubeMeta> = files
+        .par_iter()
+        .map(|f| {
+            cube_io::read_cube_meta(f)
+                .with_context(|| format!("reading metadata from {}", f.display()))
+        })
+        .collect::<Result<_>>()?;
+    sp.finish_and_clear();
+
+    let nfreq = metas[0].nfreq;
+    for m in &metas {
+        debug!(
+            "{}: {}×{} px, {} channels, {} Stokes",
+            m.path.display(),
+            m.nx,
+            m.ny,
+            m.nfreq,
+            m.nstokes
+        );
+        anyhow::ensure!(
+            m.nfreq == nfreq,
+            "{}: expected {nfreq} channels, got {}",
+            m.path.display(),
+            m.nfreq
+        );
+        // Only the first Stokes plane is convolved, so the others would be
+        // written as zeros.
+        anyhow::ensure!(
+            m.nstokes <= 1,
+            "{}: {} Stokes planes are not supported; extract a single Stokes plane first.",
+            m.path.display(),
+            m.nstokes
+        );
+    }
+    info!(
+        "Read metadata from {} cube(s), {nfreq} channel(s) each",
+        metas.len()
+    );
+    Ok(metas)
+}
+
+/// Log the target beams and return whether every channel shares one.
+fn report_targets(target_beams: &[Option<Beam>]) -> bool {
+    let valid: Vec<Beam> = target_beams.iter().flatten().copied().collect();
+    let all_same = valid.windows(2).all(|w| w[0].approx_eq(&w[1]));
+    match valid.first() {
+        Some(b) if all_same => info!("Target beam (all channels): {b}"),
+        Some(b) => {
+            info!(
+                "Target beam varies per channel ({} valid channels); e.g. channel 0: {b}",
+                valid.len()
+            );
+            info!("Run with -v to log the current/target/kernel beam for every channel.");
+        }
+        None => {}
+    }
+    all_same
+}
+
+/// Smooth every channel of one cube at pixel precision `T`.
 ///
-/// rayon convolves planes in parallel (CPU- and memory-bandwidth bound) and
-/// sends each finished plane to a single writer thread that owns the output cube
-/// and writes sequentially (cfitsio is not thread-safe).  The bounded channel
-/// caps peak memory to the in-flight planes — not the whole cube — and overlaps
-/// convolution with disk IO.  Threading (not async) fits: the work is CPU-bound
-/// and FITS IO is blocking, so an async runtime would buy nothing.
-///
-/// One [`FftPlans`] is built up front and shared by reference across all workers,
-/// so the FFTs for every channel reuse the same plans instead of re-planning per
-/// channel.
+/// rayon workers convolve channels and send them to one writer thread, which
+/// owns the output (cfitsio handles are not `Send`). The bounded channel caps
+/// memory at the planes in flight.
 fn process_cube<T: CubeElem>(
-    file: &Path,
     out: &Path,
     meta: &CubeMeta,
     target_beams: &[Option<Beam>],
-    cube_mode: CubeMode,
+    mode: CubeMode,
     cutoff: Option<f64>,
     pb: &ProgressBar,
 ) -> Result<()> {
-    // Plans depend only on the image dimensions, shared by all channels.
     let plans = FftPlans::<T>::new(meta.ny, meta.nx);
-    let nfreq = meta.nfreq;
-
     let cap = (rayon::current_num_threads() * 2).max(4);
     let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
 
     std::thread::scope(|s| {
-        // Single writer thread — creates and owns the output FITS handle.
-        // `FitsFile` holds a raw cfitsio pointer and is not `Send`, so the handle
-        // is created *on* this thread and never crosses a thread boundary. Keeping
-        // it open from creation through every channel write to `finish` means
-        // cfitsio writes the data unit exactly once (no wasted zero-fill pass).
-        let writer_handle = s.spawn(move || -> Result<()> {
-            let mut writer = cube_io::CubeWriter::create(file, out, target_beams, cube_mode, meta)
+        let writer = s.spawn(move || -> Result<()> {
+            let mut writer = CubeWriter::create(&meta.path, out, target_beams, mode, meta)
                 .with_context(|| format!("initialising output cube {}", out.display()))?;
             for (c, plane) in rx {
                 writer
-                    .write_channel_as::<T>(c, &plane, meta)
+                    .write_channel(c, &plane, meta)
                     .with_context(|| format!("writing channel {c} to {}", out.display()))?;
             }
             writer
                 .finish()
-                .with_context(|| format!("finalising output cube {}", out.display()))?;
-            Ok(())
+                .with_context(|| format!("finalising output cube {}", out.display()))
         });
 
-        // Parallel producers — convolve and stream finished planes to the writer.
-        let produce: Result<()> = (0..nfreq).into_par_iter().try_for_each(|c| {
-            // Hand a finished plane to the writer; a send error means the writer
-            // thread already exited (i.e. a write failed) — surfaced below.
-            let send = |plane: Array2<T>| -> Result<()> {
+        let produce = (0..meta.nfreq).into_par_iter().try_for_each_init(
+            || CubeReader::open(&meta.path),
+            |reader, c| {
+                let reader = reader.as_mut().map_err(|e| anyhow::anyhow!("{e}"))?;
+                let plane = smooth_channel(reader, c, meta, target_beams[c], cutoff, &plans, pb)?;
+                // A send error means the writer stopped; its error is reported below.
                 tx.send((c, plane))
                     .map_err(|_| anyhow::anyhow!("writer thread stopped before channel {c}"))?;
                 pb.inc(1);
                 Ok(())
-            };
-            let nan_plane = || Array2::from_elem((meta.ny, meta.nx), T::nan());
+            },
+        );
 
-            // A channel with no source beam, no target, or a degenerate zero beam
-            // cannot be convolved — a zero source beam makes the analytic UV
-            // filter's gain (g_ratio) diverge to infinity. Blank it with NaNs so
-            // it is written as explicit no-data rather than left as the output's
-            // zero-fill or corrupted to infinity.
-            let old_beam = match meta.beams[c] {
-                Some(b) if usable_beam(&b, None) => b,
-                _ => return send(nan_plane()),
-            };
-            let target = match target_beams[c] {
-                Some(b) if usable_beam(&b, None) => b,
-                _ => return send(nan_plane()),
-            };
-
-            // Verbose (-v) per-channel beam report: current, target, and the
-            // convolving kernel (target deconvolved from the current beam).
-            // Route through `pb.suspend` so the log never corrupts the live bar.
-            let kernel = target.deconvolve_or_zero(&old_beam);
-            pb.suspend(|| {
-                debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
-            });
-
-            let plane = if let Some(cut) = cutoff
-                && old_beam.major_arcsec() > cut
-            {
-                pb.suspend(|| {
-                    warn!(
-                        "Channel {c}: BMAJ={:.1}\" > cutoff — blanking",
-                        old_beam.major_arcsec()
-                    )
-                });
-                nan_plane()
-            } else {
-                let raw = cube_io::read_channel_as::<T>(file, c, meta)
-                    .with_context(|| format!("reading channel {c} from {}", file.display()))?;
-                // Owned: the channel is smoothed in the buffer it was read into.
-                smooth_owned_with_plans(
-                    raw,
-                    &old_beam,
-                    &target,
-                    meta.dx_deg,
-                    meta.dy_deg,
-                    cutoff,
-                    meta.unit,
-                    &plans,
-                )
-                .with_context(|| format!("smoothing channel {c}"))?
-            };
-
-            send(plane)
-        });
-
-        // Close the channel so the writer loop ends, then join it.  Prefer the
-        // writer's error (the real cause) over the producers' generic "writer
-        // stopped" when both fail.
         drop(tx);
-        let writer_result = writer_handle
+        let written = writer
             .join()
             .map_err(|_| anyhow::anyhow!("writer thread panicked"))?;
-        writer_result.and(produce)
+        written.and(produce)
     })
+}
+
+/// Channel `c` smoothed to `target`, or NaN if it has no usable beam or is
+/// over the cutoff.
+fn smooth_channel<T: CubeElem>(
+    reader: &mut CubeReader,
+    c: usize,
+    meta: &CubeMeta,
+    target: Option<Beam>,
+    cutoff: Option<f64>,
+    plans: &FftPlans<T>,
+    pb: &ProgressBar,
+) -> Result<Array2<T>> {
+    let nan_plane = || Array2::from_elem((meta.ny, meta.nx), T::nan());
+    let (Some(old_beam), Some(target)) = (meta.beams[c], target) else {
+        return Ok(nan_plane());
+    };
+    if !usable_beam(&old_beam, None) || !usable_beam(&target, None) {
+        return Ok(nan_plane());
+    }
+    if !usable_beam(&old_beam, cutoff) {
+        pb.suspend(|| {
+            warn!(
+                "Channel {c}: BMAJ={:.1}\" > cutoff; blanking",
+                old_beam.major_arcsec()
+            )
+        });
+        return Ok(nan_plane());
+    }
+    if tracing::enabled!(Level::DEBUG) {
+        let kernel = target.deconvolve_or_zero(&old_beam);
+        pb.suspend(|| {
+            debug!("Channel {c}: current {old_beam} | target {target} | kernel {kernel}")
+        });
+    }
+    let raw = reader
+        .read_channel::<T>(c, meta)
+        .with_context(|| format!("reading channel {c} from {}", meta.path.display()))?;
+    smooth(
+        raw,
+        &old_beam,
+        &target,
+        meta.dx_deg,
+        meta.dy_deg,
+        meta.unit,
+        Some(plans),
+    )
+    .with_context(|| format!("smoothing channel {c}"))
 }
 
 fn compute_target_beams(
     metas: &[CubeMeta],
     mode: CubeMode,
-    cutoff: Option<f64>,
-    circularise: bool,
-    tolerance: f64,
-    nsamps: usize,
-    epsilon: f64,
+    args: &SharedArgs,
 ) -> Result<Vec<Option<Beam>>> {
     let nfreq = metas[0].nfreq;
+    let usable = |c: usize| {
+        metas
+            .iter()
+            .filter_map(move |m| m.beams[c])
+            .filter(|b| usable_beam(b, args.cutoff))
+    };
     match mode {
         CubeMode::Natural => (0..nfreq)
             .map(|c| {
-                let valid: Vec<Beam> = metas
-                    .iter()
-                    .filter_map(|m| m.beams[c])
-                    .filter(|b| usable_beam(b, cutoff))
-                    .collect();
+                let valid: Vec<Beam> = usable(c).collect();
                 if valid.is_empty() {
                     return Ok(None);
                 }
-                let cb = common_beam(&valid, tolerance, nsamps, epsilon)
+                let cb = args
+                    .common_beam(&valid)
                     .with_context(|| format!("finding common beam for channel {c}"))?;
-                let cb = round_common_beam(cb, &valid)?;
-                Ok(Some(finish_target(cb, &valid, circularise)?))
+                Ok(Some(finish_target(cb, &valid, args.circularise)?))
             })
             .collect(),
         CubeMode::Total => {
-            let valid: Vec<Beam> = metas
-                .iter()
-                .flat_map(|m| m.beams.iter())
-                .filter_map(|b| *b)
-                .filter(|b| usable_beam(b, cutoff))
-                .collect();
+            let valid: Vec<Beam> = (0..nfreq).flat_map(usable).collect();
             anyhow::ensure!(
                 !valid.is_empty(),
                 "no valid beams found across all cubes/channels"
             );
-            let cb = common_beam(&valid, tolerance, nsamps, epsilon)
+            let cb = args
+                .common_beam(&valid)
                 .context("finding total common beam")?;
-            let cb = round_common_beam(cb, &valid)?;
-            let cb = finish_target(cb, &valid, circularise)?;
-            Ok(vec![Some(cb); nfreq])
+            Ok(vec![
+                Some(finish_target(cb, &valid, args.circularise)?);
+                nfreq
+            ])
         }
     }
 }
 
-// ── Shared utilities ──────────────────────────────────────────────────────────
+// ── Shared ────────────────────────────────────────────────────────────────────
 
 fn init_logging(verbose: u8) {
     let level = match verbose {
-        0 => tracing::Level::INFO,
-        1 => tracing::Level::DEBUG,
-        _ => tracing::Level::TRACE,
+        0 => Level::INFO,
+        1 => Level::DEBUG,
+        _ => Level::TRACE,
     };
     tracing_subscriber::fmt()
         .with_max_level(level)
@@ -728,7 +649,7 @@ fn parse_target_beam(args: &SharedArgs) -> Result<Option<Beam>> {
 
 /// True for a beam that can be convolved and is within the cutoff (arcsec).
 fn usable_beam(b: &Beam, cutoff: Option<f64>) -> bool {
-    b.is_finite() && b.minor_deg > 0.0 && cutoff.is_none_or(|c| b.major_arcsec() <= c)
+    b.has_area() && cutoff.is_none_or(|c| b.major_arcsec() <= c)
 }
 
 /// Round a computed common beam up to 0.1″ axes and 0.01° PA, as racs_tools
@@ -738,7 +659,7 @@ fn round_common_beam(b: Beam, inputs: &[Beam]) -> Result<Beam> {
         Beam::from_arcsec(
             ceil_to(b.major_arcsec() + step, 1),
             ceil_to(b.minor_arcsec() + step, 1),
-            ceil_to(b.pa_deg, 2),
+            ceil_to(b.pa_deg(), 2),
         )
         .context("rounding common beam")
     };
@@ -763,39 +684,35 @@ fn finish_target(b: Beam, inputs: &[Beam], circularise: bool) -> Result<Beam> {
     Ok(b)
 }
 
-fn progress_bar(total: u64) -> ProgressBar {
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-    // Steady tick animates the `{spinner}` even when `pos` is not advancing, so
-    // idle-but-busy phases (e.g. `init_output_cube` before the first channel is
-    // written) still show live activity rather than a frozen bar.
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb
-}
-
-/// An indeterminate spinner for blocking phases that have no item count and run
-/// outside the main progress bar (e.g. reading metadata, solving for a common
-/// beam).  Caller drives it with `finish_and_clear` when the work completes.
-fn spinner(msg: impl Into<String>) -> ProgressBar {
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed}] {msg}")
-            .unwrap(),
-    );
-    pb.set_message(msg.into());
-    pb.enable_steady_tick(Duration::from_millis(100));
-    pb
-}
-
 /// Round `x` up to `decimals` places, ignoring round-off below 1e-9 of the
 /// last place (so 30.500000000000004 stays 30.5).
 fn ceil_to(x: f64, decimals: i32) -> f64 {
     let factor = 10_f64.powi(decimals);
     (x * factor - 1e-9).ceil() / factor
+}
+
+fn progress_bar(total: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=>-"),
+    );
+    // Keeps the spinner moving while no channel has finished yet.
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
+}
+
+/// A spinner for steps with no item count.
+fn spinner(msg: impl Into<String>) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed}] {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(msg.into());
+    pb.enable_steady_tick(Duration::from_millis(100));
+    pb
 }

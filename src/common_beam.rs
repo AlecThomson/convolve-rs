@@ -1,9 +1,6 @@
-//! Common beam algorithms.
-//!
-//! Two algorithms are provided:
-//! - [`find_commonbeam_between`]: analytic CASA algorithm for exactly 2 beams.
-//! - [`common_manybeams_mve`]: Khachiyan minimum-volume-enclosing-ellipsoid for N beams.
-//! - [`common_beam`]: dispatcher that picks the appropriate algorithm.
+//! The smallest beam a set of beams can be convolved to, as radio_beam finds
+//! it: the CASA formula for two beams, otherwise a minimum-volume ellipse
+//! around points sampled on every beam (Khachiyan's algorithm).
 use crate::beam::{Beam, BeamError};
 use thiserror::Error;
 
@@ -12,26 +9,25 @@ const DEG2RAD: f64 = std::f64::consts::PI / 180.0;
 #[derive(Debug, Error)]
 pub enum CommonBeamError {
     #[error("no beams provided")]
-    NoBeans,
+    NoBeams,
     #[error("all beams are invalid or flagged")]
     AllFlagged,
     #[error("Khachiyan algorithm did not converge after {0} iterations")]
     NoConvergence(usize),
-    #[error("common beam does not deconvolve all inputs: {0}")]
-    DeconvFailed(String),
+    #[error("no common beam found that contains every input (epsilon reached {0:.2e})")]
+    NotFound(f64),
+    #[error("singular matrix in the minimum-volume ellipse fit")]
+    Singular,
+    #[error("nsamps must be at least 1")]
+    NoSamples,
     #[error("beam error: {0}")]
     Beam(#[from] BeamError),
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
-/// Find the smallest beam that all `beams` can be convolved to.
+/// The smallest beam every beam in `beams` can be convolved to.
 ///
-/// Uses the 2-beam analytic algorithm when `beams.len() == 2`, otherwise
-/// the Khachiyan minimum-volume-enclosing-ellipse algorithm (same as
-/// `radio_beam.Beams.common_beam(method='pts')`).
-///
-/// # Examples
+/// `tolerance`, `nsamps` and `epsilon` are as in
+/// `radio_beam.Beams.common_beam(method='pts')`.
 ///
 /// ```
 /// use convolve_rs::{Beam, common_beam};
@@ -40,7 +36,6 @@ pub enum CommonBeamError {
 /// let b2 = Beam::from_arcsec(12.0, 6.0, 60.0)?;
 /// let common = common_beam(&[b1, b2], 1e-4, 200, 5e-4)?;
 ///
-/// // The common beam contains every input beam, so it is at least as large.
 /// assert!(common.area_sr() >= b1.area_sr());
 /// assert!(common.area_sr() >= b2.area_sr());
 /// assert!(common.major_arcsec() >= 12.0);
@@ -53,19 +48,15 @@ pub fn common_beam(
     epsilon: f64,
 ) -> Result<Beam, CommonBeamError> {
     if beams.is_empty() {
-        return Err(CommonBeamError::NoBeans);
+        return Err(CommonBeamError::NoBeams);
     }
-    if beams
-        .iter()
-        .any(|b| !(b.major_deg.is_finite() && b.minor_deg.is_finite() && b.pa_deg.is_finite()))
-    {
-        return Err(CommonBeamError::Beam(BeamError::NotFinite));
+    if nsamps == 0 {
+        return Err(CommonBeamError::NoSamples);
     }
     if beams.len() == 1 {
         return Ok(beams[0]);
     }
 
-    // Fast path: if the largest beam already contains all others.
     let largest = largest_beam(beams);
     if fits_in_beam(beams, &largest) {
         return Ok(largest);
@@ -81,9 +72,8 @@ pub fn common_beam(
     common_manybeams_mve(beams, tolerance, nsamps, epsilon)
 }
 
-// ── 2-beam analytic algorithm (CASA ia.commonbeam) ───────────────────────────
-
-/// Find the common beam between exactly 2 beams using the CASA analytic method.
+/// The common beam of two beams by the CASA `ia.commonbeam` formula. The
+/// result is not checked; [`common_beam`] checks it.
 pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, CommonBeamError> {
     if beam1.approx_eq(beam2) {
         return Ok(*beam1);
@@ -105,18 +95,17 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
 
     // If the small beam is circular the minor axis is the circle radius.
     if small_beam.is_circular(1e-6) {
-        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg)?;
+        let beam = Beam::from_arcsec(large_major, small_major, large_beam.pa_deg())?;
         return Ok(beam);
     }
 
-    // Wrap PA difference to [-π/2, π/2].
-    let pa_diff_rad = ((small_beam.pa_deg - large_beam.pa_deg) * DEG2RAD
+    let pa_diff_rad = ((small_beam.pa_deg() - large_beam.pa_deg()) * DEG2RAD
         + std::f64::consts::FRAC_PI_2
         + std::f64::consts::PI)
         .rem_euclid(std::f64::consts::PI)
         - std::f64::consts::FRAC_PI_2;
 
-    // If beams are perpendicular the common beam axes are the two major axes.
+    // Perpendicular beams: the axes are the two major axes.
     if (pa_diff_rad.abs() - std::f64::consts::FRAC_PI_2).abs() < 1e-9 {
         let (major, minor) = if large_major >= small_major {
             (large_major, small_major)
@@ -124,14 +113,14 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
             (small_major, large_major)
         };
         let pa = if large_major >= small_major {
-            large_beam.pa_deg
+            large_beam.pa_deg()
         } else {
-            small_beam.pa_deg
+            small_beam.pa_deg()
         };
         return Beam::from_arcsec(major, minor, pa).map_err(Into::into);
     }
 
-    // Transform to coordinate frame where large_beam is circular.
+    // Work in the frame where the large beam is circular.
     let major_comb = (large_major * small_major).sqrt();
     let p = major_comb / large_major;
     let q = major_comb / large_minor;
@@ -139,14 +128,13 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
     let (trans_maj_sc, _trans_min_sc, trans_pa_sc) =
         transform_ellipse_arcsec(small_major, small_beam.minor_arcsec(), pa_diff_rad, p, q);
 
-    // Override the minor axis per the CASA algorithm.
+    // CASA sets the minor axis to the geometric mean of the majors.
     let trans_min_sc = major_comb;
 
-    // Transform back.
     let (trans_maj_unsc, trans_min_unsc, trans_pa_unsc) =
         transform_ellipse_arcsec(trans_maj_sc, trans_min_sc, trans_pa_sc, 1.0 / p, 1.0 / q);
 
-    let final_pa_deg = trans_pa_unsc.to_degrees() + large_beam.pa_deg;
+    let final_pa_deg = trans_pa_unsc.to_degrees() + large_beam.pa_deg();
 
     let eps = 100.0 * f64::EPSILON;
     let beam = Beam::from_arcsec(trans_maj_unsc + eps, trans_min_unsc + eps, final_pa_deg)?;
@@ -154,8 +142,8 @@ pub fn find_commonbeam_between(beam1: &Beam, beam2: &Beam) -> Result<Beam, Commo
     Ok(beam)
 }
 
-/// Transform an ellipse (arcsec axes, PA in radians) by scaling factors (p, q).
-/// Returns (major_arcsec, minor_arcsec, pa_rad). Port of radio_beam utils.transform_ellipse.
+/// Scale an ellipse (arcsec axes, PA in radians) by `(x_scale, y_scale)`, as
+/// radio_beam's `transform_ellipse`. Returns `(major, minor, pa_rad)`.
 fn transform_ellipse_arcsec(
     major: f64,
     minor: f64,
@@ -205,10 +193,9 @@ fn transform_ellipse_arcsec(
     }
 }
 
-// ── Khachiyan MVE algorithm ───────────────────────────────────────────────────
-
-/// Find common beam using the minimum-volume-enclosing-ellipsoid of sampled beam
-/// boundary points (Khachiyan algorithm). Matches `radio_beam` `method='pts'`.
+/// The minimum-volume ellipse around `nsamps` points on each beam. If it does
+/// not contain every beam, the points are pushed out by a growing `epsilon`
+/// and the fit repeated, as radio_beam does.
 pub fn common_manybeams_mve(
     beams: &[Beam],
     tolerance: f64,
@@ -225,44 +212,38 @@ pub fn common_manybeams_mve(
 
         let (radii, rotation) = min_vol_ellipse(&hull_pts, tolerance)?;
 
-        // Rotation matrix convention from radio_beam:
-        // ((sin θ, cos θ), (cos θ, -sin θ))
+        // radio_beam's rotation matrix convention: ((sin θ, cos θ), (cos θ, -sin θ)).
         let pa = (-rotation[0][0]).atan2(rotation[1][0]);
-        let pa = if pa == -std::f64::consts::PI || pa == std::f64::consts::PI {
+        let pa = if pa.abs() == std::f64::consts::PI {
             0.0
         } else {
             pa
         };
 
-        let r0 = radii[0];
-        let r1 = radii[1];
-        let (major_deg, minor_deg) = if r0 >= r1 { (r0, r1) } else { (r1, r0) };
-
+        let (major_deg, minor_deg) = if radii[0] >= radii[1] {
+            (radii[0], radii[1])
+        } else {
+            (radii[1], radii[0])
+        };
         let com_beam = Beam::new(major_deg, minor_deg, pa.to_degrees())?;
-
         if fits_in_beam(beams, &com_beam) {
             return Ok(com_beam);
         }
 
-        if step == max_iter {
-            return Err(CommonBeamError::DeconvFailed(format!(
-                "epsilon reached {eps:.2e} without finding valid solution"
-            )));
+        if step < max_iter {
+            eps += (step as f64 + 1.0) * (max_epsilon - eps) / max_iter as f64;
         }
-
-        eps += (step as f64 + 1.0) * (max_epsilon - eps) / max_iter as f64;
     }
-
-    unreachable!()
+    Err(CommonBeamError::NotFound(eps))
 }
 
 /// Sample `nsamps` points on the edge of each beam's ellipse (scaled by `1 + epsilon`).
 fn collect_ellipse_points(beams: &[Beam], nsamps: usize, epsilon: f64) -> Vec<[f64; 2]> {
     let mut pts = Vec::with_capacity(beams.len() * nsamps);
     for beam in beams {
-        let bpa = beam.pa_deg * DEG2RAD;
-        let major = beam.major_deg * (1.0 + epsilon);
-        let minor = beam.minor_deg * (1.0 + epsilon);
+        let bpa = beam.pa_deg() * DEG2RAD;
+        let major = beam.major_deg() * (1.0 + epsilon);
+        let minor = beam.minor_deg() * (1.0 + epsilon);
         for k in 0..nsamps {
             let phi = 2.0 * std::f64::consts::PI * k as f64 / nsamps as f64;
             let x = major * phi.cos();
@@ -281,7 +262,6 @@ fn convex_hull_2d(pts: &[[f64; 2]]) -> Vec<[f64; 2]> {
         return pts.to_vec();
     }
 
-    // Find lowest-then-leftmost point.
     let pivot = pts
         .iter()
         .enumerate()
@@ -319,12 +299,9 @@ fn cross2d(o: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
 }
 
-/// Khachiyan algorithm: minimum-volume enclosing ellipsoid of 2D points.
-///
-/// Returns `(radii, rotation_2x2)` where `radii` are the semi-axes of the ellipse
-/// and `rotation` is the 2×2 matrix whose columns are the eigenvectors.
-///
-/// Port of `radio_beam.commonbeam.getMinVolEllipse`.
+/// Khachiyan's minimum-volume enclosing ellipse of 2D points, following
+/// radio_beam's `getMinVolEllipse`. Returns the semi-axes and the rotation
+/// matrix whose columns are the axes.
 fn min_vol_ellipse(
     pts: &[[f64; 2]],
     tolerance: f64,
@@ -332,7 +309,6 @@ fn min_vol_ellipse(
     let n = pts.len();
     let d = 2_usize;
 
-    // Build Q = [[pts.T], [1...1]] shape (3, N)
     let q: Vec<[f64; 3]> = pts.iter().map(|p| [p[0], p[1], 1.0]).collect(); // (N, 3)
 
     let mut u = vec![1.0 / n as f64; n];
@@ -374,7 +350,6 @@ fn min_vol_ellipse(
         }
     }
 
-    // Center of ellipse
     let center = [
         pts.iter()
             .zip(u.iter())
@@ -398,8 +373,7 @@ fn min_vol_ellipse(
     ];
     let a = mat2_scale(mat2_inv(inner)?, 1.0 / d as f64);
 
-    // SVD of a (symmetric 2x2): A = U * diag(s) * V^T
-    // For symmetric PSD A, eigendecomposition gives radii = 1/sqrt(eigenvalues)
+    // A is symmetric positive definite, so its SVD is its eigendecomposition.
     let (eigenvalues, eigenvectors) = symmetric_2x2_eig(a);
 
     let radii = [
@@ -409,8 +383,6 @@ fn min_vol_ellipse(
 
     Ok((radii, eigenvectors))
 }
-
-// ── Small matrix helpers ──────────────────────────────────────────────────────
 
 /// Q.T * diag(u) * Q where Q is (N, 3). Returns 3x3.
 fn matmul_qt_diag_q(q: &[[f64; 3]], u: &[f64]) -> [[f64; 3]; 3] {
@@ -456,7 +428,7 @@ fn mat3_inv(m: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], CommonBeamError> {
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
 
     if det.abs() < f64::EPSILON {
-        return Err(CommonBeamError::DeconvFailed("singular 3x3 matrix".into()));
+        return Err(CommonBeamError::Singular);
     }
     let inv_det = 1.0 / det;
 
@@ -483,7 +455,7 @@ fn mat3_inv(m: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], CommonBeamError> {
 fn mat2_inv(m: [[f64; 2]; 2]) -> Result<[[f64; 2]; 2], CommonBeamError> {
     let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
     if det.abs() < f64::EPSILON {
-        return Err(CommonBeamError::DeconvFailed("singular 2x2 matrix".into()));
+        return Err(CommonBeamError::Singular);
     }
     let inv_det = 1.0 / det;
     Ok([
@@ -496,8 +468,7 @@ fn mat2_scale(m: [[f64; 2]; 2], s: f64) -> [[f64; 2]; 2] {
     [[m[0][0] * s, m[0][1] * s], [m[1][0] * s, m[1][1] * s]]
 }
 
-/// Eigendecomposition of a symmetric 2x2 matrix. Returns `(eigenvalues, eigenvectors)`.
-/// `eigenvectors[i]` is the i-th column.
+/// Eigenvalues and eigenvectors (as columns) of a symmetric 2x2 matrix.
 fn symmetric_2x2_eig(m: [[f64; 2]; 2]) -> ([f64; 2], [[f64; 2]; 2]) {
     let a = m[0][0];
     let b = m[0][1]; // = m[1][0] since symmetric
@@ -510,7 +481,6 @@ fn symmetric_2x2_eig(m: [[f64; 2]; 2]) -> ([f64; 2], [[f64; 2]; 2]) {
     let lam1 = trace / 2.0 + disc;
     let lam2 = trace / 2.0 - disc;
 
-    // Eigenvectors
     let (v1, v2) = if b.abs() > f64::EPSILON {
         let v1 = normalise([lam1 - c, b]);
         let v2 = normalise([lam2 - c, b]);
@@ -521,10 +491,7 @@ fn symmetric_2x2_eig(m: [[f64; 2]; 2]) -> ([f64; 2], [[f64; 2]; 2]) {
         ([0.0, 1.0], [1.0, 0.0])
     };
 
-    // Rotation matrix columns are eigenvectors.
-    // radio_beam convention: SVD gives rotation such that
-    //   PA = atan2(-rotation[0,0], rotation[1,0])
-    // Match that: columns = eigenvectors, so rotation[row][col].
+    // Columns are eigenvectors, as from radio_beam's SVD.
     let rotation = [[v1[0], v2[0]], [v1[1], v2[1]]];
 
     ([lam1, lam2], rotation)
@@ -537,8 +504,6 @@ fn normalise(v: [f64; 2]) -> [f64; 2] {
     }
     [v[0] / len, v[1] / len]
 }
-
-// ── Utility ───────────────────────────────────────────────────────────────────
 
 pub fn largest_beam(beams: &[Beam]) -> Beam {
     beams
@@ -561,7 +526,7 @@ mod tests {
     fn test_common_beam_identical() {
         let b = Beam::new(10.0 / 3600.0, 8.0 / 3600.0, 30.0).unwrap();
         let result = common_beam(&[b, b], 1e-4, 200, 5e-4).unwrap();
-        assert!(result.approx_eq(&b) || result.major_deg >= b.major_deg);
+        assert!(result.approx_eq(&b) || result.major_deg() >= b.major_deg());
     }
 
     #[test]
@@ -570,7 +535,8 @@ mod tests {
         let b2 = Beam::new(12.0 / 3600.0, 6.0 / 3600.0, 60.0).unwrap();
         let result = common_beam(&[b1, b2], 1e-4, 200, 5e-4).unwrap();
         assert!(
-            result.major_deg >= b1.major_deg.max(b2.major_deg) || fits_in_beam(&[b1, b2], &result)
+            result.major_deg() >= b1.major_deg().max(b2.major_deg())
+                || fits_in_beam(&[b1, b2], &result)
         );
     }
 
@@ -594,17 +560,10 @@ mod tests {
     }
 
     #[test]
-    fn test_nan_beam_is_an_error_not_a_panic() {
-        let good = Beam::from_arcsec(10.0, 8.0, 0.0).unwrap();
-        let bad = Beam {
-            major_deg: f64::NAN,
-            minor_deg: 1e-3,
-            pa_deg: 0.0,
-        };
-        for beams in [vec![good, bad], vec![good, bad, good]] {
-            assert!(common_beam(&beams, 1e-4, 200, 5e-4).is_err());
-        }
-        assert!(!fits_in_beam(&[bad], &good));
+    fn test_zero_samples_is_an_error() {
+        let b = Beam::from_arcsec(10.0, 8.0, 0.0).unwrap();
+        let c = Beam::from_arcsec(9.0, 9.0, 0.0).unwrap();
+        assert!(common_beam(&[b, c, b], 1e-4, 0, 5e-4).is_err());
     }
 
     /// The CASA two-beam solution is only used if it contains both inputs.

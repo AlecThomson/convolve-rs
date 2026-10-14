@@ -7,8 +7,7 @@ kernelspec:
 
 # Python quickstart
 
-This page is an executable notebook: every cell below is re-run on each docs
-build, so the outputs are guaranteed to match the current release.
+This page is a notebook that is re-run on every docs build.
 
 ## Beams
 
@@ -91,7 +90,7 @@ smoothed = smooth(image, old_beam, new_beam, dx_deg, dx_deg, bunit="Jy/beam")
 ```
 
 For a Jy/beam image, the peak of an unresolved source stays (close to)
-constant under convolution — the flux scaling compensates the smearing:
+constant under convolution, because the flux scaling cancels the smearing:
 
 ```{code-cell} ipython3
 print(f"input peak:    {image.max():.3f} Jy/beam")
@@ -152,5 +151,5 @@ with fits.open("image.fits") as hdul:
 ```
 
 For batch processing of many images or large cubes, prefer the
-[`convolvers` CLI](cli.md) — it parallelises across images/channels and
+[`convolvers` CLI](cli.md): it parallelises across images/channels and
 handles beamlogs and CASA multi-beam tables.

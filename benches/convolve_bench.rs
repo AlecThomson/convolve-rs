@@ -1,26 +1,17 @@
-//! Microbenchmarks for the UV-plane convolution.
+//! Benchmarks of `convolve_uv`. Run with `cargo bench`.
 //!
-//! Run with `cargo bench`. Three groups:
-//!   * `convolve` — single-image `convolve_uv` across image size, precision
-//!     (f32/f64) and the clean vs NaN-masked path.
-//!   * `convolve_large` — the same at 4096² with a small sample count.
-//!   * `cube_throughput` — convolving many same-size planes, comparing per-call
-//!     planning (`convolve_uv`) against a shared `FftPlans`
-//!     (`convolve_uv_with_plans`); this is the cube-channel hot loop and shows
-//!     the plan-reuse win in channels/second.
-//!
-//! These quantify the precision (Tier 1) and plan-reuse (Tier 0) changes; the
-//! end-to-end I/O ceiling (Tier 2) is measured separately by
-//! `scripts/profile_cube.sh`.
+//! - `convolve`: one image, by size, precision and with or without NaNs.
+//! - `convolve_large`: 4096², fewer samples.
+//! - `cube_throughput`: 64 planes of one size, planning per call against
+//!   shared `FftPlans`.
 use std::hint::black_box;
 
-use convolve_rs::{Beam, FftFloat, FftPlans, convolve_uv, convolve_uv_with_plans};
+use convolve_rs::{Beam, FftFloat, FftPlans, convolve_uv};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ndarray::Array2;
 use num_traits::cast;
 
-/// A deterministic, mildly-structured test image in precision `T`, optionally
-/// with a blanked (NaN) block to exercise the mask-convolution path.
+/// A test image, optionally with a NaN block.
 fn make_image<T: FftFloat>(n: usize, masked: bool) -> Array2<T> {
     let mut img = Array2::from_shape_fn((n, n), |(i, j)| {
         cast::<f64, T>(((i * 13 + j * 7) % 97) as f64 / 97.0).unwrap()
@@ -91,8 +82,7 @@ fn bench_convolve_large(c: &mut Criterion) {
     group.finish();
 }
 
-/// Convolve `nchan` same-size planes, the cube-channel hot loop. Compares
-/// re-planning every call against reusing one `FftPlans`.
+/// Convolve 64 planes, planning per call or sharing one `FftPlans`.
 fn bench_cube_throughput(c: &mut Criterion) {
     let (old, new) = beams();
     let (n, nchan) = (512usize, 64u64);
@@ -114,7 +104,7 @@ fn bench_cube_throughput(c: &mut Criterion) {
         let plans = FftPlans::<f32>::new(n, n);
         b.iter(|| {
             for p in &planes {
-                let r = convolve_uv_with_plans(p, &old, &new, DX, DX, None, &plans).unwrap();
+                let r = convolve_uv(p, &old, &new, DX, DX, Some(&plans)).unwrap();
                 black_box(r.image[(0, 0)]);
             }
         })

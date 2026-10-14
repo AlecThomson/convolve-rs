@@ -152,8 +152,8 @@ fn f64_image_keeps_precision() {
         &Beam::from_arcsec(20.0, 20.0, 0.0).unwrap(),
         PIX_DEG,
         PIX_DEG,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .unwrap();
     let out = dir.join("a.sm.fits");
@@ -186,8 +186,8 @@ fn four_d_image_uses_first_plane() {
         &Beam::from_arcsec(20.0, 20.0, 0.0).unwrap(),
         PIX_DEG,
         PIX_DEG,
-        None,
         BrightnessUnit::JyPerBeam,
+        None,
     )
     .unwrap();
     let out = dir.join("a.sm.fits");
@@ -223,4 +223,28 @@ fn beam_rounding() {
         "0",
     ]);
     assert!(line.starts_with("BMAJ=30.5400\""), "{line}");
+}
+
+/// An integer image is written out as floats.
+#[test]
+fn integer_image_writes_floats() {
+    let dir = workdir("integer");
+    let a = dir.join("a.fits");
+    make_image(&a, &[N, N], ImageType::Long, (10.0, 10.0, 0.0));
+    {
+        let mut f = FitsFile::edit(&a).unwrap();
+        let data: Vec<i32> = (0..N * N).map(|k| (k % 7) as i32).collect();
+        f.primary_hdu().unwrap().write_image(&mut f, &data).unwrap();
+    }
+    let (ok, log) = run(&[s(&a), "--bmaj", "20", "--bmin", "20", "--bpa", "0"]);
+    assert!(ok, "{log}");
+    let out = dir.join("a.sm.fits");
+    let mut f = FitsFile::open(&out).unwrap();
+    let bitpix: i64 = f.primary_hdu().unwrap().read_key(&mut f, "BITPIX").unwrap();
+    assert_eq!(bitpix, -32);
+    let image = read_fits::<f32>(&out).unwrap().image;
+    assert!(
+        image.iter().any(|v| v.fract() != 0.0),
+        "values were rounded"
+    );
 }

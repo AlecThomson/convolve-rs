@@ -1,8 +1,7 @@
 # CLI usage
 
-The `convolvers` binary is the command-line interface, a port of `beamcon_2D`
-and `beamcon_3D` from
-[RACS-tools](https://github.com/alecthomson/RACS-tools). Install it with:
+`convolvers 2d` and `convolvers 3d` do the jobs of `beamcon_2D` and
+`beamcon_3D`. Install with:
 
 ```sh
 cargo install convolve-rs
@@ -73,4 +72,5 @@ Per-channel beams are read from, in priority order:
   size, are written as NaN and left out when finding or checking the target.
 - Only the first plane of a 4D image is smoothed; the output has
   `NAXIS3 = NAXIS4 = 1`. `BITPIX = -64` images are smoothed and written in
-  double precision.
+  double precision; integer images are smoothed in single precision and
+  written as `BITPIX = -32`.
