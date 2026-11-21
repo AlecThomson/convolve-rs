@@ -16,7 +16,7 @@ env:
   FORCE_COLOR: 3
   CARGO_TERM_COLOR: always
   # Bump this to invalidate the cached MIRIAD build.
-  MIRIAD_CACHE_VERSION: v1
+  MIRIAD_CACHE_VERSION: v2
 
 jobs:
   lint:
@@ -103,7 +103,10 @@ jobs:
         if: steps.miriad-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 https://github.com/csiro/miriad.git /tmp/miriad-src
+          # GCC 15 defaults to C23, where PGPLOT's drivers (pndriv.c) no
+          # longer compile: they use `false` as an enum constant.
           cmake -S /tmp/miriad-src -B /tmp/miriad-build \
+            -DCMAKE_C_FLAGS="-std=gnu17" \
             -DCMAKE_INSTALL_PREFIX="$HOME/miriad-install"
           cmake --build /tmp/miriad-build --target install -j"$(nproc)"
 
