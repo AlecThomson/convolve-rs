@@ -149,5 +149,27 @@ with fits.open("image.fits") as hdul:
     fits.writeto("smoothed.fits", smoothed, header, overwrite=True)
 ```
 
-For many images or large cubes, use the [`convolvers` CLI](cli.md). It runs
-images or channels in parallel and reads beamlogs and CASA multi-beam tables.
+## Smoothing files and cubes
+
+`smooth_images` and `smooth_cubes` do what `convolvers 2d` and `convolvers 3d`
+do, from Python: find the common beam, smooth every image or channel in
+parallel, and write the results beside the inputs. They read beamlogs and CASA
+multi-beam tables, and release the GIL while they run.
+
+```python
+from convolve_rs import Beam, cube_beams, smooth_cubes, smooth_images
+
+result = smooth_images(["a.fits", "b.fits"], cutoff=25.0)
+print(result.target)
+for image in result.images:
+    print(image.output, "blanked" if image.kernel is None else image.kernel)
+
+(cube,) = smooth_cubes(["cube.fits"], mode="natural", ncores=8)
+print(cube.output, cube.targets[0])
+print(cube_beams(cube.output))
+```
+
+An image or channel with no usable beam, or one over the cutoff, is written as
+NaN with a zero beam (masked in a cube's BEAMS table), so it is not mistaken
+for one at the target resolution. See the [CLI reference](cli.md) for what
+each option does.

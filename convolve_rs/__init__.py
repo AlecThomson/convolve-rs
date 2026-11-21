@@ -5,7 +5,18 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, cast
 
 from convolve_rs._convolve_rs import Beam as _Beam
-from convolve_rs._convolve_rs import common_beam, gauss_factor, smooth
+from convolve_rs._convolve_rs import (
+    SmoothedCube,
+    SmoothedImage,
+    SmoothedImages,
+    common_beam,
+    cube_beams,
+    gauss_factor,
+    round_common_beam,
+    smooth,
+    smooth_cubes,
+    smooth_images,
+)
 
 if TYPE_CHECKING:
     from astropy.io.fits import Header
@@ -63,4 +74,16 @@ class Beam(_Beam):
         )
 
 
-__all__ = ["Beam", "common_beam", "gauss_factor", "smooth"]
+__all__ = [
+    "Beam",
+    "SmoothedCube",
+    "SmoothedImage",
+    "SmoothedImages",
+    "common_beam",
+    "cube_beams",
+    "gauss_factor",
+    "round_common_beam",
+    "smooth",
+    "smooth_cubes",
+    "smooth_images",
+]

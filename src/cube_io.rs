@@ -257,9 +257,10 @@ impl CubeReader {
 }
 
 /// Mode for choosing the common beam of a cube.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CubeMode {
     /// A common beam per channel, written to a BEAMS table.
+    #[default]
     Natural,
     /// One common beam for every channel, written to the primary header.
     Total,

@@ -259,6 +259,8 @@ impl Beam {
     ///
     /// Unlike [`Beam::deconvolve`], this accepts a kernel that is a line or a
     /// point (e.g. 20″×10″ inside 20″×20″), which the UV-plane filter handles.
+    /// Beams that differ by float32 round-off, as beams read back from a FITS
+    /// table do, count as contained (the tolerance RACS-tools 4.6 uses).
     ///
     /// ```
     /// use convolve_rs::Beam;
@@ -271,7 +273,7 @@ impl Beam {
     pub fn contains(&self, other: &Beam) -> bool {
         let own = self.cov_deg();
         let residual = own.sub(&other.cov_deg());
-        let tol = 1e-12 * (own.xx + own.yy).abs();
+        let tol = 4.0 * f64::from(f32::EPSILON) * (own.xx + own.yy).abs();
         let (_, lam_minor) = residual.eigenvalues();
         residual.xx >= -tol && residual.yy >= -tol && lam_minor >= -tol
     }
@@ -370,5 +372,20 @@ mod tests {
     fn test_negative_axis_rejected() {
         assert!(Beam::new(1e-3, -1e-3, 0.0).is_err());
         assert!(Beam::new(-1e-3, -2e-3, 0.0).is_err());
+    }
+
+    #[test]
+    fn test_contains_tolerates_float32_round_off() {
+        // A beam read back from a float32 BEAMS table: a hair larger in BMAJ.
+        let target = Beam::from_arcsec(12.3, 9.7, 41.0).unwrap();
+        let stored = Beam::from_arcsec(
+            f64::from(12.3_f32) * (1.0 + 1e-7),
+            f64::from(9.7_f32),
+            f64::from(41.0_f32),
+        )
+        .unwrap();
+        assert!(target.contains(&stored));
+        let bigger = Beam::from_arcsec(12.3 * (1.0 + 1e-5), 9.7, 41.0).unwrap();
+        assert!(!target.contains(&bigger));
     }
 }

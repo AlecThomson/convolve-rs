@@ -70,6 +70,9 @@ Per-channel beams are read from, in priority order:
   `--circularise` applies to either.
 - Images or channels whose BMAJ exceeds `--cutoff`, or whose beam has zero
   size, are written as NaN and left out when finding or checking the target.
+  A blanked image gets a zero beam, and a blanked channel is masked in the
+  BEAMS table, rather than claiming the target resolution (racs_tools writes
+  the target beam).
 - Only the first plane of a 4D image is smoothed; the output has
   `NAXIS3 = NAXIS4 = 1`. `BITPIX = -64` images are smoothed and written in
   double precision; integer images are smoothed in single precision and

@@ -7,13 +7,48 @@ use pyo3::types::PyType;
 #[cfg(feature = "stubgen")]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
+use std::path::PathBuf;
+
+use pyo3::exceptions::PyFileNotFoundError;
+
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
 use crate::convolve_uv::FftFloat;
+use crate::cube_io::{CubeMode, RefChan};
+use crate::pipeline::{
+    CubeOptions, SmoothOptions, SmoothedCube, SmoothedImage, cube_beams as rust_cube_beams,
+    round_common_beam as rust_round_common_beam, smooth_cubes as rust_smooth_cubes,
+    smooth_images as rust_smooth_images,
+};
 use crate::smooth::{BrightnessUnit, smooth as rust_smooth};
 
 fn value_error(e: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(e.to_string())
+}
+
+/// A pipeline error, with its causes, as a ValueError.
+fn pipeline_error(e: anyhow::Error) -> PyErr {
+    PyValueError::new_err(format!("{e:#}"))
+}
+
+/// FileNotFoundError for the first of `paths` that does not exist.
+fn check_exist(paths: &[PathBuf]) -> PyResult<()> {
+    match paths.iter().find(|p| !p.exists()) {
+        Some(p) => Err(PyFileNotFoundError::new_err(format!(
+            "{} does not exist",
+            p.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// `beam` as a ``convolve_rs.Beam``.
+fn py_beam(py: Python<'_>, beam: Beam) -> PyResult<Bound<'_, PyBeam>> {
+    let cls = py
+        .import("convolve_rs")?
+        .getattr("Beam")?
+        .cast_into::<PyType>()?;
+    new_instance(&cls, beam)
 }
 
 /// A 2D elliptical Gaussian beam (PSF).
@@ -348,6 +383,355 @@ fn gauss_factor(
     )
 }
 
+/// One image written by ``smooth_images``.
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "SmoothedImage", module = "convolve_rs._convolve_rs", frozen)]
+struct PySmoothedImage(SmoothedImage);
+
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PySmoothedImage {
+    /// The input image.
+    #[getter]
+    fn input(&self) -> PathBuf {
+        self.0.input.clone()
+    }
+
+    /// The smoothed image.
+    #[getter]
+    fn output(&self) -> PathBuf {
+        self.0.output.clone()
+    }
+
+    /// The input's beam.
+    #[getter]
+    fn old_beam<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBeam>> {
+        py_beam(py, self.0.old_beam)
+    }
+
+    /// The beam the image was convolved with, or ``None`` if it was blanked.
+    #[getter]
+    fn kernel<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBeam>>> {
+        self.0.kernel.map(|b| py_beam(py, b)).transpose()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SmoothedImage(input={:?}, output={:?}, blanked={})",
+            self.0.input,
+            self.0.output,
+            self.0.kernel.is_none()
+        )
+    }
+}
+
+/// The result of ``smooth_images``.
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "SmoothedImages", module = "convolve_rs._convolve_rs", frozen)]
+struct PySmoothedImages {
+    target: Beam,
+    images: Vec<SmoothedImage>,
+}
+
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PySmoothedImages {
+    /// The beam every usable image was smoothed to.
+    #[getter]
+    fn target<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBeam>> {
+        py_beam(py, self.target)
+    }
+
+    /// One entry per input, in input order.
+    #[getter]
+    fn images(&self) -> Vec<PySmoothedImage> {
+        self.images.iter().cloned().map(PySmoothedImage).collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SmoothedImages(target={}, images=<{} images>)",
+            self.target,
+            self.images.len()
+        )
+    }
+}
+
+/// One cube written by ``smooth_cubes``.
+#[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
+#[pyclass(name = "SmoothedCube", module = "convolve_rs._convolve_rs", frozen)]
+struct PySmoothedCube(SmoothedCube);
+
+#[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
+#[pymethods]
+impl PySmoothedCube {
+    /// The input cube.
+    #[getter]
+    fn input(&self) -> PathBuf {
+        self.0.input.clone()
+    }
+
+    /// The smoothed cube.
+    #[getter]
+    fn output(&self) -> PathBuf {
+        self.0.output.clone()
+    }
+
+    /// The target beam of each channel, ``None`` for a channel with no target.
+    #[getter]
+    fn targets<'py>(&self, py: Python<'py>) -> PyResult<Vec<Option<Bound<'py, PyBeam>>>> {
+        beam_list(py, &self.0.targets)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SmoothedCube(input={:?}, output={:?}, channels={})",
+            self.0.input,
+            self.0.output,
+            self.0.targets.len()
+        )
+    }
+}
+
+fn beam_list<'py>(
+    py: Python<'py>,
+    beams: &[Option<Beam>],
+) -> PyResult<Vec<Option<Bound<'py, PyBeam>>>> {
+    beams
+        .iter()
+        .map(|b| b.map(|b| py_beam(py, b)).transpose())
+        .collect()
+}
+
+/// Smooth 2D FITS images to one common beam, as ``convolvers 2d`` does.
+///
+/// Each image is written to ``<prefix><name>.<suffix>.fits`` in ``outdir``
+/// (default: beside the input). Images with no usable beam, or a BMAJ over
+/// ``cutoff``, are written as NaN with a zero beam. The GIL is released.
+///
+/// Args:
+///     paths (list[str]): The images.
+///     target_beam (Beam, optional): Beam to smooth to. Default: the common
+///         beam of the inputs, rounded up to 0.1 arcsec as racs_tools does.
+///     cutoff (float, optional): Blank images whose BMAJ exceeds this (arcsec).
+///     circularise (bool): Make the target circular.
+///     suffix (str): Output name suffix.
+///     prefix (str, optional): Output name prefix.
+///     outdir (str, optional): Output directory.
+///     tolerance, nsamps, epsilon: Settings of the common-beam fit.
+///     dryrun (bool): Find the target beam but write nothing.
+///     ncores (int, optional): Threads to use. Default: one per core.
+///
+/// Returns:
+///     SmoothedImages: The target beam and, per input, its output and kernel.
+///
+/// Raises:
+///     FileNotFoundError: If an input does not exist.
+///     ValueError: If no image has a usable beam, the target is too small, or
+///         an image cannot be read or written.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (
+    paths,
+    target_beam=None,
+    cutoff=None,
+    circularise=false,
+    suffix="sm",
+    prefix=None,
+    outdir=None,
+    tolerance=1e-4,
+    nsamps=200,
+    epsilon=5e-4,
+    dryrun=false,
+    ncores=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn smooth_images(
+    py: Python<'_>,
+    paths: Vec<PathBuf>,
+    target_beam: Option<PyRef<'_, PyBeam>>,
+    cutoff: Option<f64>,
+    circularise: bool,
+    suffix: &str,
+    prefix: Option<String>,
+    outdir: Option<PathBuf>,
+    tolerance: f64,
+    nsamps: usize,
+    epsilon: f64,
+    dryrun: bool,
+    ncores: Option<usize>,
+) -> PyResult<PySmoothedImages> {
+    check_exist(&paths)?;
+    let opts = SmoothOptions {
+        target_beam: target_beam.map(|b| b.inner),
+        circularise,
+        cutoff,
+        suffix: suffix.into(),
+        prefix,
+        outdir,
+        tolerance,
+        nsamps,
+        epsilon,
+        dryrun,
+        ncores,
+        progress: false,
+    };
+    let result = py
+        .detach(|| rust_smooth_images(&paths, &opts))
+        .map_err(pipeline_error)?;
+    Ok(PySmoothedImages {
+        target: result.target,
+        images: result.images,
+    })
+}
+
+/// Smooth FITS cubes channel by channel, as ``convolvers 3d`` does.
+///
+/// Every cube must have the same number of channels and at most one Stokes
+/// plane. A channel with no target, no usable beam, or a BMAJ over ``cutoff``
+/// is written as NaN and masked in the BEAMS table. Each output gets a
+/// beamlog of its targets. The GIL is released.
+///
+/// Args:
+///     paths (list[str]): The cubes.
+///     mode (str): ``"natural"`` for a common beam per channel, ``"total"``
+///         for one beam for every channel.
+///     target_beam (Beam, optional): One beam for every channel.
+///     target_beams (list[Beam | None], optional): A beam per channel;
+///         ``None`` blanks the channel.
+///     ref_chan (str, optional): Channel whose beam goes in the header's
+///         BMAJ/BMIN/BPA: ``"first"``, ``"last"`` or ``"mid"``. Default: the
+///         spectral axis' CRPIX.
+///     uselogs (bool): Reuse the beamlogs of a previous run as the targets.
+///     cutoff, circularise, suffix, prefix, outdir, tolerance, nsamps,
+///         epsilon, dryrun, ncores: As for ``smooth_images``.
+///
+/// Returns:
+///     list[SmoothedCube]: Per input, its output and per-channel targets.
+///
+/// Raises:
+///     FileNotFoundError: If an input does not exist.
+///     ValueError: On bad options, cubes that cannot be smoothed together, or
+///         a read or write error.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (
+    paths,
+    mode="natural",
+    target_beam=None,
+    target_beams=None,
+    ref_chan=None,
+    uselogs=false,
+    cutoff=None,
+    circularise=false,
+    suffix="sm",
+    prefix=None,
+    outdir=None,
+    tolerance=1e-4,
+    nsamps=200,
+    epsilon=5e-4,
+    dryrun=false,
+    ncores=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn smooth_cubes(
+    py: Python<'_>,
+    paths: Vec<PathBuf>,
+    mode: &str,
+    target_beam: Option<PyRef<'_, PyBeam>>,
+    target_beams: Option<Vec<Option<PyRef<'_, PyBeam>>>>,
+    ref_chan: Option<&str>,
+    uselogs: bool,
+    cutoff: Option<f64>,
+    circularise: bool,
+    suffix: &str,
+    prefix: Option<String>,
+    outdir: Option<PathBuf>,
+    tolerance: f64,
+    nsamps: usize,
+    epsilon: f64,
+    dryrun: bool,
+    ncores: Option<usize>,
+) -> PyResult<Vec<PySmoothedCube>> {
+    check_exist(&paths)?;
+    let mode = match mode {
+        "natural" => CubeMode::Natural,
+        "total" => CubeMode::Total,
+        _ => return Err(value_error(format!("unknown mode {mode:?}"))),
+    };
+    let ref_chan = match ref_chan {
+        None => RefChan::Crpix,
+        Some("first") => RefChan::First,
+        Some("last") => RefChan::Last,
+        Some("mid") => RefChan::Mid,
+        Some(r) => return Err(value_error(format!("unknown ref_chan {r:?}"))),
+    };
+    let opts = CubeOptions {
+        smooth: SmoothOptions {
+            target_beam: target_beam.map(|b| b.inner),
+            circularise,
+            cutoff,
+            suffix: suffix.into(),
+            prefix,
+            outdir,
+            tolerance,
+            nsamps,
+            epsilon,
+            dryrun,
+            ncores,
+            progress: false,
+        },
+        mode,
+        ref_chan,
+        uselogs,
+        target_beams: target_beams
+            .map(|bs| bs.iter().map(|b| b.as_ref().map(|b| b.inner)).collect()),
+    };
+    let cubes = py
+        .detach(|| rust_smooth_cubes(&paths, &opts))
+        .map_err(pipeline_error)?;
+    Ok(cubes.into_iter().map(PySmoothedCube).collect())
+}
+
+/// The beam of each channel of a cube, ``None`` where it is masked.
+///
+/// Beams come from the BEAMS table, else a beamlog beside the cube, else the
+/// header's BMAJ/BMIN/BPA.
+///
+/// Raises:
+///     FileNotFoundError: If the cube does not exist.
+///     ValueError: If it cannot be read or has no beams.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+fn cube_beams(py: Python<'_>, path: PathBuf) -> PyResult<Vec<Option<Bound<'_, PyBeam>>>> {
+    check_exist(std::slice::from_ref(&path))?;
+    let beams = py
+        .detach(|| rust_cube_beams(&path))
+        .map_err(pipeline_error)?;
+    beam_list(py, &beams)
+}
+
+/// ``beam`` rounded up to 0.1 arcsec axes and 0.01 degree PA, as racs_tools
+/// rounds a common beam, with 0.1 arcsec more if the rounded PA would leave
+/// one of ``beams`` outside it.
+///
+/// Examples:
+///     >>> from convolve_rs import Beam, round_common_beam
+///     >>> b = Beam.from_arcsec(10.03, 8.01, 30.004)
+///     >>> r = round_common_beam(b, [b])
+///     >>> round(r.major_arcsec, 6), round(r.minor_arcsec, 6), round(r.pa_deg, 6)
+///     (10.1, 8.1, 30.01)
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+fn round_common_beam<'py>(
+    beam: &Bound<'py, PyBeam>,
+    beams: Vec<PyRef<'py, PyBeam>>,
+) -> PyResult<Bound<'py, PyBeam>> {
+    let inputs: Vec<Beam> = beams.iter().map(|b| b.inner).collect();
+    let rounded = rust_round_common_beam(beam.borrow().inner, &inputs).map_err(pipeline_error)?;
+    new_instance(&beam.get_type(), rounded)
+}
+
 #[cfg(feature = "stubgen")]
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
@@ -373,6 +757,13 @@ pub fn _convolve_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(common_beam, m)?)?;
     m.add_function(wrap_pyfunction!(smooth, m)?)?;
     m.add_function(wrap_pyfunction!(gauss_factor, m)?)?;
+    m.add_class::<PySmoothedImage>()?;
+    m.add_class::<PySmoothedImages>()?;
+    m.add_class::<PySmoothedCube>()?;
+    m.add_function(wrap_pyfunction!(smooth_images, m)?)?;
+    m.add_function(wrap_pyfunction!(smooth_cubes, m)?)?;
+    m.add_function(wrap_pyfunction!(cube_beams, m)?)?;
+    m.add_function(wrap_pyfunction!(round_common_beam, m)?)?;
     #[cfg(feature = "stubgen")]
     m.add_function(wrap_pyfunction!(_generate_stubs, m)?)?;
     Ok(())

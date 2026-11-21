@@ -922,7 +922,8 @@ fn cli_integer_cube_writes_floats() {
     );
 }
 
-/// A channel over the cutoff is blanked even when the target could contain it.
+/// A channel over the cutoff is blanked, and masked in the BEAMS table, even
+/// when the target could contain it.
 #[test]
 fn cli_cutoff_blanks_even_when_target_contains() {
     let dir = workdir("cli_cutoff_contained");
@@ -953,6 +954,8 @@ fn cli_cutoff_blanks_even_when_target_contains() {
             .iter()
             .all(|v| v.is_nan())
     );
+    assert!(meta.beams[0].is_some() && meta.beams[2].is_some());
+    assert!(meta.beams[1].is_none());
 }
 
 /// The header BMAJ of `out`, in degrees, against its beamlog's channel `chan`.
