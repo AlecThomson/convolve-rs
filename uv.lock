@@ -636,7 +636,6 @@ dev = [
 test = [
     { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "astropy", version = "7.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "packaging" },
     { name = "pytest" },
     { name = "racs-tools", marker = "python_full_version >= '3.11'" },
     { name = "radio-beam" },
@@ -667,11 +666,10 @@ requires-dist = [
     { name = "nbconvert", marker = "extra == 'benchmark'", specifier = ">=7.17.1" },
     { name = "nbformat", marker = "extra == 'benchmark'", specifier = ">=5.10.4" },
     { name = "numpy" },
-    { name = "packaging", marker = "extra == 'test'" },
     { name = "pandas", marker = "extra == 'benchmark'", specifier = ">=2.3.3" },
     { name = "prek", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },
-    { name = "racs-tools", marker = "python_full_version >= '3.11' and extra == 'test'", specifier = ">=4.6.0" },
+    { name = "racs-tools", marker = "python_full_version >= '3.11' and extra == 'test'", specifier = ">=4.6.1" },
     { name = "radio-beam", marker = "extra == 'test'" },
     { name = "ty", marker = "extra == 'dev'" },
 ]
@@ -2567,7 +2565,7 @@ wheels = [
 
 [[package]]
 name = "racs-tools"
-version = "4.6.0"
+version = "4.6.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "astropy", version = "7.2.0", source = { registry = "https://pypi.org/simple" } },
@@ -2578,9 +2576,9 @@ dependencies = [
     { name = "spectral-cube" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/54/9f/8fc878f5bb172de8d17c7d4f60319f6c1515f27764319511960f0a1e4360/racs_tools-4.6.0.tar.gz", hash = "sha256:f741926431ac1117f30c5a9cc80093fda0386f077ac5dab0261909c92dd034ca", size = 35887, upload-time = "2026-11-21T11:37:31.975Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ae/0e/cc7969c6e3edc622354655edf03904e6148fcbdcabb7db7fa9654015e52c/racs_tools-4.6.1.tar.gz", hash = "sha256:0a159180f85658109a1c1bdd6d2986b2e118cdf88c28aa02317b4c6f2c9e5265", size = 36189, upload-time = "2026-11-21T15:11:19.632Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/1a/bbdc5fb008e72e33362a4324f1307fbdf5999a71ab7cd7cb3fd997fe6508/racs_tools-4.6.0-py3-none-any.whl", hash = "sha256:7e4dd398da9852e74e2c58f365ba5c234e3bfcc9d67377fc9b164b56b19481a4", size = 38044, upload-time = "2026-11-21T11:37:32.838Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/47/7d020bd2242730b69d8e034de8ae684c48587142e01b7bbb17e5b4bf0b2a/racs_tools-4.6.1-py3-none-any.whl", hash = "sha256:1d8f41fa48d313475bb12a3baa5830f605d1906b537f41a4ee087794aac4a350", size = 38355, upload-time = "2026-11-21T15:11:20.263Z" },
 ]
 
 [[package]]

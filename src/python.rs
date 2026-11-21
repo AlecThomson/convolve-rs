@@ -590,7 +590,8 @@ fn smooth_images(
 /// Every cube must have the same number of channels and at most one Stokes
 /// plane. A channel with no target, no usable beam, or a BMAJ over ``cutoff``
 /// is written as NaN and masked in the BEAMS table. Each output gets a
-/// beamlog of its targets. The GIL is released.
+/// beamlog of its targets. Arguments not listed here are as for
+/// ``smooth_images``. The GIL is released.
 ///
 /// Args:
 ///     paths (list[str]): The cubes.
@@ -603,8 +604,6 @@ fn smooth_images(
 ///         BMAJ/BMIN/BPA: ``"first"``, ``"last"`` or ``"mid"``. Default: the
 ///         spectral axis' CRPIX.
 ///     uselogs (bool): Reuse the beamlogs of a previous run as the targets.
-///     cutoff, circularise, suffix, prefix, outdir, tolerance, nsamps,
-///         epsilon, dryrun, ncores: As for ``smooth_images``.
 ///
 /// Returns:
 ///     list[SmoothedCube]: Per input, its output and per-channel targets.

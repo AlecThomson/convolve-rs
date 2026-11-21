@@ -79,18 +79,6 @@ def _cube(path: Path, beams) -> Path:
     return path
 
 
-def _exact_racs_tools():
-    """racs_tools' beamcon modules, if they have the exact Nyquist taper
-    (RACS-tools 4.7). Before it, racs_tools differs near NaN edges."""
-    from importlib.metadata import version  # noqa: PLC0415
-
-    from packaging.version import Version  # noqa: PLC0415
-
-    pytest.importorskip("racs_tools")
-    if Version(version("RACS-tools")) < Version("4.7.0"):
-        pytest.skip("RACS-tools < 4.7 takes one sign of the Nyquist bin")
-
-
 def _assert_close(ours: np.ndarray, theirs: np.ndarray) -> None:
     """The tolerances of test_python's racs_tools parity test: convolve-rs
     blanks a thin extra rim at NaN edges, and otherwise matches."""
@@ -128,7 +116,7 @@ class TestSmoothImages:
         return [_image(d / f"im{i}.fits", b, seed=i) for i, b in enumerate(BEAMS_2D)]
 
     def test_matches_racs_tools(self, tmp_path):
-        _exact_racs_tools()
+        pytest.importorskip("racs_tools")
         beamcon_2D = pytest.importorskip("racs_tools.beamcon_2D")
         ref_in, rs_in = self._inputs(tmp_path / "ref"), self._inputs(tmp_path / "rs")
         ref_beam, _ = beamcon_2D.get_common_beam(ref_in)
@@ -189,7 +177,7 @@ BEAMS_3D = [
 class TestSmoothCubes:
     @pytest.mark.parametrize("mode", ["natural", "total"])
     def test_matches_racs_tools(self, tmp_path, mode):
-        _exact_racs_tools()
+        pytest.importorskip("racs_tools")
         beamcon_3D = pytest.importorskip("racs_tools.beamcon_3D")
         (tmp_path / "ref").mkdir()
         (tmp_path / "rs").mkdir()
