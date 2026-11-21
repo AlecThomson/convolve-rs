@@ -12,7 +12,7 @@ use convolve_rs::{
     beam::Beam,
     common_beam::{common_beam, fits_in_beam},
     convolve_uv::FftPlans,
-    cube_io::{self, CubeElem, CubeMeta, CubeMode, CubeReader, CubeWriter, PixelType},
+    cube_io::{self, CubeElem, CubeMeta, CubeMode, CubeReader, CubeWriter, PixelType, RefChan},
     fits_io::{FitsImageHeader, output_path, read_fits_header, read_fits_plane, write_fits},
     smooth::smooth,
 };
@@ -98,9 +98,26 @@ struct SharedArgs {
     /// Verbose output (-v, -vv).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Threads to use [default: all cores, or RAYON_NUM_THREADS].
+    #[arg(short = 'n', long)]
+    ncores: Option<usize>,
 }
 
 impl SharedArgs {
+    /// Logging, then the thread pool every parallel step runs on.
+    fn init(&self) -> Result<()> {
+        init_logging(self.verbose);
+        if let Some(n) = self.ncores {
+            anyhow::ensure!(n > 0, "--ncores must be at least 1");
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global()
+                .context("setting up the thread pool")?;
+        }
+        Ok(())
+    }
+
     fn output_for(&self, file: &Path) -> PathBuf {
         output_path(
             file,
@@ -145,7 +162,7 @@ struct BeamLogEntry2D {
 }
 
 fn cmd_2d(args: TwoDArgs) -> Result<()> {
-    init_logging(args.shared.verbose);
+    args.shared.init()?;
     let files = collect_files(&args.infile, args.listfile)?;
     let cutoff = args.shared.cutoff;
 
@@ -333,37 +350,58 @@ struct ThreeDArgs {
     /// Common-beam mode.
     #[arg(long, default_value = "natural", value_enum)]
     mode: ModeArg,
+
+    /// Channel whose beam goes in the output header's BMAJ/BMIN/BPA
+    /// [default: the spectral axis' CRPIX].
+    #[arg(long, value_enum)]
+    ref_chan: Option<RefChanArg>,
+
+    /// Reuse the target beams of a previous run, read from each output cube's
+    /// beamlog, instead of solving for them.
+    #[arg(long, conflicts_with_all = ["bmaj", "bmin", "bpa"])]
+    uselogs: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RefChanArg {
+    /// The first channel.
+    First,
+    /// The last channel.
+    Last,
+    /// The middle channel (the upper middle for an even count).
+    Mid,
+}
+
+impl From<RefChanArg> for RefChan {
+    fn from(r: RefChanArg) -> Self {
+        match r {
+            RefChanArg::First => RefChan::First,
+            RefChanArg::Last => RefChan::Last,
+            RefChanArg::Mid => RefChan::Mid,
+        }
+    }
 }
 
 fn cmd_3d(args: ThreeDArgs) -> Result<()> {
-    init_logging(args.shared.verbose);
+    args.shared.init()?;
     let files = collect_files(&args.infile, args.listfile)?;
     let metas = read_cube_metas(&files)?;
     let nfreq = metas[0].nfreq;
     let mode = CubeMode::from(args.mode);
+    let ref_chan = args.ref_chan.map_or(RefChan::default(), RefChan::from);
 
-    let target_beams = match parse_target_beam(&args.shared)? {
-        Some(b) => {
-            let valid: Vec<Beam> = metas
-                .iter()
-                .flat_map(|m| m.beams.iter().flatten())
-                .copied()
-                .filter(|b| usable_beam(b, args.shared.cutoff))
-                .collect();
-            vec![Some(finish_target(b, &valid, args.shared.circularise)?); nfreq]
-        }
-        None => {
-            let sp = spinner(match mode {
-                CubeMode::Natural => "Solving for per-channel common beams…",
-                CubeMode::Total => "Solving for the common beam across all channels…",
-            });
-            let beams = compute_target_beams(&metas, mode, &args.shared)?;
-            sp.finish_and_clear();
-            beams
-        }
+    // One set of targets per cube: shared, unless read back from each one's log.
+    let per_cube: Vec<Vec<Option<Beam>>> = if args.uselogs {
+        metas
+            .iter()
+            .map(|m| read_previous_targets(&args.shared.output_for(&m.path), nfreq))
+            .collect::<Result<_>>()?
+    } else {
+        vec![solve_targets(&args, &metas, mode)?; metas.len()]
     };
+    let target_beams = &per_cube[0];
 
-    let all_same = report_targets(&target_beams);
+    let all_same = report_targets(target_beams);
     if args.shared.dryrun {
         // stdout, so callers can capture it: one beam if all channels share
         // it, else one `<channel> <beam>` line per channel.
@@ -383,26 +421,74 @@ fn cmd_3d(args: ThreeDArgs) -> Result<()> {
     }
 
     let pb = progress_bar((files.len() * nfreq) as u64);
-    for meta in &metas {
+    for (meta, target_beams) in metas.iter().zip(&per_cube) {
         let file = &meta.path;
         let out = args.shared.output_for(file);
         pb.suspend(|| info!("Initialising output cube {} …", out.display()));
         pb.set_message("processing");
+        let cutoff = args.shared.cutoff;
         match meta.dtype {
             PixelType::F32 => {
-                process_cube::<f32>(&out, meta, &target_beams, mode, args.shared.cutoff, &pb)?
+                process_cube::<f32>(&out, meta, target_beams, mode, ref_chan, cutoff, &pb)?
             }
             PixelType::F64 => {
-                process_cube::<f64>(&out, meta, &target_beams, mode, args.shared.cutoff, &pb)?
+                process_cube::<f64>(&out, meta, target_beams, mode, ref_chan, cutoff, &pb)?
             }
         }
         let beamlog = cube_io::beamlog_path(&out);
-        cube_io::write_beamlog(&beamlog, &target_beams)
+        cube_io::write_beamlog(&beamlog, target_beams)
             .with_context(|| format!("writing beamlog {}", beamlog.display()))?;
         pb.suspend(|| info!("{} → {}", file.display(), out.display()));
     }
     pb.finish_with_message("done");
     Ok(())
+}
+
+/// The target beams a previous run wrote to the beamlog of output `out`.
+fn read_previous_targets(out: &Path, nfreq: usize) -> Result<Vec<Option<Beam>>> {
+    let log = cube_io::beamlog_path(out);
+    let beams = cube_io::read_beamlog(&log)
+        .with_context(|| format!("reading the previous run's beamlog {}", log.display()))?;
+    anyhow::ensure!(
+        beams.len() == nfreq,
+        "{}: {} channels, but the cube has {nfreq}",
+        log.display(),
+        beams.len()
+    );
+    info!("Target beams read from {}", log.display());
+    Ok(beams
+        .into_iter()
+        .map(|b| (!b.is_zero()).then_some(b))
+        .collect())
+}
+
+/// The per-channel target beams: the requested beam, or the common beams.
+fn solve_targets(
+    args: &ThreeDArgs,
+    metas: &[CubeMeta],
+    mode: CubeMode,
+) -> Result<Vec<Option<Beam>>> {
+    let nfreq = metas[0].nfreq;
+    Ok(match parse_target_beam(&args.shared)? {
+        Some(b) => {
+            let valid: Vec<Beam> = metas
+                .iter()
+                .flat_map(|m| m.beams.iter().flatten())
+                .copied()
+                .filter(|b| usable_beam(b, args.shared.cutoff))
+                .collect();
+            vec![Some(finish_target(b, &valid, args.shared.circularise)?); nfreq]
+        }
+        None => {
+            let sp = spinner(match mode {
+                CubeMode::Natural => "Solving for per-channel common beams…",
+                CubeMode::Total => "Solving for the common beam across all channels…",
+            });
+            let beams = compute_target_beams(metas, mode, &args.shared)?;
+            sp.finish_and_clear();
+            beams
+        }
+    })
 }
 
 /// Read every cube's metadata and check they can be smoothed together.
@@ -477,6 +563,7 @@ fn process_cube<T: CubeElem>(
     meta: &CubeMeta,
     target_beams: &[Option<Beam>],
     mode: CubeMode,
+    ref_chan: RefChan,
     cutoff: Option<f64>,
     pb: &ProgressBar,
 ) -> Result<()> {
@@ -486,8 +573,9 @@ fn process_cube<T: CubeElem>(
 
     std::thread::scope(|s| {
         let writer = s.spawn(move || -> Result<()> {
-            let mut writer = CubeWriter::create(&meta.path, out, target_beams, mode, meta)
-                .with_context(|| format!("initialising output cube {}", out.display()))?;
+            let mut writer =
+                CubeWriter::create(&meta.path, out, target_beams, mode, meta, ref_chan)
+                    .with_context(|| format!("initialising output cube {}", out.display()))?;
             for (c, plane) in rx {
                 writer
                     .write_channel(c, &plane, meta)

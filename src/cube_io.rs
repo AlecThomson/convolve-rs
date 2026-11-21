@@ -91,6 +91,18 @@ impl CubeMeta {
     }
 }
 
+/// Which channel's beam goes in the primary header of an output cube.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RefChan {
+    /// The channel at the spectral axis' CRPIX, as racs_tools does by default.
+    #[default]
+    Crpix,
+    First,
+    Last,
+    /// Channel `nfreq / 2`: the upper middle one for an even count.
+    Mid,
+}
+
 /// The beamlog next to a FITS file: `{dir}/beamlog.{stem}.txt`.
 pub fn beamlog_path(fits: &Path) -> PathBuf {
     let dir = fits.parent().unwrap_or(Path::new("."));
@@ -271,11 +283,12 @@ impl CubeWriter {
         target_beams: &[Option<Beam>],
         mode: CubeMode,
         meta: &CubeMeta,
+        ref_chan: RefChan,
     ) -> Result<Self, CubeError> {
         let mut fptr = create_output(input_path, output_path, None)?;
         write_primary_beam_keys(
             &mut fptr,
-            ref_beam_for(target_beams, meta),
+            ref_beam_for(target_beams, meta, ref_chan),
             mode == CubeMode::Natural,
         )?;
         Ok(Self {
@@ -309,11 +322,16 @@ impl CubeWriter {
     }
 }
 
-/// The beam for the primary header: the target at the spectral CRPIX (clamped
-/// to the channel range), else the first valid one, else zero.
-fn ref_beam_for(target_beams: &[Option<Beam>], meta: &CubeMeta) -> Beam {
-    let last = meta.nfreq.saturating_sub(1) as f64;
-    let ref_idx = (meta.crpix_freq - 1.0).clamp(0.0, last) as usize;
+/// The beam for the primary header: the target at `ref_chan` (CRPIX clamped to
+/// the channel range), else the first valid one, else zero.
+fn ref_beam_for(target_beams: &[Option<Beam>], meta: &CubeMeta, ref_chan: RefChan) -> Beam {
+    let last = meta.nfreq.saturating_sub(1);
+    let ref_idx = match ref_chan {
+        RefChan::Crpix => (meta.crpix_freq - 1.0).clamp(0.0, last as f64) as usize,
+        RefChan::First => 0,
+        RefChan::Last => last,
+        RefChan::Mid => (meta.nfreq / 2).min(last),
+    };
     target_beams[ref_idx]
         .or_else(|| target_beams.iter().find_map(|b| *b))
         .unwrap_or(Beam::zero())
