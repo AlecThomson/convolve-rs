@@ -44,7 +44,8 @@ pub mod smooth;
 pub use beam::{Beam, BeamError, gauss_factor};
 pub use common_beam::{CommonBeamError, common_beam, find_commonbeam_between};
 pub use convolve_uv::{
-    ConvolutionResult, ConvolveError, FftFloat, FftPlans, convolve_uv, fftfreq, gaussft,
+    ConvolutionResult, ConvolveError, FftFloat, FftPlans, NanBlanking, PixelScale, convolve_uv,
+    convolve_uv_with, fftfreq, gaussft,
 };
 pub use fits_io::{
     FitsError, FitsImageData, FitsImageHeader, output_path, read_fits, read_fits_header,
@@ -54,7 +55,7 @@ pub use pipeline::{
     CubeOptions, SmoothOptions, SmoothedCube, SmoothedImage, SmoothedImages, cube_beams,
     round_common_beam, smooth_cubes, smooth_images,
 };
-pub use smooth::{BrightnessUnit, smooth};
+pub use smooth::{BrightnessUnit, smooth, smooth_with};
 
 #[cfg(feature = "python")]
 mod python;

@@ -14,12 +14,12 @@ use tracing::{Level, debug, info, warn};
 
 use crate::beam::Beam;
 use crate::common_beam::{common_beam, fits_in_beam};
-use crate::convolve_uv::FftPlans;
+use crate::convolve_uv::{FftPlans, NanBlanking};
 use crate::cube_io::{
     self, CubeElem, CubeMeta, CubeMode, CubeReader, CubeWriter, PixelType, RefChan,
 };
 use crate::fits_io::{FitsImageHeader, output_path, read_fits_header, read_fits_plane, write_fits};
-use crate::smooth::smooth;
+use crate::smooth::smooth_with;
 
 /// Options shared by [`smooth_images`] and [`smooth_cubes`].
 #[derive(Debug, Clone)]
@@ -42,6 +42,8 @@ pub struct SmoothOptions {
     pub nsamps: usize,
     /// Edge inflation in the common-beam fit.
     pub epsilon: f64,
+    /// Which pixels near the input's NaNs are blanked.
+    pub nan_blanking: NanBlanking,
     /// Find the target beams but write nothing.
     pub dryrun: bool,
     /// Threads to use. Default: rayon's global pool.
@@ -62,6 +64,7 @@ impl Default for SmoothOptions {
             tolerance: 1e-4,
             nsamps: 200,
             epsilon: 5e-4,
+            nan_blanking: NanBlanking::RacsTools,
             dryrun: false,
             ncores: None,
             progress: false,
@@ -199,8 +202,20 @@ fn smooth_images_in_pool(files: &[PathBuf], opts: &SmoothOptions) -> Result<Smoo
             );
         }
         match header.dtype {
-            PixelType::F32 => smooth_image_as::<f32>(header, &output, &target, kernel.is_none()),
-            PixelType::F64 => smooth_image_as::<f64>(header, &output, &target, kernel.is_none()),
+            PixelType::F32 => smooth_image_as::<f32>(
+                header,
+                &output,
+                &target,
+                kernel.is_none(),
+                opts.nan_blanking,
+            ),
+            PixelType::F64 => smooth_image_as::<f64>(
+                header,
+                &output,
+                &target,
+                kernel.is_none(),
+                opts.nan_blanking,
+            ),
         }?;
         pb.suspend(|| info!("{} → {}", header.path.display(), output.display()));
         pb.inc(1);
@@ -247,6 +262,7 @@ fn smooth_image_as<T: CubeElem>(
     out: &Path,
     target: &Beam,
     blank: bool,
+    nan_blanking: NanBlanking,
 ) -> Result<()> {
     let file = &header.path;
     if blank {
@@ -256,13 +272,13 @@ fn smooth_image_as<T: CubeElem>(
     }
     let data =
         read_fits_plane::<T>(header).with_context(|| format!("reading {}", file.display()))?;
-    let image = smooth(
+    let image = smooth_with(
         data,
         &header.beam,
         target,
-        header.dx_deg,
-        header.dy_deg,
+        header.pixel_scale,
         header.unit,
+        nan_blanking,
         None,
     )
     .with_context(|| format!("smoothing {}", file.display()))?;
@@ -330,6 +346,7 @@ fn smooth_cubes_in_pool(files: &[PathBuf], opts: &CubeOptions) -> Result<Vec<Smo
             mode: opts.mode,
             ref_chan: opts.ref_chan,
             cutoff: shared.cutoff,
+            nan_blanking: shared.nan_blanking,
             pb: &pb,
         };
         match meta.dtype {
@@ -512,6 +529,7 @@ struct CubeJob<'a> {
     mode: CubeMode,
     ref_chan: RefChan,
     cutoff: Option<f64>,
+    nan_blanking: NanBlanking,
     pb: &'a ProgressBar,
 }
 
@@ -612,13 +630,13 @@ impl CubeJob<'_> {
         let raw = reader
             .read_channel::<T>(c, meta)
             .with_context(|| format!("reading channel {c} from {}", meta.path.display()))?;
-        smooth(
+        smooth_with(
             raw,
             &old_beam,
             &target,
-            meta.dx_deg,
-            meta.dy_deg,
+            meta.pixel_scale,
             meta.unit,
+            self.nan_blanking,
             Some(plans),
         )
         .with_context(|| format!("smoothing channel {c}"))

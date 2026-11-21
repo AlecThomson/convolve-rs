@@ -73,6 +73,13 @@ Per-channel beams are read from, in priority order:
   A blanked image gets a zero beam, and a blanked channel is masked in the
   BEAMS table, rather than claiming the target resolution (racs_tools writes
   the target beam).
+- The pixel grid is read in full from CD, or PC and CDELT, so rotated and
+  skewed grids and grids with east to the right are smoothed correctly.
+  racs_tools reads CDELT alone, which suits the usual unrotated grid with east
+  to the left; there both give the same output.
+- `--nan-fraction F` blanks the NaN pixels and every pixel where more than `F`
+  of the smoothed signal came from them, as patchwork does with 0.5. By
+  default convolvers blanks as racs_tools does.
 - Only the first plane of a 4D image is smoothed; the output has
   `NAXIS3 = NAXIS4 = 1`. `BITPIX = -64` images are smoothed and written in
   double precision; integer images are smoothed in single precision and

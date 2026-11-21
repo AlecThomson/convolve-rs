@@ -16,8 +16,8 @@ use ndarray::Array2;
 use thiserror::Error;
 
 use crate::beam::{Beam, BeamError};
-use crate::convolve_uv::FftFloat;
-use crate::fits_io::{FitsError, create_output, read_header_beam, read_unit};
+use crate::convolve_uv::{FftFloat, PixelScale};
+use crate::fits_io::{FitsError, create_output, read_header_beam, read_pixel_scale, read_unit};
 use crate::smooth::BrightnessUnit;
 
 pub use atfits_rs::PixelType;
@@ -71,6 +71,8 @@ pub struct CubeMeta {
     pub dx_deg: f64,
     /// Pixel size along y in degrees.
     pub dy_deg: f64,
+    /// The full pixel grid, from CD, or PC and CDELT.
+    pub pixel_scale: PixelScale,
     /// CRPIX of the spectral axis, truncated to a whole pixel as racs_tools
     /// does. Picks the channel whose beam goes in the output header; may lie
     /// outside `1..=nfreq`.
@@ -136,6 +138,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
     };
 
     let (dx_deg, dy_deg) = pixel_scale_deg(&mut fptr)?;
+    let pixel_scale = read_pixel_scale(&mut fptr, dx_deg, dy_deg)?;
     let crpix_freq = atfits_rs::key_f64(&mut fptr, &format!("CRPIX{freq_axis}"))?
         .unwrap_or(1.0)
         .floor();
@@ -170,6 +173,7 @@ pub fn read_cube_meta(path: &Path) -> Result<CubeMeta, CubeError> {
         nstokes,
         dx_deg,
         dy_deg,
+        pixel_scale,
         crpix_freq,
         beams,
         is_4d: naxis == 4,

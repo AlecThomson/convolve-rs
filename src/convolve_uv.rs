@@ -96,6 +96,62 @@ impl<T: FftNum> FftPlans<T> {
     }
 }
 
+/// How image pixels map to the sky.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PixelScale(Scale);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scale {
+    Cdelt(f64, f64),
+    Matrix([[f64; 2]; 2]),
+}
+
+impl PixelScale {
+    /// Pixel sizes along x and y in degrees (CDELT1, CDELT2). Their signs
+    /// are ignored, as racs_tools does, which suits the usual grid with east
+    /// to the left.
+    pub fn cdelt(dx_deg: f64, dy_deg: f64) -> Self {
+        Self(Scale::Cdelt(dx_deg, dy_deg))
+    }
+
+    /// The pixel-to-sky matrix in degrees, as astropy's
+    /// `WCS.pixel_scale_matrix` gives it: `m[i][j]` is the step along world
+    /// axis `i` (east, north) per pixel along axis `j` (x, y). Signs,
+    /// rotation and skew are kept. `None` if it is not finite or singular.
+    ///
+    /// ```
+    /// use convolve_rs::PixelScale;
+    ///
+    /// let d = 2.5 / 3600.0;
+    /// // The usual grid, east to the left, is the same as its CDELTs.
+    /// assert_eq!(PixelScale::matrix([[-d, 0.0], [0.0, d]]), Some(PixelScale::cdelt(-d, d)));
+    /// assert_eq!(PixelScale::matrix([[d, d], [d, d]]), None);
+    /// ```
+    pub fn matrix(m: [[f64; 2]; 2]) -> Option<Self> {
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        if !(m.iter().flatten().all(|x| x.is_finite()) && det.is_normal()) {
+            return None;
+        }
+        // Kept on the CDELT path so its output is unchanged to the bit.
+        if m[0][1] == 0.0 && m[1][0] == 0.0 && m[0][0] < 0.0 && m[1][1] > 0.0 {
+            return Some(Self::cdelt(m[0][0], m[1][1]));
+        }
+        Some(Self(Scale::Matrix(m)))
+    }
+}
+
+/// Which pixels of a convolved image are blanked near the input's NaNs.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum NanBlanking {
+    /// As racs_tools: where the NaN mask, convolved like the image and with
+    /// its flux scaling, reaches 0.99. A lone NaN pixel is filled in.
+    #[default]
+    RacsTools,
+    /// The NaN pixels, and every pixel where more than this fraction of the
+    /// convolved signal came from them. patchwork uses 0.5.
+    Fraction(f64),
+}
+
 /// Convolve `image` from `old_beam` to `new_beam` in the UV plane.
 ///
 /// `dx_deg` and `dy_deg` are the pixel sizes (CDELT1, CDELT2); their sign is
@@ -129,11 +185,35 @@ pub fn convolve_uv<'a, T: FftFloat>(
     dy_deg: f64,
     plans: Option<&FftPlans<T>>,
 ) -> Result<ConvolutionResult<T>, ConvolveError> {
+    convolve_uv_with(
+        image,
+        old_beam,
+        new_beam,
+        PixelScale::cdelt(dx_deg, dy_deg),
+        NanBlanking::RacsTools,
+        plans,
+    )
+}
+
+/// [`convolve_uv`] on any pixel grid, with a choice of NaN blanking.
+///
+/// # Errors
+///
+/// As for [`convolve_uv`].
+pub fn convolve_uv_with<'a, T: FftFloat>(
+    image: impl Into<CowArray<'a, T, Ix2>>,
+    old_beam: &Beam,
+    new_beam: &Beam,
+    scale: PixelScale,
+    blanking: NanBlanking,
+    plans: Option<&FftPlans<T>>,
+) -> Result<ConvolutionResult<T>, ConvolveError> {
     convolve_with_gain(
         image.into(),
         old_beam,
         new_beam,
-        (dx_deg, dy_deg),
+        scale,
+        blanking,
         plans,
         |ratio| ratio,
     )
@@ -146,7 +226,8 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
     image: CowArray<'_, T, Ix2>,
     old_beam: &Beam,
     new_beam: &Beam,
-    (dx_deg, dy_deg): (f64, f64),
+    scale: PixelScale,
+    blanking: NanBlanking,
     plans: Option<&FftPlans<T>>,
     gain: impl Fn(f64) -> f64,
 ) -> Result<ConvolutionResult<T>, ConvolveError> {
@@ -182,7 +263,16 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
         });
     }
 
-    let taper = UvTaper::new(old_beam, new_beam);
+    let (taper, row_step, col_step) = match scale.0 {
+        // Rows run along y (CDELT2), columns along x (CDELT1). Only the
+        // magnitudes matter: passing a negative CDELT1 to fftfreq would mirror the PA.
+        Scale::Cdelt(dx, dy) => (
+            UvTaper::new(old_beam, new_beam),
+            dy.abs().to_radians(),
+            dx.abs().to_radians(),
+        ),
+        Scale::Matrix(m) => (UvTaper::in_pixels(old_beam, new_beam, m), 1.0, 1.0),
+    };
     let nan_count = image.iter().filter(|x| x.is_nan()).count();
     if nan_count == image.len() {
         return Ok(ConvolutionResult {
@@ -191,17 +281,10 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
         });
     }
 
-    // Rows run along y (CDELT2), columns along x (CDELT1). Only the magnitudes
-    // matter: passing a negative CDELT1 to fftfreq would mirror the PA.
-    let grid = UvGrid::new(
-        dim,
-        dy_deg.abs().to_radians(),
-        dx_deg.abs().to_radians(),
-        &taper,
-    );
+    let grid = UvGrid::new(dim, row_step, col_step, &taper);
     // Done before the image is unpacked, so the mask's buffer is freed first.
     let blank = if nan_count > 0 {
-        Some(nan_spread(image.view(), &taper, &grid, plans)?)
+        Some(nan_spread(image.view(), &taper, &grid, plans, blanking)?)
     } else {
         None
     };
@@ -219,15 +302,16 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
     })
 }
 
-/// Pixels to blank: where the NaN mask, convolved like the image, reaches
-/// 0.99. racs_tools uses 1; with nearly equal beams (g_ratio ≈ 1) a solid NaN
-/// region sits at 1 minus round-off and the NaN pixels on its edge just under
-/// 1, and both must stay blank.
+/// Pixels to blank (see [`NanBlanking`]). racs_tools blanks where its mask
+/// reaches 1; with nearly equal beams (g_ratio ≈ 1) a solid NaN region sits
+/// at 1 minus round-off and the NaN pixels on its edge just under 1, and both
+/// must stay blank, hence 0.99.
 fn nan_spread<T: FftFloat>(
     image: ArrayView2<'_, T>,
     taper: &UvTaper,
     grid: &UvGrid,
     plans: &FftPlans<T>,
+    blanking: NanBlanking,
 ) -> Result<Bitset, ConvolveError> {
     let mut mask = Vec::with_capacity(spectrum_len(plans));
     mask.extend(
@@ -236,9 +320,19 @@ fn nan_spread<T: FftFloat>(
             .map(|x| if x.is_nan() { T::one() } else { T::zero() }),
     );
     let npix = (plans.nrows * plans.ncols) as f64;
-    convolve_in_place(&mut mask, taper, taper.ratio / npix, grid, plans)?;
-    let threshold = T::one() - cast_saturating::<T>(1e-2);
-    Ok(Bitset::from_predicate(&mask, |m| m >= threshold))
+    Ok(match blanking {
+        NanBlanking::RacsTools => {
+            convolve_in_place(&mut mask, taper, taper.ratio / npix, grid, plans)?;
+            let threshold = T::one() - cast_saturating::<T>(1e-2);
+            Bitset::from_predicate(&mask, |m| m >= threshold)
+        }
+        NanBlanking::Fraction(fraction) => {
+            let nans = Bitset::from_predicate(&mask, |m| m > T::zero());
+            convolve_in_place(&mut mask, taper, 1.0 / npix, grid, plans)?;
+            let fraction = cast_saturating::<T>(fraction);
+            Bitset::from_predicate(&mask, |m| m > fraction).union(&nans)
+        }
+    })
 }
 
 fn spectrum_len<T: FftNum>(plans: &FftPlans<T>) -> usize {
@@ -305,6 +399,51 @@ impl UvTaper {
             b: k * (b - b_in),
             c: k * (c - c_in),
             ratio: (2.0 * PI * sx * sy).sqrt() / (2.0 * PI * sx_in * sy_in).sqrt(),
+        }
+    }
+
+    /// The taper in cycles per pixel, for a grid whose pixels step by the
+    /// columns of `m_deg` on the sky (see [`PixelScale::matrix`]). The kernel's
+    /// sky covariance, `Σ_new − Σ_old`, becomes `M⁻¹ (Σ_new − Σ_old) M⁻ᵀ` in pixels.
+    fn in_pixels(old_beam: &Beam, new_beam: &Beam, m_deg: [[f64; 2]; 2]) -> Self {
+        use std::f64::consts::PI;
+        let fwhm_to_sigma = 2.0 * (2.0 * 2_f64.ln()).sqrt();
+        // Covariance along (east, north), in radians²; the major axis points
+        // along (sin PA, cos PA).
+        let cov = |b: &Beam| {
+            let major = (b.major_deg().to_radians() / fwhm_to_sigma).powi(2);
+            let minor = (b.minor_deg().to_radians() / fwhm_to_sigma).powi(2);
+            let (s, c) = b.pa_deg().to_radians().sin_cos();
+            let en = (major - minor) * s * c;
+            [
+                [major * s * s + minor * c * c, en],
+                [en, major * c * c + minor * s * s],
+            ]
+        };
+        let (new, old) = (cov(new_beam), cov(old_beam));
+        let d = [
+            [new[0][0] - old[0][0], new[0][1] - old[0][1]],
+            [new[1][0] - old[1][0], new[1][1] - old[1][1]],
+        ];
+        let m = m_deg.map(|row| row.map(f64::to_radians));
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        let inv = [
+            [m[1][1] / det, -m[0][1] / det],
+            [-m[1][0] / det, m[0][0] / det],
+        ];
+        // p = inv · d · invᵀ, symmetric; index 0 is x (columns), 1 is y (rows).
+        let p = |i: usize, j: usize| {
+            (0..2)
+                .flat_map(|k| (0..2).map(move |l| (k, l)))
+                .map(|(k, l)| inv[i][k] * d[k][l] * inv[j][l])
+                .sum::<f64>()
+        };
+        let k = -2.0 * PI * PI;
+        Self {
+            a: k * p(1, 1),
+            b: k * 2.0 * p(0, 1),
+            c: k * p(0, 0),
+            ratio: Self::new(old_beam, new_beam).ratio,
         }
     }
 
@@ -411,6 +550,13 @@ impl Bitset {
             })
             .collect();
         Self { words }
+    }
+
+    fn union(mut self, other: &Self) -> Self {
+        for (a, b) in self.words.iter_mut().zip(&other.words) {
+            *a |= b;
+        }
+        self
     }
 
     fn for_each_set(&self, mut f: impl FnMut(usize)) {
@@ -763,6 +909,16 @@ mod tests {
     /// Reference: full complex 2D FFTs of the zero-filled image and the NaN
     /// mask, multiplied by `gaussft` on the full grid.
     fn reference(image: &Array2<f64>, old: &Beam, new: &Beam, dx: f64) -> Array2<f64> {
+        reference_blanked(image, old, new, dx, NanBlanking::RacsTools)
+    }
+
+    fn reference_blanked(
+        image: &Array2<f64>,
+        old: &Beam,
+        new: &Beam,
+        dx: f64,
+        blanking: NanBlanking,
+    ) -> Array2<f64> {
         let (nrows, ncols) = image.dim();
         let u = fftfreq(nrows, dx.to_radians());
         let v = fftfreq(ncols, dx.to_radians());
@@ -795,10 +951,18 @@ mod tests {
         };
         let img = conv(&|x| if x.is_nan() { 0.0 } else { x });
         let mask = conv(&|x| if x.is_nan() { 1.0 } else { 0.0 });
+        let ratio = UvTaper::new(old, new).ratio;
         let out = img
             .iter()
             .zip(&mask)
-            .map(|(&x, &m)| if m >= 1.0 - 1e-2 { f64::NAN } else { x })
+            .zip(image.iter())
+            .map(|((&x, &m), &orig)| {
+                let blank = match blanking {
+                    NanBlanking::RacsTools => m >= 1.0 - 1e-2,
+                    NanBlanking::Fraction(f) => orig.is_nan() || m / ratio > f,
+                };
+                if blank { f64::NAN } else { x }
+            })
             .collect();
         Array2::from_shape_vec((nrows, ncols), out).unwrap()
     }
@@ -923,6 +1087,155 @@ mod tests {
             let got = convolve_uv(&img, &old, &new, dx, dy, None).unwrap().image;
             for (a, b) in pos.iter().zip(got.iter()) {
                 assert_eq!(a.to_bits(), b.to_bits(), "dx={dx} dy={dy}");
+            }
+        }
+    }
+
+    /// Blanking by fraction matches the reference, and blanks a lone NaN
+    /// pixel that the racs_tools rule fills in.
+    #[test]
+    fn test_nan_fraction_matches_reference() {
+        let dx = 2.5 / 3600.0;
+        let old = Beam::from_arcsec(12.0, 10.0, 20.0).unwrap();
+        let new = Beam::from_arcsec(18.0, 15.0, 35.0).unwrap();
+        let img = test_image(48, 40, true);
+        let lone = (46, 37);
+        for f in [0.0, 0.25, 0.5, 1.0] {
+            let blanking = NanBlanking::Fraction(f);
+            let want = reference_blanked(&img, &old, &new, dx, blanking);
+            let got = convolve_uv_with(&img, &old, &new, PixelScale::cdelt(dx, dx), blanking, None)
+                .unwrap()
+                .image;
+            for (&w, &g) in want.iter().zip(got.iter()) {
+                assert_eq!(w.is_nan(), g.is_nan(), "fraction {f}: NaN mask differs");
+                if !w.is_nan() {
+                    assert!((w - g).abs() < 1e-9, "fraction {f}: {w} vs {g}");
+                }
+            }
+            assert!(got[lone].is_nan());
+        }
+        let racs = convolve_uv(&img, &old, &new, dx, dx, None).unwrap().image;
+        assert!(!racs[lone].is_nan());
+        let count = |a: &Array2<f64>| a.iter().filter(|x| x.is_nan()).count();
+        let at = |f| {
+            convolve_uv_with(
+                &img,
+                &old,
+                &new,
+                PixelScale::cdelt(dx, dx),
+                NanBlanking::Fraction(f),
+                None,
+            )
+            .unwrap()
+            .image
+        };
+        assert_eq!(count(&at(1.0)), count(&img));
+        assert!(count(&at(0.25)) > count(&at(0.5)));
+    }
+
+    /// The usual diagonal matrix takes the CDELT path; others are kept.
+    #[test]
+    fn test_pixel_scale_matrix_validation() {
+        let d = 2.0 / 3600.0;
+        assert_eq!(
+            PixelScale::matrix([[-d, 0.0], [0.0, d]]),
+            Some(PixelScale::cdelt(-d, d))
+        );
+        assert!(matches!(
+            PixelScale::matrix([[d, 0.0], [0.0, d]]),
+            Some(PixelScale(Scale::Matrix(_)))
+        ));
+        assert_eq!(PixelScale::matrix([[d, 2.0 * d], [d, 2.0 * d]]), None);
+        assert_eq!(PixelScale::matrix([[f64::NAN, 0.0], [0.0, d]]), None);
+    }
+
+    /// The matrix path gives the same image as the CDELT path on a diagonal
+    /// grid, to round-off.
+    #[test]
+    fn test_matrix_path_matches_cdelt_path() {
+        let d = 2.0 / 3600.0;
+        let old = Beam::from_arcsec(8.0, 5.0, 30.0).unwrap();
+        let new = Beam::from_arcsec(16.0, 9.0, 70.0).unwrap();
+        for nans in [false, true] {
+            let img = test_image(40, 36, nans);
+            let cdelt = convolve_uv(&img, &old, &new, -d, d, None).unwrap().image;
+            let scale = PixelScale(Scale::Matrix([[-d, 0.0], [0.0, d]]));
+            let matrix = convolve_uv_with(&img, &old, &new, scale, NanBlanking::RacsTools, None)
+                .unwrap()
+                .image;
+            for (a, b) in cdelt.iter().zip(matrix.iter()) {
+                assert_eq!(a.is_nan(), b.is_nan());
+                if !a.is_nan() {
+                    assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+                }
+            }
+        }
+    }
+
+    /// On rotated, skewed and east-right grids, a smoothed point source has
+    /// the pixel covariance `M⁻¹ (Σ_new − Σ_old) M⁻ᵀ`.
+    #[test]
+    fn test_kernel_covariance_on_any_grid() {
+        let old = Beam::from_arcsec(6.0, 4.0, 20.0).unwrap();
+        let new = Beam::from_arcsec(14.0, 9.0, 65.0).unwrap();
+        let fwhm_to_sigma = 1.0 / (8.0 * 2f64.ln()).sqrt();
+        let cov = |b: &Beam| {
+            let (maj, min) = (
+                (b.major_arcsec() * fwhm_to_sigma).powi(2),
+                (b.minor_arcsec() * fwhm_to_sigma).powi(2),
+            );
+            let (s, c) = b.pa_deg().to_radians().sin_cos();
+            let en = (maj - min) * s * c;
+            [
+                [maj * s * s + min * c * c, en],
+                [en, maj * c * c + min * s * s],
+            ]
+        };
+        let (cn, co) = (cov(&new), cov(&old));
+        let (t, a) = (0.4f64, 2.0);
+        for m in [
+            [[-a * t.cos(), a * t.sin()], [a * t.sin(), a * t.cos()]],
+            [[-a, 0.6], [0.3, 1.5 * a]],
+            [[a, 0.0], [0.0, a]],
+        ] {
+            let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+            let inv = [
+                [m[1][1] / det, -m[0][1] / det],
+                [-m[1][0] / det, m[0][0] / det],
+            ];
+            let want = |i: usize, j: usize| {
+                let mut sum = 0.0;
+                for k in 0..2 {
+                    for l in 0..2 {
+                        sum += inv[i][k] * (cn[k][l] - co[k][l]) * inv[j][l];
+                    }
+                }
+                sum
+            };
+            let n = 96;
+            let mut img = Array2::<f64>::zeros((n, n));
+            img[(n / 2, n / 2)] = 1.0;
+            let m_deg = m.map(|row| row.map(|x| x / 3600.0));
+            let scale = PixelScale::matrix(m_deg).unwrap();
+            let res = convolve_uv_with(&img, &old, &new, scale, NanBlanking::RacsTools, None)
+                .unwrap()
+                .image;
+            let total: f64 = res.sum();
+            let (mut xx, mut xy, mut yy) = (0.0, 0.0, 0.0);
+            for ((i, j), &v) in res.indexed_iter() {
+                let (x, y) = (j as f64 - (n / 2) as f64, i as f64 - (n / 2) as f64);
+                xx += v * x * x;
+                xy += v * x * y;
+                yy += v * y * y;
+            }
+            let got = [xx / total, xy / total, yy / total];
+            let expected = [want(0, 0), want(0, 1), want(1, 1)];
+            let scale = expected[0].max(expected[2]);
+            for (g, e) in got.iter().zip(expected) {
+                assert!(
+                    (g - e).abs() < 1e-3 * scale,
+                    "{m:?}: {got:?} vs {expected:?}"
+                );
             }
         }
     }

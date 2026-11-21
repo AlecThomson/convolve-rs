@@ -4,13 +4,16 @@
 //! plane of a 4D image is used, as in racs_tools.
 use std::path::{Path, PathBuf};
 
-use atfits_rs::{HeaderGeom, PixelType, create_cube_open, pixel_scale_deg, update_key_f64};
+use atfits_rs::{
+    HeaderGeom, PixelType, create_cube_open, pixel_scale_deg, pixel_scale_matrix, update_key_f64,
+};
 use fitsio::FitsFile;
 use fitsio::hdu::FitsHdu;
 use ndarray::Array2;
 use thiserror::Error;
 
 use crate::beam::{Beam, BeamError};
+use crate::convolve_uv::PixelScale;
 use crate::cube_io::CubeElem;
 use crate::smooth::BrightnessUnit;
 
@@ -57,6 +60,8 @@ pub struct FitsImageHeader {
     pub dx_deg: f64,
     /// Pixel size along y in degrees.
     pub dy_deg: f64,
+    /// The full pixel grid, from CD, or PC and CDELT.
+    pub pixel_scale: PixelScale,
     pub beam: Beam,
     pub unit: BrightnessUnit,
     pub dtype: PixelType,
@@ -83,6 +88,7 @@ pub fn read_fits_header(path: &Path) -> Result<FitsImageHeader, FitsError> {
     }
     let hdu = fptr.primary_hdu()?;
     let (dx_deg, dy_deg) = pixel_scale_deg(&mut fptr)?;
+    let pixel_scale = read_pixel_scale(&mut fptr, dx_deg, dy_deg)?;
     let beam = read_header_beam(&mut fptr)?.ok_or(FitsError::MissingKeyword("BMAJ".into()))?;
     Ok(FitsImageHeader {
         path: path.to_path_buf(),
@@ -91,10 +97,21 @@ pub fn read_fits_header(path: &Path) -> Result<FitsImageHeader, FitsError> {
         nplanes,
         dx_deg,
         dy_deg,
+        pixel_scale,
         beam,
         unit: read_unit(&mut fptr, &hdu, path),
         dtype: PixelType::from_bitpix(geom.bitpix),
     })
+}
+
+/// The pixel grid of an open image, or its CDELTs if the matrix is singular.
+pub(crate) fn read_pixel_scale(
+    fptr: &mut FitsFile,
+    dx_deg: f64,
+    dy_deg: f64,
+) -> Result<PixelScale, FitsError> {
+    let m = pixel_scale_matrix(fptr)?;
+    Ok(PixelScale::matrix(m).unwrap_or(PixelScale::cdelt(dx_deg, dy_deg)))
 }
 
 /// Read a 2D image, or the first plane of a 4D one, in precision `T`.
