@@ -57,7 +57,7 @@ jobs:
         include:
           - { platform: linux, runner: ubuntu-latest, target: x86_64 }
           - { platform: linux, runner: ubuntu-latest, target: aarch64 }
-          - { platform: macos, runner: macos-14, target: aarch64 }
+          - { platform: macos, runner: macos-26, target: aarch64 }
           # No Windows wheel: cfitsio can't be built from source under MSVC.
           # Windows users can build from the sdist or use conda/WSL.
     steps:
