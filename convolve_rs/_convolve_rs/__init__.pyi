@@ -2,12 +2,21 @@
 # ruff: noqa: E501, F401, F403, F405
 
 import builtins
+import os
+import pathlib
 import typing
 __all__ = [
     "Beam",
+    "SmoothedCube",
+    "SmoothedImage",
+    "SmoothedImages",
     "common_beam",
+    "cube_beams",
     "gauss_factor",
+    "round_common_beam",
     "smooth",
+    "smooth_cubes",
+    "smooth_images",
 ]
 
 class Beam:
@@ -108,6 +117,72 @@ class Beam:
     def __repr__(self) -> builtins.str: ...
     def __str__(self) -> builtins.str: ...
 
+@typing.final
+class SmoothedCube:
+    r"""
+    One cube written by ``smooth_cubes``.
+    """
+    @property
+    def input(self) -> pathlib.Path:
+        r"""
+        The input cube.
+        """
+    @property
+    def output(self) -> pathlib.Path:
+        r"""
+        The smoothed cube.
+        """
+    @property
+    def targets(self) -> builtins.list[typing.Optional[Beam]]:
+        r"""
+        The target beam of each channel, ``None`` for a channel with no target.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class SmoothedImage:
+    r"""
+    One image written by ``smooth_images``.
+    """
+    @property
+    def input(self) -> pathlib.Path:
+        r"""
+        The input image.
+        """
+    @property
+    def output(self) -> pathlib.Path:
+        r"""
+        The smoothed image.
+        """
+    @property
+    def old_beam(self) -> Beam:
+        r"""
+        The input's beam.
+        """
+    @property
+    def kernel(self) -> typing.Optional[Beam]:
+        r"""
+        The beam the image was convolved with, or ``None`` if it was blanked.
+        """
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class SmoothedImages:
+    r"""
+    The result of ``smooth_images``.
+    """
+    @property
+    def target(self) -> Beam:
+        r"""
+        The beam every usable image was smoothed to.
+        """
+    @property
+    def images(self) -> builtins.list[SmoothedImage]:
+        r"""
+        One entry per input, in input order.
+        """
+    def __repr__(self) -> builtins.str: ...
+
 def common_beam(beams: typing.Sequence[Beam], tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005) -> Beam:
     r"""
     The smallest beam every beam in ``beams`` can be convolved to.
@@ -131,6 +206,18 @@ def common_beam(beams: typing.Sequence[Beam], tolerance: builtins.float = 0.0001
         True
     """
 
+def cube_beams(path: builtins.str | os.PathLike | pathlib.Path) -> builtins.list[typing.Optional[Beam]]:
+    r"""
+    The beam of each channel of a cube, ``None`` where it is masked.
+    
+    Beams come from the BEAMS table, else a beamlog beside the cube, else the
+    header's BMAJ/BMIN/BPA.
+    
+    Raises:
+        FileNotFoundError: If the cube does not exist.
+        ValueError: If it cannot be read or has no beams.
+    """
+
 def gauss_factor(conv_beam: Beam, orig_beam: Beam, dx_arcsec: builtins.float, dy_arcsec: builtins.float) -> tuple[builtins.float, builtins.float, builtins.float, builtins.float, builtins.float]:
     r"""
     The factor that keeps a Jy/beam image in Jy/beam after convolving it from
@@ -147,6 +234,20 @@ def gauss_factor(conv_beam: Beam, orig_beam: Beam, dx_arcsec: builtins.float, dy
         >>> fac, amp, bmaj, bmin, bpa = gauss_factor(conv, orig, 2.5, 2.5)
         >>> round(bmaj, 5)
         11.18034
+    """
+
+def round_common_beam(beam: Beam, beams: typing.Sequence[Beam]) -> Beam:
+    r"""
+    ``beam`` rounded up to 0.1 arcsec axes and 0.01 degree PA, as racs_tools
+    rounds a common beam, with 0.1 arcsec more if the rounded PA would leave
+    one of ``beams`` outside it.
+    
+    Examples:
+        >>> from convolve_rs import Beam, round_common_beam
+        >>> b = Beam.from_arcsec(10.03, 8.01, 30.004)
+        >>> r = round_common_beam(b, [b])
+        >>> round(r.major_arcsec, 6), round(r.minor_arcsec, 6), round(r.pa_deg, 6)
+        (10.1, 8.1, 30.01)
     """
 
 def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> typing.Any:
@@ -189,5 +290,66 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
         4.0
         >>> round(float(smooth(image, old, new, dx, dx, bunit="K")[32, 32]), 3)
         1.0
+    """
+
+def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], mode: builtins.str = 'natural', target_beam: typing.Optional[Beam] = None, target_beams: typing.Optional[typing.Sequence[typing.Optional[Beam]]] = None, ref_chan: typing.Optional[builtins.str] = None, uselogs: builtins.bool = False, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> builtins.list[SmoothedCube]:
+    r"""
+    Smooth FITS cubes channel by channel, as ``convolvers 3d`` does.
+    
+    Every cube must have the same number of channels and at most one Stokes
+    plane. A channel with no target, no usable beam, or a BMAJ over ``cutoff``
+    is written as NaN and masked in the BEAMS table. Each output gets a
+    beamlog of its targets. Arguments not listed here are as for
+    ``smooth_images``. The GIL is released.
+    
+    Args:
+        paths (list[str]): The cubes.
+        mode (str): ``"natural"`` for a common beam per channel, ``"total"``
+            for one beam for every channel.
+        target_beam (Beam, optional): One beam for every channel.
+        target_beams (list[Beam | None], optional): A beam per channel;
+            ``None`` blanks the channel.
+        ref_chan (str, optional): Channel whose beam goes in the header's
+            BMAJ/BMIN/BPA: ``"first"``, ``"last"`` or ``"mid"``. Default: the
+            spectral axis' CRPIX.
+        uselogs (bool): Reuse the beamlogs of a previous run as the targets.
+    
+    Returns:
+        list[SmoothedCube]: Per input, its output and per-channel targets.
+    
+    Raises:
+        FileNotFoundError: If an input does not exist.
+        ValueError: On bad options, cubes that cannot be smoothed together, or
+            a read or write error.
+    """
+
+def smooth_images(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], target_beam: typing.Optional[Beam] = None, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> SmoothedImages:
+    r"""
+    Smooth 2D FITS images to one common beam, as ``convolvers 2d`` does.
+    
+    Each image is written to ``<prefix><name>.<suffix>.fits`` in ``outdir``
+    (default: beside the input). Images with no usable beam, or a BMAJ over
+    ``cutoff``, are written as NaN with a zero beam. The GIL is released.
+    
+    Args:
+        paths (list[str]): The images.
+        target_beam (Beam, optional): Beam to smooth to. Default: the common
+            beam of the inputs, rounded up to 0.1 arcsec as racs_tools does.
+        cutoff (float, optional): Blank images whose BMAJ exceeds this (arcsec).
+        circularise (bool): Make the target circular.
+        suffix (str): Output name suffix.
+        prefix (str, optional): Output name prefix.
+        outdir (str, optional): Output directory.
+        tolerance, nsamps, epsilon: Settings of the common-beam fit.
+        dryrun (bool): Find the target beam but write nothing.
+        ncores (int, optional): Threads to use. Default: one per core.
+    
+    Returns:
+        SmoothedImages: The target beam and, per input, its output and kernel.
+    
+    Raises:
+        FileNotFoundError: If an input does not exist.
+        ValueError: If no image has a usable beam, the target is too small, or
+            an image cannot be read or written.
     """
 

@@ -19,7 +19,14 @@ Documentation = "https://convolve-rs.readthedocs.io"
 Repository = "https://github.com/alecthomson/convolve-rs"
 
 [project.optional-dependencies]
-test = ["pytest", "radio-beam", "astropy"]
+# RACS-tools is the reference the parity tests compare against; it needs
+# Python 3.11, so on 3.10 those tests skip.
+test = [
+  "pytest",
+  "radio-beam",
+  "astropy",
+  "RACS-tools>=4.6.1; python_version >= '3.11'",
+]
 dev = ["prek", "ty"]
 benchmark = [
     "astropy>=6.1.7",

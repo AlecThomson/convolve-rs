@@ -9,6 +9,7 @@
 //!   convolved to.
 //! - [`convolve_uv`](fn@convolve_uv): UV-plane convolution between two beams.
 //! - [`smooth`](fn@smooth): convolution plus Jy/beam or Kelvin flux scaling.
+//! - [`smooth_images`], [`smooth_cubes`]: smooth files on disk, as the CLI does.
 //! - [`fits_io`], [`cube_io`]: FITS image and cube I/O.
 //!
 //! ```
@@ -37,6 +38,7 @@ pub mod common_beam;
 pub mod convolve_uv;
 pub mod cube_io;
 pub mod fits_io;
+pub mod pipeline;
 pub mod smooth;
 
 pub use beam::{Beam, BeamError, gauss_factor};
@@ -47,6 +49,10 @@ pub use convolve_uv::{
 pub use fits_io::{
     FitsError, FitsImageData, FitsImageHeader, output_path, read_fits, read_fits_header,
     read_fits_plane, write_fits,
+};
+pub use pipeline::{
+    CubeOptions, SmoothOptions, SmoothedCube, SmoothedImage, SmoothedImages, cube_beams,
+    round_common_beam, smooth_cubes, smooth_images,
 };
 pub use smooth::{BrightnessUnit, smooth};
 

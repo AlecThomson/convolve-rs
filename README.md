@@ -1,6 +1,6 @@
 # convolve-rs
 
-[![Docs](https://readthedocs.org/projects/convolve-rs/badge/?version=latest)](https://convolve-rs.readthedocs.io/en/latest/)
+[![Docs](https://img.shields.io/readthedocs/convolve-rs)](https://convolve-rs.readthedocs.io/en/latest/)
 [![docs.rs](https://img.shields.io/docsrs/convolve-rs)](https://docs.rs/convolve-rs)
 [![PyPI](https://img.shields.io/pypi/v/convolve-rs)](https://pypi.org/project/convolve-rs/)
 [![crates.io](https://img.shields.io/crates/v/convolve-rs)](https://crates.io/crates/convolve-rs)

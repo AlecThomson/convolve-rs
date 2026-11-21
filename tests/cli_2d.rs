@@ -67,7 +67,8 @@ fn header_beam(path: &Path) -> Beam {
     read_fits_header(path).unwrap().beam
 }
 
-/// An image over the cutoff is written as NaN; the run does not abort.
+/// An image over the cutoff is written as NaN with a zero beam; the run does
+/// not abort.
 #[test]
 fn cutoff_blanks_image() {
     let dir = workdir("cutoff");
@@ -80,6 +81,8 @@ fn cutoff_blanks_image() {
     let out_b = read_fits::<f32>(&dir.join("b.sm.fits")).unwrap();
     assert!(out_a.image.iter().all(|v| v.is_finite()));
     assert!(out_b.image.iter().all(|v| v.is_nan()));
+    assert!(header_beam(&dir.join("a.sm.fits")).has_area());
+    assert!(header_beam(&dir.join("b.sm.fits")).is_zero());
 }
 
 /// An explicit target is checked only against images that will be smoothed.
