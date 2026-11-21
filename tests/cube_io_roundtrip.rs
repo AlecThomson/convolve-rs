@@ -194,8 +194,9 @@ fn natural_mode_write_channel_and_beams() {
 
     // BEAMS extension must round-trip the per-channel target beams.
     let out_meta = cube_io::read_cube_meta(&out).unwrap();
-    for c in 0..NFREQ {
-        let b = out_meta.beams[c].expect("channel beam present");
+    assert_eq!(out_meta.beams.len(), NFREQ);
+    for (c, b) in out_meta.beams.iter().enumerate() {
+        let b = b.expect("channel beam present");
         assert!((b.major_arcsec() - (25.0 + c as f64)).abs() < 1e-3);
     }
 }
