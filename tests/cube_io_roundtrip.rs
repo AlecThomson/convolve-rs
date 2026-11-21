@@ -1,7 +1,7 @@
 //! Cube I/O round trips and end-to-end `convolvers 3d` runs.
 
 use convolve_rs::beam::Beam;
-use convolve_rs::cube_io::{self, CubeElem, CubeMode, CubeReader, CubeWriter};
+use convolve_rs::cube_io::{self, CubeElem, CubeMode, CubeReader, CubeWriter, RefChan};
 use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 use ndarray::Array2;
@@ -69,7 +69,7 @@ fn write_cube<T: CubeElem>(
     meta: &cube_io::CubeMeta,
     planes: &[Array2<T>],
 ) -> Result<(), cube_io::CubeError> {
-    let mut w = CubeWriter::create(input, out, target, mode, meta)?;
+    let mut w = CubeWriter::create(input, out, target, mode, meta, RefChan::default())?;
     for (c, p) in planes.iter().enumerate() {
         w.write_channel(c, p, meta)?;
     }
@@ -952,4 +952,103 @@ fn cli_cutoff_blanks_even_when_target_contains() {
             .iter()
             .all(|v| v.is_nan())
     );
+}
+
+/// The header BMAJ of `out`, in degrees, against its beamlog's channel `chan`.
+fn header_and_logged_bmaj(out: &std::path::Path, chan: usize) -> (f64, f64) {
+    let (bmaj, ..) = read_primary_beam_keys(out);
+    let logged = cube_io::read_beamlog(&cube_io::beamlog_path(out)).unwrap();
+    (bmaj, logged[chan].major_deg())
+}
+
+#[test]
+fn cli_ref_chan_picks_the_header_beam() {
+    let dir = workdir("cli_ref_chan");
+    let path = dir.join("in.fits");
+    make_varied_cube(&path);
+    let out = dir.join("in.sm.fits");
+    let p = path.to_str().unwrap();
+
+    // CRPIX3 = 1, so the default is channel 0
+    for (flag, chan) in [
+        (None, 0),
+        (Some("first"), 0),
+        (Some("mid"), NFREQ / 2),
+        (Some("last"), NFREQ - 1),
+    ] {
+        let mut args = vec!["3d", p, "--mode", "natural"];
+        if let Some(f) = flag {
+            args.extend(["--ref-chan", f]);
+        }
+        let (ok, log) = run_cli(&args);
+        assert!(ok, "{flag:?}:\n{log}");
+        let (header, logged) = header_and_logged_bmaj(&out, chan);
+        assert!(
+            (header - logged).abs() < 1e-12,
+            "{flag:?}: {header} vs channel {chan} {logged}"
+        );
+    }
+    // Channel beams grow with channel, so the choices differ
+    let (last, _) = header_and_logged_bmaj(&out, NFREQ - 1);
+    let (_, first) = header_and_logged_bmaj(&out, 0);
+    assert!(last > first);
+}
+
+#[test]
+fn cli_uselogs_reuses_the_previous_targets() {
+    let dir = workdir("cli_uselogs");
+    let path = dir.join("in.fits");
+    make_varied_cube(&path);
+    let p = path.to_str().unwrap();
+    let out = dir.join("in.sm.fits");
+
+    // Without a previous run there is no log to use
+    let (ok, log) = run_cli(&["3d", p, "--uselogs"]);
+    assert!(!ok && log.contains("beamlog"), "{log}");
+
+    let (ok, log) = run_cli(&["3d", p, "--mode", "natural"]);
+    assert!(ok, "{log}");
+    // Hand-edit the log: the rerun must convolve to these, not re-solve
+    let log_path = cube_io::beamlog_path(&out);
+    let mut text = String::from("# Channel BMAJ[arcsec] BMIN[arcsec] BPA[deg]\n");
+    for c in 0..NFREQ {
+        text += &format!("{c} 40 35 10\n");
+    }
+    std::fs::write(&log_path, text).unwrap();
+
+    let (ok, log) = run_cli(&["3d", p, "--mode", "natural", "--uselogs"]);
+    assert!(ok, "{log}");
+    let meta = cube_io::read_cube_meta(&out).unwrap();
+    for b in &meta.beams {
+        let b = b.expect("every channel has a target");
+        assert!((b.major_arcsec() - 40.0).abs() < 1e-3, "{b}");
+        assert!((b.minor_arcsec() - 35.0).abs() < 1e-3, "{b}");
+    }
+
+    // A target beam and --uselogs contradict each other
+    let (ok, _) = run_cli(&[
+        "3d",
+        p,
+        "--uselogs",
+        "--bmaj",
+        "50",
+        "--bmin",
+        "50",
+        "--bpa",
+        "0",
+    ]);
+    assert!(!ok);
+}
+
+#[test]
+fn cli_ncores_sets_the_thread_count() {
+    let dir = workdir("cli_ncores");
+    let path = dir.join("in.fits");
+    make_varied_cube(&path);
+    let p = path.to_str().unwrap();
+    let (ok, log) = run_cli(&["3d", p, "--mode", "total", "--ncores", "1"]);
+    assert!(ok, "{log}");
+    assert!(dir.join("in.sm.fits").exists());
+    let (ok, log) = run_cli(&["3d", p, "--ncores", "0"]);
+    assert!(!ok && log.contains("--ncores"), "{log}");
 }

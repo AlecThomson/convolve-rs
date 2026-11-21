@@ -163,7 +163,7 @@ impl PyBeam {
 fn new_instance<'py>(cls: &Bound<'py, PyType>, beam: Beam) -> PyResult<Bound<'py, PyBeam>> {
     Ok(cls
         .call1((beam.major_deg(), beam.minor_deg(), beam.pa_deg()))?
-        .downcast_into::<PyBeam>()?)
+        .cast_into::<PyBeam>()?)
 }
 
 /// The smallest beam every beam in ``beams`` can be convolved to.

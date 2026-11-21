@@ -48,29 +48,29 @@ abi3 = ["python", "pyo3/abi3-py310"]
 stubgen = ["python", "dep:pyo3-stub-gen"]
 
 [dependencies]
-pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
-numpy = { version = "0.26", optional = true }
-pyo3-stub-gen = { version = "0.22.3", optional = true }
+pyo3 = { version = "0.30", features = ["extension-module"], optional = true }
+numpy = { version = "0.30", optional = true }
+pyo3-stub-gen = { version = "0.23.3", optional = true }
 # Shared low-level cfitsio helpers (pixel I/O, header editing, image creation).
-atfits-rs = "1.2"
+atfits-rs = "1.3"
 # cfitsio linkage is controlled by the crate-level `fitsio-src` feature (see
 # [features] above).
 fitsio = { version = "0.21" }
-ndarray = "0.16"
+ndarray = "0.17"
 rustfft = "6"
 realfft = "3"
 num-traits = "0.2"
 rayon = "1"
 clap = { version = "4", features = ["derive"] }
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-indicatif = { version = "0.17", features = ["rayon"] }
+indicatif = { version = "0.18", features = ["rayon"] }
 
 [dev-dependencies]
 # Benchmark harness (dev-only; not part of the published crate or wheel).
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "convolve_bench"
