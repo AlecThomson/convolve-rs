@@ -427,3 +427,86 @@ class TestSmoothInputs:
         np.testing.assert_allclose(
             ours[finite], theirs[finite], rtol=0, atol=1e-4 * theirs[finite].std()
         )
+
+
+class TestExactTaper:
+    """smooth() against the closed-form answer: convolve the image's
+    band-limited interpolant with the kernel exactly and resample. On an even
+    axis that averages the taper over the Nyquist bin's +-1/2 cycles/pixel,
+    which turns the cross term exp(b u v) into cosh(b u v) there."""
+
+    PIX = 2.0 / 3600.0
+    CASES = (
+        ((9, 9, 0), (12.3, 9.1, 30)),
+        ((16, 11, 40), (16.1, 15.1, 40.03)),
+        ((10, 8, 30), (12.3, 9.1, 65.8)),
+    )
+
+    @staticmethod
+    def _quadratic_form(beam, pix):
+        """sigma^2 terms (a, b, c) of a beam in pixels, u along rows, v along
+        columns, PA from the row axis, as racs_tools.gaussft writes them."""
+        f = 2 * np.sqrt(2 * np.log(2))
+        sx, sy = beam[0] / 3600 / pix / f, beam[1] / 3600 / pix / f
+        t = np.deg2rad(beam[2])
+        c, s = np.cos(t), np.sin(t)
+        return np.array(
+            [
+                sx**2 * c**2 + sy**2 * s**2,
+                2 * c * s * (sy**2 - sx**2),
+                sx**2 * s**2 + sy**2 * c**2,
+            ]
+        )
+
+    def _exact(self, image, old, new):
+        a, b, c = (
+            -2
+            * np.pi**2
+            * (
+                self._quadratic_form(new, self.PIX)
+                - self._quadratic_form(old, self.PIX)
+            )
+        )
+        ratio = new[0] * new[1] / (old[0] * old[1])
+        ny, nx = image.shape
+        u = np.fft.fftfreq(ny)[:, None]
+        v = np.fft.fftfreq(nx)[None, :]
+        cross = np.exp(b * u * v)
+        nyquist = np.zeros(image.shape, dtype=bool)
+        if ny % 2 == 0:
+            nyquist[ny // 2, :] = True
+        if nx % 2 == 0:
+            nyquist[:, nx // 2] = True
+        cross = np.where(nyquist, np.cosh(b * u * v), cross)
+        taper = ratio * np.exp(a * u**2 + c * v**2) * cross
+        exact = np.fft.ifft2(np.fft.fft2(image) * taper)
+        assert np.abs(exact.imag).max() < 1e-12 * np.abs(exact.real).max()
+        return exact.real
+
+    @pytest.mark.parametrize("shape", [(64, 64), (64, 65), (65, 64), (65, 65)])
+    @pytest.mark.parametrize(("old", "new"), CASES)
+    def test_matches_closed_form(self, shape, old, new):
+        image = np.random.default_rng(2).normal(size=shape)
+        ours = smooth(
+            image,
+            Beam.from_arcsec(*old),
+            Beam.from_arcsec(*new),
+            self.PIX,
+            self.PIX,
+        )
+        exact = self._exact(image, old, new)
+        np.testing.assert_allclose(ours, exact, rtol=0, atol=1e-12 * exact.std())
+
+    @pytest.mark.parametrize(("old", "new"), CASES)
+    def test_mirror_symmetric(self, old, new):
+        # Mirroring the image and its beams' PAs mirrors the result. Taking one
+        # sign of the Nyquist bin, as before, broke this by up to 15% of the noise.
+        image = np.random.default_rng(3).normal(size=(64, 64))
+        mirror = lambda b: Beam.from_arcsec(b[0], b[1], -b[2])  # noqa: E731
+        direct = smooth(
+            image, Beam.from_arcsec(*old), Beam.from_arcsec(*new), self.PIX, self.PIX
+        )
+        mirrored = smooth(
+            image[:, ::-1].copy(), mirror(old), mirror(new), self.PIX, self.PIX
+        )[:, ::-1]
+        np.testing.assert_allclose(mirrored, direct, rtol=0, atol=1e-12 * direct.std())

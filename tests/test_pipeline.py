@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import astropy.units as u
 import numpy as np
@@ -10,7 +10,11 @@ import pytest
 from astropy.io import fits
 
 import convolve_rs as cr
-from convolve_rs._convolve_rs import Beam as _Beam
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from convolve_rs._convolve_rs import Beam as _Beam
 
 PIX = 2.0 / 3600.0
 
@@ -30,18 +34,24 @@ def _header(bmaj: float, bmin: float, bpa: float, *, cube: bool = False) -> fits
     return h
 
 
-def _noise(shape, seed=0) -> np.ndarray:
-    return np.random.default_rng(seed).normal(size=shape).astype(np.float32)
+def _sky(beam, seed=0) -> np.ndarray:
+    """A 64x64 noise image at resolution ``beam`` (arcsec, arcsec, deg), as a
+    real image is: white noise holds power at the Nyquist frequency that no
+    image made with a beam has."""
+    white = np.random.default_rng(seed).normal(size=(64, 64))
+    point = cr.Beam.from_arcsec(1e-3, 1e-3, 0.0)
+    target = cr.Beam.from_arcsec(*beam)
+    return cr.smooth(white, point, target, PIX, PIX, bunit="K").astype(np.float32)
 
 
 def _image(path: Path, beam, seed=0) -> Path:
-    fits.writeto(path, _noise((64, 64), seed), _header(*beam), overwrite=True)
+    fits.writeto(path, _sky(beam, seed), _header(*beam), overwrite=True)
     return path
 
 
 def _cube(path: Path, beams) -> Path:
     """A cube with a CASA BEAMS table of ``beams`` (arcsec, arcsec, deg)."""
-    data = _noise((1, len(beams), 64, 64))
+    data = np.stack([_sky(b, seed=i) for i, b in enumerate(beams)])[None]
     data[0, 1, 10:20, 10:20] = np.nan
     header = _header(*beams[0], cube=True)
     header["CTYPE4"], header["CRPIX4"], header["CRVAL4"], header["CDELT4"] = (
@@ -51,7 +61,9 @@ def _cube(path: Path, beams) -> Path:
         1.0,
     )
     header["CASAMBM"] = True
-    bmaj, bmin, bpa = (np.array(col, dtype=np.float32) for col in zip(*beams))
+    bmaj, bmin, bpa = (
+        np.array(col, dtype=np.float32) for col in zip(*beams, strict=True)
+    )
     table = fits.BinTableHDU.from_columns(
         [
             fits.Column(name="BMAJ", format="1E", unit="arcsec", array=bmaj),
@@ -67,13 +79,26 @@ def _cube(path: Path, beams) -> Path:
     return path
 
 
+def _exact_racs_tools():
+    """racs_tools' beamcon modules, if they have the exact Nyquist taper
+    (RACS-tools 4.7). Before it, racs_tools differs near NaN edges."""
+    from importlib.metadata import version  # noqa: PLC0415
+
+    from packaging.version import Version  # noqa: PLC0415
+
+    pytest.importorskip("racs_tools")
+    if Version(version("RACS-tools")) < Version("4.7.0"):
+        pytest.skip("RACS-tools < 4.7 takes one sign of the Nyquist bin")
+
+
 def _assert_close(ours: np.ndarray, theirs: np.ndarray) -> None:
     """The tolerances of test_python's racs_tools parity test: convolve-rs
     blanks a thin extra rim at NaN edges, and otherwise matches."""
     assert np.isnan(ours)[np.isnan(theirs)].all()
-    assert np.isnan(ours).sum() - np.isnan(theirs).sum() <= max(
-        0.02 * np.isnan(theirs).sum(), 0
-    ) + 4 * 64
+    assert (
+        np.isnan(ours).sum() - np.isnan(theirs).sum()
+        <= max(0.02 * np.isnan(theirs).sum(), 0) + 4 * 64
+    )
     finite = ~np.isnan(ours)
     np.testing.assert_allclose(
         ours[finite], theirs[finite], rtol=0, atol=1e-4 * np.nanstd(theirs)
@@ -94,11 +119,7 @@ def _same_beam(ours: _Beam | None, theirs, *, fitted: bool = False) -> None:
     assert abs(d_pa) * (1 - (minor / major) ** 2) <= (2e-3 if fitted else 1e-8)
 
 
-# Beams whose kernels leave little white-noise power at the Nyquist frequency.
-# There both smooth() implementations pick one sign of +-1/2 rather than the
-# exact average, and they pick opposite ones, so they can differ by ~1e-3 of
-# the noise.
-BEAMS_2D = [(10.0, 8.0, 30.0), (12.0, 7.0, 75.0), (9.5, 7.5, 20.0)]
+BEAMS_2D = [(10.0, 8.0, 30.0), (12.0, 7.0, 75.0), (9.0, 9.0, 0.0)]
 
 
 class TestSmoothImages:
@@ -107,6 +128,7 @@ class TestSmoothImages:
         return [_image(d / f"im{i}.fits", b, seed=i) for i, b in enumerate(BEAMS_2D)]
 
     def test_matches_racs_tools(self, tmp_path):
+        _exact_racs_tools()
         beamcon_2D = pytest.importorskip("racs_tools.beamcon_2D")
         ref_in, rs_in = self._inputs(tmp_path / "ref"), self._inputs(tmp_path / "rs")
         ref_beam, _ = beamcon_2D.get_common_beam(ref_in)
@@ -156,12 +178,18 @@ class TestSmoothImages:
             cr.smooth_images(files, ncores=0, dryrun=True)
 
 
-BEAMS_3D = [(10.0, 8.0, 30.0), (12.0, 7.0, 75.0), (9.5, 7.5, 20.0), (11.0, 6.0, 50.0)]
+BEAMS_3D = [
+    (14.0, 12.0, 10.0),
+    (16.0, 11.0, 40.0),
+    (15.0, 15.0, 0.0),
+    (13.0, 9.0, 80.0),
+]
 
 
 class TestSmoothCubes:
     @pytest.mark.parametrize("mode", ["natural", "total"])
     def test_matches_racs_tools(self, tmp_path, mode):
+        _exact_racs_tools()
         beamcon_3D = pytest.importorskip("racs_tools.beamcon_3D")
         (tmp_path / "ref").mkdir()
         (tmp_path / "rs").mkdir()
@@ -208,7 +236,7 @@ class TestSmoothCubes:
     def test_cutoff_channel_is_masked(self, tmp_path):
         path = _cube(tmp_path / "c.fits", BEAMS_3D)
         (cube,) = cr.smooth_cubes(
-            [path], target_beam=cr.Beam.from_arcsec(30, 30, 0), cutoff=11.5
+            [path], target_beam=cr.Beam.from_arcsec(30, 30, 0), cutoff=15.5
         )
         data = fits.getdata(cube.output)[0]
         assert np.isnan(data[1]).all()

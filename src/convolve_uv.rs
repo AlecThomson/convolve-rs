@@ -357,13 +357,19 @@ pub fn fftfreq(n: usize, d: f64) -> Vec<f64> {
 const COL_BLOCK: usize = 16;
 
 /// UV coordinates of the half spectrum, with `a·u²` precomputed per row.
+///
+/// On an even axis the Nyquist bin holds +1/2 and -1/2 cycles per pixel at
+/// once. Convolving the image's band-limited interpolant exactly and
+/// resampling averages the filter over both, which turns the cross term
+/// `exp(b u v)` into `cosh(b u v)` there and leaves the rest unchanged.
 struct UvGrid {
     u: Vec<f64>,
     au2: Vec<f64>,
-    /// `v` for the `ncols/2 + 1` columns of the half spectrum. Taken from the
-    /// full `fftfreq` rather than `rfftfreq`, so the Nyquist bin keeps the
-    /// sign the full transform gives it.
+    /// `v` for the `ncols/2 + 1` columns of the half spectrum.
     v: Vec<f64>,
+    /// The Nyquist row and column, on even axes.
+    nyquist_row: Option<usize>,
+    nyquist_col: Option<usize>,
 }
 
 impl UvGrid {
@@ -377,7 +383,14 @@ impl UvGrid {
         let au2 = u.iter().map(|&u| taper.a * u * u).collect();
         let mut v = fftfreq(ncols, col_step_rad);
         v.truncate(ncols / 2 + 1);
-        Self { u, au2, v }
+        let nyquist = |n: usize| n.is_multiple_of(2).then_some(n / 2);
+        Self {
+            u,
+            au2,
+            v,
+            nyquist_row: nyquist(nrows),
+            nyquist_col: nyquist(ncols),
+        }
     }
 }
 
@@ -622,10 +635,18 @@ fn filter_columns<T: FftFloat>(
                 }
                 plans.col_fwd.process_with_scratch(tile, scratch);
                 for (k, col) in tile.chunks_exact_mut(nrows).enumerate() {
-                    let v = grid.v[j0 + k];
+                    let j = j0 + k;
+                    let v = grid.v[j];
                     let (bv, cv2) = (taper.b * v, taper.c * v * v);
-                    for ((s, &u), &au2) in col.iter_mut().zip(&grid.u).zip(&grid.au2) {
-                        let g = gain * (au2 + bv * u + cv2).exp();
+                    let nyquist_col = grid.nyquist_col == Some(j);
+                    for (i, ((s, &u), &au2)) in
+                        col.iter_mut().zip(&grid.u).zip(&grid.au2).enumerate()
+                    {
+                        let g = if nyquist_col || grid.nyquist_row == Some(i) {
+                            gain * (au2 + cv2).exp() * (bv * u).cosh()
+                        } else {
+                            gain * (au2 + bv * u + cv2).exp()
+                        };
                         *s = s.scale(cast_saturating::<T>(g));
                     }
                 }
@@ -644,6 +665,33 @@ fn filter_columns<T: FftFloat>(
 mod tests {
     use super::*;
     use ndarray::Array2;
+
+    /// Mirroring the image and both PAs mirrors the result. Taking one sign of
+    /// the Nyquist bin, rather than averaging both, broke this on even axes.
+    #[test]
+    fn test_mirror_symmetric_on_even_and_odd_grids() {
+        let old = Beam::from_arcsec(10.0, 8.0, 30.0).unwrap();
+        let new = Beam::from_arcsec(12.3, 9.1, 65.8).unwrap();
+        let flip_pa = |b: &Beam| Beam::new(b.major_deg(), b.minor_deg(), -b.pa_deg()).unwrap();
+        let dx = 2.0 / 3600.0;
+        for (ny, nx) in [(32, 32), (32, 33), (33, 32), (33, 33)] {
+            let image = Array2::from_shape_fn((ny, nx), |(i, j)| {
+                (((i * 131 + j * 71) % 97) as f64 / 97.0 - 0.5) * 2.0
+            });
+            let mirror =
+                |a: &Array2<f64>| Array2::from_shape_fn((ny, nx), |(i, j)| a[(i, nx - 1 - j)]);
+            let direct = convolve_uv(&image, &old, &new, dx, dx, None).unwrap().image;
+            let flipped = convolve_uv(mirror(&image), &flip_pa(&old), &flip_pa(&new), dx, dx, None)
+                .unwrap()
+                .image;
+            let worst = mirror(&flipped)
+                .iter()
+                .zip(direct.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 1e-12, "{ny}x{nx}: mirrored result off by {worst}");
+        }
+    }
 
     #[test]
     fn test_fftfreq() {

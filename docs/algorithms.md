@@ -73,6 +73,17 @@ the "robust" mode of RACS-tools:
    evaluated exactly at each UV point (no kernel image is ever constructed).
 3. Inverse FFT.
 
+The result is exactly the image's band-limited interpolant convolved with the
+kernel and resampled. On an even-sized axis that needs one more step: the
+Nyquist bin holds +1/2 and -1/2 cycles per pixel at once, and a rotated kernel
+tapers the two differently. Writing the taper as
+`r exp(a u² + b u v + c v²)`, the exact value there is their average, which
+replaces the cross term `exp(b u v)` with `cosh(b u v)` on the Nyquist row and
+column. Taking either sign alone leaves a result that changes when the image
+is mirrored. On images already at their beam the Nyquist bin holds almost no
+power and the difference is far below the noise, but it shows at sharp edges
+such as blanked regions, and on under-sampled beams.
+
 NaN pixels are handled by zero-filling the data, convolving a NaN mask through
 the same filter, and re-blanking every output pixel where the smeared mask
 reaches 0.99. RACS-tools uses 1; the lower value keeps NaN pixels blank when

@@ -636,6 +636,7 @@ dev = [
 test = [
     { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "astropy", version = "7.2.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging" },
     { name = "pytest" },
     { name = "racs-tools", marker = "python_full_version >= '3.11'" },
     { name = "radio-beam" },
@@ -666,6 +667,7 @@ requires-dist = [
     { name = "nbconvert", marker = "extra == 'benchmark'", specifier = ">=7.17.1" },
     { name = "nbformat", marker = "extra == 'benchmark'", specifier = ">=5.10.4" },
     { name = "numpy" },
+    { name = "packaging", marker = "extra == 'test'" },
     { name = "pandas", marker = "extra == 'benchmark'", specifier = ">=2.3.3" },
     { name = "prek", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'test'" },

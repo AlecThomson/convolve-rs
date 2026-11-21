@@ -25,6 +25,7 @@ test = [
   "pytest",
   "radio-beam",
   "astropy",
+  "packaging",
   "RACS-tools>=4.6.0; python_version >= '3.11'",
 ]
 dev = ["prek", "ty"]
