@@ -5,6 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{Level, info};
 
 use convolve_rs::{
+    NanBlanking,
     beam::Beam,
     cube_io::{CubeMode, RefChan},
     pipeline::{CubeOptions, SmoothOptions, SmoothedImage, smooth_cubes, smooth_images},
@@ -72,6 +73,11 @@ struct SharedArgs {
     #[arg(short, long)]
     cutoff: Option<f64>,
 
+    /// Blank the NaN pixels and every pixel where more than this fraction of
+    /// the smoothed signal came from them [default: as racs_tools].
+    #[arg(long, value_parser = parse_fraction)]
+    nan_fraction: Option<f64>,
+
     /// Compute common beam and report without writing output files.
     #[arg(short, long)]
     dryrun: bool,
@@ -97,6 +103,14 @@ struct SharedArgs {
     ncores: Option<u16>,
 }
 
+fn parse_fraction(s: &str) -> Result<f64, String> {
+    let f: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    (0.0..=1.0)
+        .contains(&f)
+        .then_some(f)
+        .ok_or_else(|| format!("{f} is not between 0 and 1"))
+}
+
 impl SharedArgs {
     /// Start logging and gather the options.
     fn init(&self) -> Result<SmoothOptions> {
@@ -111,6 +125,9 @@ impl SharedArgs {
             tolerance: self.tolerance,
             nsamps: self.nsamps,
             epsilon: self.epsilon,
+            nan_blanking: self
+                .nan_fraction
+                .map_or(NanBlanking::RacsTools, NanBlanking::Fraction),
             dryrun: self.dryrun,
             ncores: self.ncores.map(usize::from),
             progress: true,

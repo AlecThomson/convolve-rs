@@ -250,7 +250,7 @@ def round_common_beam(beam: Beam, beams: typing.Sequence[Beam]) -> Beam:
         (10.1, 8.1, 30.01)
     """
 
-def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.float, dy_deg: builtins.float, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None) -> typing.Any:
+def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: typing.Optional[builtins.float] = None, dy_deg: typing.Optional[builtins.float] = None, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None, pixel_scale_matrix: typing.Optional[typing.Sequence[typing.Sequence[builtins.float]]] = None, nan_fraction: typing.Optional[builtins.float] = None) -> typing.Any:
     r"""
     Smooth an image from ``old_beam`` to ``new_beam``.
     
@@ -264,20 +264,30 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
         old_beam (Beam): Current beam.
         new_beam (Beam): Target beam; ``old_beam`` convolved with some
             Gaussian must give it.
-        dx_deg (float): Pixel size along x in degrees (CDELT1; sign ignored).
-        dy_deg (float): Pixel size along y in degrees (CDELT2; sign ignored).
+        dx_deg (float, optional): Pixel size along x in degrees (CDELT1; sign
+            ignored).
+        dy_deg (float, optional): Pixel size along y in degrees (CDELT2; sign
+            ignored).
         cutoff_arcsec (float, optional): Raise ``ValueError`` if the BMAJ of
             ``old_beam`` exceeds this.
         bunit (str, optional): FITS ``BUNIT``. ``"K"`` means no flux scaling;
             an unrecognised value warns and is treated as Jy/beam (the default).
+        pixel_scale_matrix (array-like, optional): The 2×2 pixel-to-sky matrix
+            in degrees, in place of ``dx_deg`` and ``dy_deg``, as astropy's
+            ``WCS.pixel_scale_matrix`` gives it. For rotated or skewed grids,
+            and grids with east to the right.
+        nan_fraction (float, optional): Blank the NaN pixels and every pixel
+            where more than this fraction of the smoothed signal came from
+            them. Default: blank as racs_tools does.
     
     Returns:
         numpy.ndarray: The smoothed image. An all-NaN image is returned as is.
     
     Raises:
         ValueError: If ``new_beam`` cannot be reached from ``old_beam``,
-            ``old_beam`` has zero size, its BMAJ exceeds ``cutoff_arcsec``, or
-            ``image`` is not a 2D float array.
+            ``old_beam`` has zero size, its BMAJ exceeds ``cutoff_arcsec``,
+            ``image`` is not a 2D float array, the pixel scale is not given
+            exactly one way, or the matrix is singular.
     
     Examples:
         >>> import numpy as np
@@ -292,7 +302,7 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: builtins.f
         1.0
     """
 
-def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], mode: builtins.str = 'natural', target_beam: typing.Optional[Beam] = None, target_beams: typing.Optional[typing.Sequence[typing.Optional[Beam]]] = None, ref_chan: typing.Optional[builtins.str] = None, uselogs: builtins.bool = False, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> builtins.list[SmoothedCube]:
+def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], mode: builtins.str = 'natural', target_beam: typing.Optional[Beam] = None, target_beams: typing.Optional[typing.Sequence[typing.Optional[Beam]]] = None, ref_chan: typing.Optional[builtins.str] = None, uselogs: builtins.bool = False, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, nan_fraction: typing.Optional[builtins.float] = None, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> builtins.list[SmoothedCube]:
     r"""
     Smooth FITS cubes channel by channel, as ``convolvers 3d`` does.
     
@@ -323,7 +333,7 @@ def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Pat
             a read or write error.
     """
 
-def smooth_images(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], target_beam: typing.Optional[Beam] = None, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> SmoothedImages:
+def smooth_images(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], target_beam: typing.Optional[Beam] = None, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, nan_fraction: typing.Optional[builtins.float] = None, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> SmoothedImages:
     r"""
     Smooth 2D FITS images to one common beam, as ``convolvers 2d`` does.
     
@@ -341,6 +351,7 @@ def smooth_images(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Pa
         prefix (str, optional): Output name prefix.
         outdir (str, optional): Output directory.
         tolerance, nsamps, epsilon: Settings of the common-beam fit.
+        nan_fraction (float, optional): As for ``smooth``.
         dryrun (bool): Find the target beam but write nothing.
         ncores (int, optional): Threads to use. Default: one per core.
     

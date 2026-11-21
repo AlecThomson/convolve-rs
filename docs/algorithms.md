@@ -84,10 +84,22 @@ is mirrored. On images already at their beam the Nyquist bin holds almost no
 power and the difference is far below the noise, but it shows at sharp edges
 such as blanked regions, and on under-sampled beams.
 
+The UV coordinates come from the pixel grid. With CDELTs alone, as RACS-tools
+does, the grid is taken to be unrotated with east to the left. Given the full
+pixel-to-sky matrix `M` (CD, or PC and CDELT; astropy's
+`WCS.pixel_scale_matrix`), the kernel's sky covariance `Σ_new − Σ_old` becomes
+`M⁻¹ (Σ_new − Σ_old) M⁻ᵀ` in pixels, and the taper is evaluated in cycles per
+pixel. That covers rotated and skewed grids, and grids with east to the right.
+The file functions and the CLI always read the full matrix; for the usual grid
+it takes the CDELT path, so its output is unchanged.
+
 NaN pixels are handled by zero-filling the data, convolving a NaN mask through
 the same filter, and re-blanking every output pixel where the smeared mask
 reaches 0.99. RACS-tools uses 1; the lower value keeps NaN pixels blank when
-the beams are nearly equal and round-off leaves the mask just under 1.
+the beams are nearly equal and round-off leaves the mask just under 1. With
+`nan_fraction` (`--nan-fraction`) set instead, the NaN pixels are blanked,
+along with every pixel where more than that fraction of the convolved signal
+came from them; patchwork uses 0.5.
 
 Because the image is real-valued, a real-input FFT is used along the
 contiguous axis, which halves the spectrum's memory.

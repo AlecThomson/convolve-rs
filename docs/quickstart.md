@@ -122,6 +122,27 @@ smoothed_nan = smooth(image_nan, old_beam, new_beam, dx_deg, dx_deg, bunit="Jy/b
 print(f"NaN pixels in: {np.isnan(image_nan).sum()}, out: {np.isnan(smoothed_nan).sum()}")
 ```
 
+`nan_fraction` blanks the NaN pixels and every pixel where more than that
+fraction of the smoothed signal came from them, as patchwork does with 0.5:
+
+```{code-cell} ipython3
+patchwork_like = smooth(
+    image_nan, old_beam, new_beam, dx_deg, dx_deg, bunit="Jy/beam", nan_fraction=0.5
+)
+print(f"NaN pixels out: {np.isnan(patchwork_like).sum()}")
+```
+
+For a rotated or skewed grid, pass the pixel-to-sky matrix in degrees, as
+astropy's `WCS.pixel_scale_matrix` gives it, instead of `dx_deg` and `dy_deg`:
+
+```{code-cell} ipython3
+theta = np.radians(20.0)
+matrix = dx_deg * np.array(
+    [[-np.cos(theta), np.sin(theta)], [np.sin(theta), np.cos(theta)]]
+)
+rotated = smooth(image, old_beam, new_beam, pixel_scale_matrix=matrix)
+```
+
 ## Working with FITS files
 
 With [astropy](https://www.astropy.org/), reading the beam from a header and
