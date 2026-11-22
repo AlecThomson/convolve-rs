@@ -10,7 +10,11 @@ def clear_of_missing(blank: np.ndarray, reach: int) -> np.ndarray:
     over the last two axes. There a convolution does not depend on how it
     treats missing data, so every correct tool gives the same result."""
     ny, nx = blank.shape[-2:]
-    padded = np.pad(blank, [(0, 0)] * (blank.ndim - 2) + [(reach + 1, reach)] * 2, constant_values=True)
+    padded = np.pad(
+        blank,
+        [(0, 0)] * (blank.ndim - 2) + [(reach + 1, reach)] * 2,
+        constant_values=True,
+    )
     counts = padded.astype(np.int64).cumsum(-2).cumsum(-1)
     w = 2 * reach + 1
     window = (
