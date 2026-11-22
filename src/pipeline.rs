@@ -83,8 +83,14 @@ impl SmoothOptions {
         )
     }
 
+    /// The rounded common beam of `beams`, retrying with a tenth of the
+    /// tolerance if the fit fails, as racs_tools does.
     fn common_beam(&self, beams: &[Beam]) -> Result<Beam> {
-        let cb = common_beam(beams, self.tolerance, self.nsamps, self.epsilon)?;
+        let cb = common_beam(beams, self.tolerance, self.nsamps, self.epsilon).or_else(|e| {
+            let tolerance = self.tolerance * 0.1;
+            warn!("{e}; retrying the common beam with tolerance={tolerance:.1e}");
+            common_beam(beams, tolerance, self.nsamps, self.epsilon)
+        })?;
         round_common_beam(cb, beams)
     }
 }
@@ -160,10 +166,12 @@ fn smooth_images_in_pool(files: &[PathBuf], opts: &SmoothOptions) -> Result<Smoo
         .map(|h| h.beam)
         .filter(|b| usable_beam(b, cutoff))
         .collect();
-    ensure!(!valid.is_empty(), "all beams are flagged or invalid");
+    // With a target given, images that cannot reach it are blanked, as
+    // racs_tools does, even when that is all of them.
     let target = match opts.target_beam {
         Some(b) => b,
         None => {
+            ensure!(!valid.is_empty(), "all beams are flagged or invalid");
             let sp = spinner(opts.progress, "Solving for the common beam…");
             let cb = opts.common_beam(&valid)?;
             sp.finish_and_clear();
@@ -734,6 +742,31 @@ fn spinner(show: bool, msg: impl Into<String>) -> ProgressBar {
 
 #[cfg(test)]
 mod tests {
+    /// A channel of flint's test cubes that the fit only solves at a tenth of
+    /// the default tolerance.
+    #[test]
+    fn test_common_beam_retries_with_a_smaller_tolerance() {
+        let beams: Vec<Beam> = [
+            (14.4205, 12.0973, 75.199),
+            (14.4108, 12.1006, 75.011),
+            (14.4212, 12.1285, 74.9),
+            (13.741, 12.035, 72.886),
+            (14.3404, 12.1605, 75.903),
+            (14.4298, 12.1451, 74.711),
+            (14.408, 12.0558, 75.231),
+            (14.4111, 11.9223, 75.674),
+            (14.1325, 12.0036, 73.702),
+            (14.0073, 11.9958, 74.489),
+        ]
+        .iter()
+        .map(|&(a, b, pa)| Beam::from_arcsec(a, b, pa).unwrap())
+        .collect();
+        let opts = SmoothOptions::default();
+        assert!(common_beam(&beams, opts.tolerance, opts.nsamps, opts.epsilon).is_err());
+        let cb = opts.common_beam(&beams).unwrap();
+        assert!(beams.iter().all(|b| cb.contains(b)));
+    }
+
     use super::*;
 
     #[test]

@@ -1,7 +1,7 @@
 //! FITS image reading and writing.
 //!
-//! Handles 2D images (NAXIS = 2) and 4D images (NAXIS = 4). Only the first
-//! plane of a 4D image is used, as in racs_tools.
+//! Handles images with 2 to 4 axes. Only the first plane of a 3D or 4D image
+//! is used, as in racs_tools.
 use std::path::{Path, PathBuf};
 
 use atfits_rs::{
@@ -25,7 +25,7 @@ pub enum FitsError {
     Fitsio(#[from] fitsio::errors::Error),
     #[error("missing keyword: {0}")]
     MissingKeyword(String),
-    #[error("unsupported NAXIS={0} (expected 2 or 4)")]
+    #[error("unsupported NAXIS={0} (expected 2 to 4)")]
     UnsupportedNaxis(i64),
     #[error("invalid header beam: {0}")]
     Beam(#[from] BeamError),
@@ -48,7 +48,7 @@ impl From<atfits_rs::AtfitsError> for FitsError {
     }
 }
 
-/// Header metadata of a 2D image, or of the first plane of a 4D one.
+/// Header metadata of a 2D image, or of the first plane of a 3D or 4D one.
 #[derive(Debug, Clone)]
 pub struct FitsImageHeader {
     pub path: PathBuf,
@@ -72,11 +72,11 @@ pub struct FitsImageData<T = f32> {
     pub image: Array2<T>,
 }
 
-/// Read the shape, pixel scale, beam and unit of a 2D or 4D image.
+/// Read the shape, pixel scale, beam and unit of a 2D, 3D or 4D image.
 pub fn read_fits_header(path: &Path) -> Result<FitsImageHeader, FitsError> {
     let mut fptr = FitsFile::open(path)?;
     let geom = HeaderGeom::from_file(&mut fptr)?;
-    if geom.naxis != 2 && geom.naxis != 4 {
+    if !(2..=4).contains(&geom.naxis) {
         return Err(FitsError::UnsupportedNaxis(geom.naxis as i64));
     }
     let nplanes = geom.dims[2..].iter().product();
@@ -114,7 +114,7 @@ pub(crate) fn read_pixel_scale(
     Ok(PixelScale::matrix(m).unwrap_or(PixelScale::cdelt(dx_deg, dy_deg)))
 }
 
-/// Read a 2D image, or the first plane of a 4D one, in precision `T`.
+/// Read a 2D image, or the first plane of a 3D or 4D one, in precision `T`.
 pub fn read_fits<T: CubeElem>(path: &Path) -> Result<FitsImageData<T>, FitsError> {
     let header = read_fits_header(path)?;
     let image = read_fits_plane(&header)?;

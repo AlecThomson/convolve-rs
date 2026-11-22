@@ -80,7 +80,7 @@ Per-channel beams are read from, in priority order:
 - `--nan-fraction F` blanks the NaN pixels and every pixel where more than `F`
   of the smoothed signal came from them, as patchwork does with 0.5. By
   default convolvers blanks as racs_tools does.
-- Only the first plane of a 4D image is smoothed; the output has
-  `NAXIS3 = NAXIS4 = 1`. `BITPIX = -64` images are smoothed and written in
+- Only the first plane of a 3D or 4D image is smoothed; the output keeps the
+  extra axes with length 1. `BITPIX = -64` images are smoothed and written in
   double precision; integer images are smoothed in single precision and
   written as `BITPIX = -32`.
