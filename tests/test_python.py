@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 import radio_beam as rb
 from astropy.io import fits
+from parity import assert_matches_away_from_missing, reach_px
 
 from convolve_rs import Beam, common_beam, smooth
 
@@ -415,18 +416,55 @@ class TestSmoothInputs:
             self.PIX,
             self.PIX,
         )
-        # convolve-rs blanks where the convolved NaN mask reaches 0.99 of the
-        # filter gain rather than 1, so f32 round-off cannot un-blank a masked
-        # region; that adds a thin rim of blanked pixels but never removes one.
-        assert np.isnan(ours)[np.isnan(theirs)].all()
-        assert (
-            np.isnan(ours).sum() - np.isnan(theirs).sum()
-            < 0.02 * np.isnan(theirs).sum()
+        # racs_tools wraps round the edges and does not normalise near NaNs,
+        # so the two agree only beyond the kernel's reach of either.
+        assert_matches_away_from_missing(
+            ours, theirs, np.isnan(img), reach_px(18, self.PIX * 3600)
         )
-        finite = ~np.isnan(ours)
-        np.testing.assert_allclose(
-            ours[finite], theirs[finite], rtol=0, atol=1e-4 * theirs[finite].std()
-        )
+
+
+class TestMissingData:
+    """The sky beyond the edges and under NaN pixels is missing data."""
+
+    PIX = 2.0 * ARCSEC
+    OLD, NEW = Beam.from_arcsec(10, 8, 30), Beam.from_arcsec(24, 20, 60)
+
+    def _flat(self):
+        image = np.ones((96, 80))
+        image[40:60, 30:50] = np.nan
+        return image
+
+    def test_flat_image_stays_flat(self):
+        out = smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, bunit="K")
+        kept = out[~np.isnan(out)]
+        assert kept.size > 0.8 * out.size
+        np.testing.assert_allclose(kept, 1.0, rtol=0, atol=1e-6)
+
+    def test_corners_and_nan_interiors_are_blank(self):
+        out = smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX)
+        assert np.isnan(out[[0, 0, -1, -1], [0, -1, 0, -1]]).all()
+        assert np.isnan(out[45:55, 35:45]).all()
+        assert np.isfinite(out[0, 40])
+        assert np.isfinite(out[48, 0])
+
+    def test_nan_fraction_is_a_tolerance(self):
+        blanked = [
+            np.isnan(
+                smooth(
+                    self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, nan_fraction=f
+                )
+            ).sum()
+            for f in (0.01, 0.5, 0.9)
+        ]
+        assert blanked[0] > blanked[1] > blanked[2] > 0
+        with pytest.raises(ValueError, match="between 0 and 1"):
+            smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX, nan_fraction=2)
+
+    def test_no_flux_wraps_round(self):
+        image = np.zeros((96, 80))
+        image[48, 0] = 1.0
+        out = smooth(image, self.OLD, self.NEW, self.PIX, self.PIX)
+        assert abs(out[48, -1]) < 1e-9
 
 
 class TestExactTaper:
@@ -458,30 +496,56 @@ class TestExactTaper:
             ]
         )
 
+    @staticmethod
+    def _fast_len(n):
+        """The smallest length >= n with no prime factor above 5."""
+        while True:
+            m = n
+            for p in (2, 3, 5):
+                while m % p == 0:
+                    m //= p
+            if m == 1:
+                return n
+            n += 1
+
     def _exact(self, image, old, new):
-        a, b, c = (
-            -2
-            * np.pi**2
-            * (
-                self._quadratic_form(new, self.PIX)
-                - self._quadratic_form(old, self.PIX)
-            )
+        """The image padded beyond the kernel's 6.1 sigma reach, with the sky
+        beyond it missing, through the exact taper on the padded grid. Kept
+        pixels are divided by the share of the kernel on data; those with
+        more than half on missing data are blanked."""
+        difference = self._quadratic_form(new, self.PIX) - self._quadratic_form(
+            old, self.PIX
         )
-        ratio = new[0] * new[1] / (old[0] * old[1])
+        a, b, c = -2 * np.pi**2 * difference
+        cov = [[difference[0], difference[1] / 2], [difference[1] / 2, difference[2]]]
+        reach = int(np.ceil(6.1 * np.sqrt(np.linalg.eigvalsh(cov).max()))) + 1
         ny, nx = image.shape
-        u = np.fft.fftfreq(ny)[:, None]
-        v = np.fft.fftfreq(nx)[None, :]
+        py, px = self._fast_len(ny + reach), self._fast_len(nx + reach)
+        ratio = new[0] * new[1] / (old[0] * old[1])
+        u = np.fft.fftfreq(py)[:, None]
+        v = np.fft.fftfreq(px)[None, :]
         cross = np.exp(b * u * v)
-        nyquist = np.zeros(image.shape, dtype=bool)
-        if ny % 2 == 0:
-            nyquist[ny // 2, :] = True
-        if nx % 2 == 0:
-            nyquist[:, nx // 2] = True
+        nyquist = np.zeros((py, px), dtype=bool)
+        if py % 2 == 0:
+            nyquist[py // 2, :] = True
+        if px % 2 == 0:
+            nyquist[:, px // 2] = True
         cross = np.where(nyquist, np.cosh(b * u * v), cross)
-        taper = ratio * np.exp(a * u**2 + c * v**2) * cross
-        exact = np.fft.ifft2(np.fft.fft2(image) * taper)
-        assert np.abs(exact.imag).max() < 1e-12 * np.abs(exact.real).max()
-        return exact.real
+        taper = np.exp(a * u**2 + c * v**2) * cross
+
+        def convolve(plane):
+            out = np.fft.ifft2(np.fft.fft2(plane) * taper)
+            assert np.abs(out.imag).max() < 1e-12 * max(np.abs(out.real).max(), 1)
+            return out.real[:ny, :nx]
+
+        padded = np.zeros((py, px))
+        padded[:ny, :nx] = image
+        missing = np.ones((py, px))
+        missing[:ny, :nx] = 0
+        data, m = ratio * convolve(padded), convolve(missing)
+        exact = data / (1 - m)
+        exact[m > 0.5] = np.nan
+        return exact
 
     @pytest.mark.parametrize("shape", [(64, 64), (64, 65), (65, 64), (65, 65)])
     @pytest.mark.parametrize(("old", "new"), CASES)
@@ -495,7 +559,11 @@ class TestExactTaper:
             self.PIX,
         )
         exact = self._exact(image, old, new)
-        np.testing.assert_allclose(ours, exact, rtol=0, atol=1e-12 * exact.std())
+        # convolve-rs leaves alone pixels with under 1e-8 of their kernel on
+        # missing data, where the reference still divides.
+        np.testing.assert_allclose(
+            ours, exact, rtol=0, atol=2e-8 * np.nanmax(np.abs(exact))
+        )
 
     @pytest.mark.parametrize(("old", "new"), CASES)
     def test_mirror_symmetric(self, old, new):
@@ -509,4 +577,6 @@ class TestExactTaper:
         mirrored = smooth(
             image[:, ::-1].copy(), mirror(old), mirror(new), self.PIX, self.PIX
         )[:, ::-1]
-        np.testing.assert_allclose(mirrored, direct, rtol=0, atol=1e-12 * direct.std())
+        np.testing.assert_allclose(
+            mirrored, direct, rtol=0, atol=1e-12 * np.nanstd(direct)
+        )

@@ -77,9 +77,11 @@ Per-channel beams are read from, in priority order:
   skewed grids and grids with east to the right are smoothed correctly.
   racs_tools reads CDELT alone, which suits the usual unrotated grid with east
   to the left; there both give the same output.
-- `--nan-fraction F` blanks the NaN pixels and every pixel where more than `F`
-  of the smoothed signal came from them, as patchwork does with 0.5. By
-  default convolvers blanks as racs_tools does.
+- NaN pixels and the sky beyond the image are missing data. Pixels near them
+  are divided by the share of their kernel that fell on data, and those with
+  more than `--nan-fraction` (default 0.5) of it on missing data are blanked,
+  the image's corners included. racs_tools 4.6 and earlier wraps round the
+  edges and blanks where its mask reaches 1.
 - Only the first plane of a 3D or 4D image is smoothed; the output keeps the
   extra axes with length 1. `BITPIX = -64` images are smoothed and written in
   double precision; integer images are smoothed in single precision and

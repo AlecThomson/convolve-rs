@@ -44,8 +44,8 @@ pub mod smooth;
 pub use beam::{Beam, BeamError, gauss_factor};
 pub use common_beam::{CommonBeamError, common_beam, find_commonbeam_between};
 pub use convolve_uv::{
-    ConvolutionResult, ConvolveError, FftFloat, FftPlans, NanBlanking, PixelScale, convolve_uv,
-    convolve_uv_with, fftfreq, gaussft,
+    ConvolutionResult, ConvolveError, DEFAULT_NAN_FRACTION, FftFloat, FftPlans, PixelScale,
+    convolve_uv, convolve_uv_with, fftfreq, gaussft, padded_size,
 };
 pub use fits_io::{
     FitsError, FitsImageData, FitsImageHeader, output_path, read_fits, read_fits_header,

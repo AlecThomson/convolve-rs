@@ -13,7 +13,7 @@ use pyo3::exceptions::PyFileNotFoundError;
 
 use crate::beam::{Beam, gauss_factor as rust_gauss_factor};
 use crate::common_beam::common_beam as rust_common_beam;
-use crate::convolve_uv::{FftFloat, NanBlanking, PixelScale};
+use crate::convolve_uv::{DEFAULT_NAN_FRACTION, FftFloat, PixelScale};
 use crate::cube_io::{CubeMode, RefChan};
 use crate::pipeline::{
     CubeOptions, SmoothOptions, SmoothedCube, SmoothedImage, cube_beams as rust_cube_beams,
@@ -246,14 +246,14 @@ fn resolve_unit(py: Python<'_>, bunit: Option<&str>) -> PyResult<BrightnessUnit>
     Ok(BrightnessUnit::JyPerBeam)
 }
 
-/// The blanking ``nan_fraction`` asks for.
-fn nan_blanking(nan_fraction: Option<f64>) -> PyResult<NanBlanking> {
-    match nan_fraction {
-        None => Ok(NanBlanking::RacsTools),
-        Some(f) if (0.0..=1.0).contains(&f) => Ok(NanBlanking::Fraction(f)),
-        Some(f) => Err(value_error(format!(
-            "nan_fraction must be between 0 and 1, not {f}"
-        ))),
+/// ``nan_fraction``, checked to lie between 0 and 1.
+fn check_nan_fraction(nan_fraction: f64) -> PyResult<f64> {
+    if (0.0..=1.0).contains(&nan_fraction) {
+        Ok(nan_fraction)
+    } else {
+        Err(value_error(format!(
+            "nan_fraction must be between 0 and 1, not {nan_fraction}"
+        )))
     }
 }
 
@@ -265,11 +265,11 @@ fn smooth_typed<'py, T: FftFloat + numpy::Element>(
     beams: (&Beam, &Beam),
     scale: PixelScale,
     unit: BrightnessUnit,
-    blanking: NanBlanking,
+    nan_fraction: f64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let view = arr.as_array();
     let out = py
-        .detach(|| rust_smooth(view, beams.0, beams.1, scale, unit, blanking, None))
+        .detach(|| rust_smooth(view, beams.0, beams.1, scale, unit, nan_fraction, None))
         .map_err(value_error)?;
     Ok(out.into_pyarray(py).into_any())
 }
@@ -311,9 +311,10 @@ fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAn
 ///         in degrees, in place of ``dx_deg`` and ``dy_deg``, as astropy's
 ///         ``WCS.pixel_scale_matrix`` gives it. For rotated or skewed grids,
 ///         and grids with east to the right.
-///     nan_fraction (float, optional): Blank the NaN pixels and every pixel
-///         where more than this fraction of the smoothed signal came from
-///         them. Default: blank as racs_tools does.
+///     nan_fraction (float): Blank pixels where more than this fraction of
+///         the kernel's weight fell on missing data: NaN pixels, or the sky
+///         beyond the image. Pixels kept near missing data are divided by the
+///         share that fell on data, so their flux scale is right.
 ///
 /// Returns:
 ///     numpy.ndarray: The smoothed image. An all-NaN image is returned as is.
@@ -346,7 +347,7 @@ fn native_byte_order<'py>(image: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAn
     cutoff_arcsec=None,
     bunit=None,
     pixel_scale_matrix=None,
-    nan_fraction=None,
+    nan_fraction=DEFAULT_NAN_FRACTION,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn smooth<'py>(
@@ -359,7 +360,7 @@ fn smooth<'py>(
     cutoff_arcsec: Option<f64>,
     bunit: Option<&str>,
     pixel_scale_matrix: Option<[[f64; 2]; 2]>,
-    nan_fraction: Option<f64>,
+    nan_fraction: f64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let scale = match (dx_deg, dy_deg, pixel_scale_matrix) {
         (Some(dx), Some(dy), None) => PixelScale::cdelt(dx, dy),
@@ -371,7 +372,7 @@ fn smooth<'py>(
             ));
         }
     };
-    let blanking = nan_blanking(nan_fraction)?;
+    let nan_fraction = check_nan_fraction(nan_fraction)?;
     let bmaj = old_beam.inner.major_arcsec();
     if let Some(cutoff) = cutoff_arcsec
         && bmaj > cutoff
@@ -384,10 +385,10 @@ fn smooth<'py>(
     let image = &native_byte_order(image)?;
     let beams = (&old_beam.inner, &new_beam.inner);
     if let Ok(arr) = image.extract::<PyReadonlyArray2<f32>>() {
-        return smooth_typed(py, arr, beams, scale, unit, blanking);
+        return smooth_typed(py, arr, beams, scale, unit, nan_fraction);
     }
     if let Ok(arr) = image.extract::<PyReadonlyArray2<f64>>() {
-        return smooth_typed(py, arr, beams, scale, unit, blanking);
+        return smooth_typed(py, arr, beams, scale, unit, nan_fraction);
     }
     Err(PyValueError::new_err(
         "image must be a 2-D float32 or float64 numpy array",
@@ -588,7 +589,7 @@ fn beam_list<'py>(
     tolerance=1e-4,
     nsamps=200,
     epsilon=5e-4,
-    nan_fraction=None,
+    nan_fraction=DEFAULT_NAN_FRACTION,
     dryrun=false,
     ncores=None,
 ))]
@@ -605,7 +606,7 @@ fn smooth_images(
     tolerance: f64,
     nsamps: usize,
     epsilon: f64,
-    nan_fraction: Option<f64>,
+    nan_fraction: f64,
     dryrun: bool,
     ncores: Option<usize>,
 ) -> PyResult<PySmoothedImages> {
@@ -620,7 +621,7 @@ fn smooth_images(
         tolerance,
         nsamps,
         epsilon,
-        nan_blanking: nan_blanking(nan_fraction)?,
+        nan_fraction: check_nan_fraction(nan_fraction)?,
         dryrun,
         ncores,
         progress: false,
@@ -678,7 +679,7 @@ fn smooth_images(
     tolerance=1e-4,
     nsamps=200,
     epsilon=5e-4,
-    nan_fraction=None,
+    nan_fraction=DEFAULT_NAN_FRACTION,
     dryrun=false,
     ncores=None,
 ))]
@@ -699,7 +700,7 @@ fn smooth_cubes(
     tolerance: f64,
     nsamps: usize,
     epsilon: f64,
-    nan_fraction: Option<f64>,
+    nan_fraction: f64,
     dryrun: bool,
     ncores: Option<usize>,
 ) -> PyResult<Vec<PySmoothedCube>> {
@@ -727,7 +728,7 @@ fn smooth_cubes(
             tolerance,
             nsamps,
             epsilon,
-            nan_blanking: nan_blanking(nan_fraction)?,
+            nan_fraction: check_nan_fraction(nan_fraction)?,
             dryrun,
             ncores,
             progress: false,

@@ -5,7 +5,6 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{Level, info};
 
 use convolve_rs::{
-    NanBlanking,
     beam::Beam,
     cube_io::{CubeMode, RefChan},
     pipeline::{CubeOptions, SmoothOptions, SmoothedImage, smooth_cubes, smooth_images},
@@ -73,10 +72,10 @@ struct SharedArgs {
     #[arg(short, long)]
     cutoff: Option<f64>,
 
-    /// Blank the NaN pixels and every pixel where more than this fraction of
-    /// the smoothed signal came from them [default: as racs_tools].
-    #[arg(long, value_parser = parse_fraction)]
-    nan_fraction: Option<f64>,
+    /// Blank pixels where more than this fraction of the kernel's weight fell
+    /// on missing data (NaN pixels, or the sky beyond the image).
+    #[arg(long, value_parser = parse_fraction, default_value_t = convolve_rs::DEFAULT_NAN_FRACTION)]
+    nan_fraction: f64,
 
     /// Compute common beam and report without writing output files.
     #[arg(short, long)]
@@ -125,9 +124,7 @@ impl SharedArgs {
             tolerance: self.tolerance,
             nsamps: self.nsamps,
             epsilon: self.epsilon,
-            nan_blanking: self
-                .nan_fraction
-                .map_or(NanBlanking::RacsTools, NanBlanking::Fraction),
+            nan_fraction: self.nan_fraction,
             dryrun: self.dryrun,
             ncores: self.ncores.map(usize::from),
             progress: true,

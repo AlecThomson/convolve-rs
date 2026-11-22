@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 from astropy.io import fits
+from parity import assert_matches_away_from_missing, reach_px
 
 import convolve_rs as cr
 
@@ -21,6 +22,8 @@ OLD = (8.0, 6.0, 25.0)
 NEW = (15.0, 11.0, 70.0)
 ARCSEC = 1 / 3600
 ROT = 0.4
+# Pixels are at least 2 arcsec, and the kernel's FWHM under NEW's major axis
+REACH = reach_px(NEW[0], 2.0)
 MATRICES = {
     "usual": [[-2 * ARCSEC, 0.0], [0.0, 2 * ARCSEC]],
     "rotated": [
@@ -49,12 +52,6 @@ def _sky(matrix) -> np.ndarray:
     return image
 
 
-def _interior(a: np.ndarray) -> np.ndarray:
-    """``a`` without the edges, where patchwork pads with zeros and convolve-rs
-    wraps around."""
-    return a[16:-16, 16:-16]
-
-
 @pytest.mark.parametrize("name", list(MATRICES))
 def test_matches_convolve_to_beam(name):
     matrix = MATRICES[name]
@@ -72,12 +69,9 @@ def test_matches_convolve_to_beam(name):
         pixel_scale_matrix=matrix,
         nan_fraction=0.5,
     )
-    ours, theirs = _interior(ours), _interior(theirs)
-    np.testing.assert_array_equal(np.isnan(ours), np.isnan(theirs))
-    good = ~np.isnan(theirs)
-    np.testing.assert_allclose(
-        ours[good], theirs[good], rtol=0, atol=1e-4 * np.std(theirs[good])
-    )
+    # patchwork pads with zeros and does not normalise near NaNs, so the two
+    # agree beyond the kernel's reach of the edges and NaNs.
+    assert_matches_away_from_missing(ours, theirs, np.isnan(image), REACH)
 
 
 def test_smooth_images_reads_the_cd_matrix(tmp_path: Path):
@@ -100,9 +94,6 @@ def test_smooth_images_reads_the_cd_matrix(tmp_path: Path):
         [path], target_beam=cr.Beam.from_arcsec(*NEW), nan_fraction=0.5
     )
     ours = fits.getdata(result.images[0].output)
-    ours, theirs = _interior(ours), _interior(theirs)
-    np.testing.assert_array_equal(np.isnan(ours), np.isnan(theirs))
-    good = ~np.isnan(theirs)
-    np.testing.assert_allclose(
-        ours[good], theirs[good], rtol=0, atol=1e-4 * np.std(theirs[good])
-    )
+    # patchwork pads with zeros and does not normalise near NaNs, so the two
+    # agree beyond the kernel's reach of the edges and NaNs.
+    assert_matches_away_from_missing(ours, theirs, np.isnan(fits.getdata(path)), REACH)
