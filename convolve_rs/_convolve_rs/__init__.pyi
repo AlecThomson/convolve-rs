@@ -250,7 +250,7 @@ def round_common_beam(beam: Beam, beams: typing.Sequence[Beam]) -> Beam:
         (10.1, 8.1, 30.01)
     """
 
-def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: typing.Optional[builtins.float] = None, dy_deg: typing.Optional[builtins.float] = None, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None, pixel_scale_matrix: typing.Optional[typing.Sequence[typing.Sequence[builtins.float]]] = None, nan_fraction: typing.Optional[builtins.float] = None) -> typing.Any:
+def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: typing.Optional[builtins.float] = None, dy_deg: typing.Optional[builtins.float] = None, cutoff_arcsec: typing.Optional[builtins.float] = None, bunit: typing.Optional[builtins.str] = None, pixel_scale_matrix: typing.Optional[typing.Sequence[typing.Sequence[builtins.float]]] = None, nan_fraction: builtins.float = 0.5) -> typing.Any:
     r"""
     Smooth an image from ``old_beam`` to ``new_beam``.
     
@@ -276,9 +276,10 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: typing.Opt
             in degrees, in place of ``dx_deg`` and ``dy_deg``, as astropy's
             ``WCS.pixel_scale_matrix`` gives it. For rotated or skewed grids,
             and grids with east to the right.
-        nan_fraction (float, optional): Blank the NaN pixels and every pixel
-            where more than this fraction of the smoothed signal came from
-            them. Default: blank as racs_tools does.
+        nan_fraction (float): Blank pixels where more than this fraction of
+            the kernel's weight fell on missing data: NaN pixels, or the sky
+            beyond the image. Pixels kept near missing data are divided by the
+            share that fell on data, so their flux scale is right.
     
     Returns:
         numpy.ndarray: The smoothed image. An all-NaN image is returned as is.
@@ -302,7 +303,7 @@ def smooth(image: typing.Any, old_beam: Beam, new_beam: Beam, dx_deg: typing.Opt
         1.0
     """
 
-def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], mode: builtins.str = 'natural', target_beam: typing.Optional[Beam] = None, target_beams: typing.Optional[typing.Sequence[typing.Optional[Beam]]] = None, ref_chan: typing.Optional[builtins.str] = None, uselogs: builtins.bool = False, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, nan_fraction: typing.Optional[builtins.float] = None, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> builtins.list[SmoothedCube]:
+def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], mode: builtins.str = 'natural', target_beam: typing.Optional[Beam] = None, target_beams: typing.Optional[typing.Sequence[typing.Optional[Beam]]] = None, ref_chan: typing.Optional[builtins.str] = None, uselogs: builtins.bool = False, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, nan_fraction: builtins.float = 0.5, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> builtins.list[SmoothedCube]:
     r"""
     Smooth FITS cubes channel by channel, as ``convolvers 3d`` does.
     
@@ -333,7 +334,7 @@ def smooth_cubes(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Pat
             a read or write error.
     """
 
-def smooth_images(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], target_beam: typing.Optional[Beam] = None, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, nan_fraction: typing.Optional[builtins.float] = None, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> SmoothedImages:
+def smooth_images(paths: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], target_beam: typing.Optional[Beam] = None, cutoff: typing.Optional[builtins.float] = None, circularise: builtins.bool = False, suffix: builtins.str = 'sm', prefix: typing.Optional[builtins.str] = None, outdir: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, tolerance: builtins.float = 0.0001, nsamps: builtins.int = 200, epsilon: builtins.float = 0.0005, nan_fraction: builtins.float = 0.5, dryrun: builtins.bool = False, ncores: typing.Optional[builtins.int] = None) -> SmoothedImages:
     r"""
     Smooth 2D FITS images to one common beam, as ``convolvers 2d`` does.
     

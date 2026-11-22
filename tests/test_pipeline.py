@@ -8,6 +8,7 @@ import astropy.units as u
 import numpy as np
 import pytest
 from astropy.io import fits
+from parity import assert_matches_away_from_missing, clear_of_missing, reach_px
 
 import convolve_rs as cr
 
@@ -41,7 +42,10 @@ def _sky(beam, seed=0) -> np.ndarray:
     white = np.random.default_rng(seed).normal(size=(64, 64))
     point = cr.Beam.from_arcsec(1e-3, 1e-3, 0.0)
     target = cr.Beam.from_arcsec(*beam)
-    return cr.smooth(white, point, target, PIX, PIX, bunit="K").astype(np.float32)
+    # Synthetic sky, complete to its edges
+    return cr.smooth(
+        white, point, target, PIX, PIX, bunit="K", nan_fraction=1.0
+    ).astype(np.float32)
 
 
 def _image(path: Path, beam, seed=0) -> Path:
@@ -122,20 +126,6 @@ def _cube(path: Path, beams) -> Path:
     return path
 
 
-def _assert_close(ours: np.ndarray, theirs: np.ndarray) -> None:
-    """The tolerances of test_python's racs_tools parity test: convolve-rs
-    blanks a thin extra rim at NaN edges, and otherwise matches."""
-    assert np.isnan(ours)[np.isnan(theirs)].all()
-    assert (
-        np.isnan(ours).sum() - np.isnan(theirs).sum()
-        <= max(0.02 * np.isnan(theirs).sum(), 0) + 4 * 64
-    )
-    finite = ~np.isnan(ours)
-    np.testing.assert_allclose(
-        ours[finite], theirs[finite], rtol=0, atol=1e-4 * np.nanstd(theirs)
-    )
-
-
 def _same_beam(ours: _Beam | None, theirs, *, fitted: bool = False) -> None:
     """Equal beams; a ``fitted`` common beam to within the minimum-volume
     ellipse fit, which lands up to one 0.1 arcsec rounding step from
@@ -172,7 +162,14 @@ class TestSmoothImages:
         for ref, img in zip(ref_in, result.images, strict=True):
             assert img.output == img.input.with_suffix(".sm.fits")
             theirs = fits.getdata(ref.with_suffix(".sm.fits"))
-            _assert_close(fits.getdata(img.output), theirs)
+            assert_matches_away_from_missing(
+                fits.getdata(img.output),
+                theirs,
+                np.isnan(fits.getdata(ref)),
+                reach_px(result.target.major_arcsec, PIX * 3600),
+                # (12, 7, 75) to (12.3, 9.1, 65.8) is a kernel under a pixel wide
+                tolerance=5e-3,
+            )
             assert fits.getheader(img.output)["BMAJ"] == pytest.approx(
                 result.target.major_deg
             )
@@ -242,7 +239,15 @@ class TestSmoothCubes:
         assert cube.output == rs_in.with_suffix(".sm.fits")
         for ours, theirs in zip(cube.targets, ref_targets, strict=True):
             _same_beam(ours, theirs)
-        _assert_close(fits.getdata(cube.output), fits.getdata(outs[0]))
+        assert_matches_away_from_missing(
+            fits.getdata(cube.output),
+            fits.getdata(outs[0]),
+            np.isnan(fits.getdata(ref_in)),
+            reach_px(max(b.major.to_value(u.arcsec) for b in ref_targets), PIX * 3600),
+            # Common beams rounded up from their channels' beams: kernels of
+            # a fraction of a pixel
+            tolerance=5e-3,
+        )
         if mode == "total":
             # racs_tools keeps the input's CASAMBM = T but writes no BEAMS table
             ours_h, theirs_h = fits.getheader(cube.output), fits.getheader(outs[0])
@@ -271,7 +276,10 @@ class TestSmoothCubes:
         )
         data = fits.getdata(cube.output)[0]
         assert np.isnan(data[1]).all()
-        assert np.isfinite(data[0]).all()
+        clear = clear_of_missing(
+            np.zeros(data[0].shape, dtype=bool), reach_px(30, PIX * 3600)
+        )
+        assert np.isfinite(data[0][clear]).all()
         beams = cr.cube_beams(cube.output)
         assert beams[1] is None
         assert all(b is not None for i, b in enumerate(beams) if i != 1)

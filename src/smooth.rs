@@ -3,7 +3,7 @@ use ndarray::{Array2, CowArray, Ix2};
 
 use crate::beam::Beam;
 use crate::convolve_uv::{
-    ConvolveError, FftFloat, FftPlans, NanBlanking, PixelScale, convolve_with_gain,
+    ConvolveError, DEFAULT_NAN_FRACTION, FftFloat, FftPlans, PixelScale, convolve_with_gain,
 };
 
 /// Brightness unit of an image, which decides the flux scaling.
@@ -96,12 +96,13 @@ pub fn smooth<'a, T: FftFloat>(
         new_beam,
         PixelScale::cdelt(dx_deg, dy_deg),
         unit,
-        NanBlanking::RacsTools,
+        DEFAULT_NAN_FRACTION,
         plans,
     )
 }
 
-/// [`smooth`] on any pixel grid, with a choice of NaN blanking.
+/// [`smooth`] on any pixel grid, blanking pixels where more than
+/// `nan_fraction` of the kernel's weight fell on missing data.
 ///
 /// # Errors
 ///
@@ -112,7 +113,7 @@ pub fn smooth_with<'a, T: FftFloat>(
     new_beam: &Beam,
     scale: PixelScale,
     unit: BrightnessUnit,
-    blanking: NanBlanking,
+    nan_fraction: f64,
     plans: Option<&FftPlans<T>>,
 ) -> Result<Array2<T>, ConvolveError> {
     // The filter's DC gain is g_ratio = √(Ω_new/Ω_old); Jy/beam needs its
@@ -122,7 +123,7 @@ pub fn smooth_with<'a, T: FftFloat>(
         old_beam,
         new_beam,
         scale,
-        blanking,
+        nan_fraction,
         plans,
         |ratio| match unit {
             BrightnessUnit::JyPerBeam => ratio * ratio,

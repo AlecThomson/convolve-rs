@@ -73,8 +73,9 @@ the "robust" mode of RACS-tools:
    evaluated exactly at each UV point (no kernel image is ever constructed).
 3. Inverse FFT.
 
-The result is exactly the image's band-limited interpolant convolved with the
-kernel and resampled. On an even-sized axis that needs one more step: the
+The image is padded first (see below), and the result is exactly the padded
+image's band-limited interpolant convolved with the kernel and resampled. On
+an even-sized axis that needs one more step: the
 Nyquist bin holds +1/2 and -1/2 cycles per pixel at once, and a rotated kernel
 tapers the two differently. Writing the taper as
 `r exp(a u² + b u v + c v²)`, the exact value there is their average, which
@@ -93,13 +94,36 @@ pixel. That covers rotated and skewed grids, and grids with east to the right.
 The file functions and the CLI always read the full matrix; for the usual grid
 it takes the CDELT path, so its output is unchanged.
 
-NaN pixels are handled by zero-filling the data, convolving a NaN mask through
-the same filter, and re-blanking every output pixel where the smeared mask
-reaches 0.99. RACS-tools uses 1; the lower value keeps NaN pixels blank when
-the beams are nearly equal and round-off leaves the mask just under 1. With
-`nan_fraction` (`--nan-fraction`) set instead, the NaN pixels are blanked,
-along with every pixel where more than that fraction of the convolved signal
-came from them; patchwork uses 0.5.
+## Edges and missing data
+
+The sky beyond an image's edges is unknown, as is the sky under its NaN
+pixels, and both are treated the same way: as missing data.
+
+- **Edges.** The image is padded by the kernel's reach (6.1 standard
+  deviations), so the convolution is linear. A transform of the image alone
+  would be circular, carrying flux off one edge onto the opposite one, as
+  RACS-tools 4.6 and convolve-rs before 3.0 did.
+- **Normalisation.** Missing pixels are filled with zeros, and a mask of them
+  is convolved through the same filter. Each output pixel is divided by the
+  share of its kernel's weight that fell on data. Without that, a pixel near
+  missing data is too faint by the share that fell on it: zero filling alone
+  is biased.
+- **Blanking.** A pixel with more than `nan_fraction` (default 0.5) of its
+  kernel's weight on missing data is mostly extrapolated, and is blanked. The
+  corners of an image, with about three quarters of their kernel beyond it,
+  are blanked; so is anything deep enough in a NaN region.
+
+So a flat image stays flat up to its edges and its NaN regions.
+`nan_fraction` is a tolerance: lower it to keep only pixels whose kernel
+lies almost all on data, at the cost of a wider blanked margin.
+
+A kernel narrower than about a pixel is cut off at the Nyquist frequency, so
+it rings, and the missing-data share it gives can dip a little below zero
+near an edge. Those pixels are divided all the same, which keeps a flat image
+flat.
+
+Only the part of the mask near missing data is convolved, which gives the
+same shares at a fraction of the cost.
 
 Because the image is real-valued, a real-input FFT is used along the
 contiguous axis, which halves the spectrum's memory.

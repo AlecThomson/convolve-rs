@@ -367,7 +367,12 @@ fn test_smooth_beam_area_ratio() {
     .unwrap();
 
     let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
-    let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
+    // The corners, mostly beyond the image, are blank.
+    let sum_out: f64 = smoothed
+        .iter()
+        .filter(|x| !x.is_nan())
+        .map(|&x| x as f64)
+        .sum();
 
     // Expected: Ω_new / Ω_old = (40*40) / (20*10) = 8
     let area_old = old.area_sr();
@@ -965,7 +970,12 @@ fn test_cube_channel_beam_area_ratio() {
         .unwrap();
 
         let sum_in: f64 = image.iter().map(|&x| x as f64).sum();
-        let sum_out: f64 = smoothed.iter().map(|&x| x as f64).sum();
+        // The corners, mostly beyond the image, are blank.
+        let sum_out: f64 = smoothed
+            .iter()
+            .filter(|x| !x.is_nan())
+            .map(|&x| x as f64)
+            .sum();
         let ratio = sum_out / sum_in;
 
         assert!(

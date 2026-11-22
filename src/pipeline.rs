@@ -14,7 +14,7 @@ use tracing::{Level, debug, info, warn};
 
 use crate::beam::Beam;
 use crate::common_beam::{common_beam, fits_in_beam};
-use crate::convolve_uv::{FftPlans, NanBlanking};
+use crate::convolve_uv::{DEFAULT_NAN_FRACTION, FftPlans, padded_size};
 use crate::cube_io::{
     self, CubeElem, CubeMeta, CubeMode, CubeReader, CubeWriter, PixelType, RefChan,
 };
@@ -43,7 +43,7 @@ pub struct SmoothOptions {
     /// Edge inflation in the common-beam fit.
     pub epsilon: f64,
     /// Which pixels near the input's NaNs are blanked.
-    pub nan_blanking: NanBlanking,
+    pub nan_fraction: f64,
     /// Find the target beams but write nothing.
     pub dryrun: bool,
     /// Threads to use. Default: rayon's global pool.
@@ -64,7 +64,7 @@ impl Default for SmoothOptions {
             tolerance: 1e-4,
             nsamps: 200,
             epsilon: 5e-4,
-            nan_blanking: NanBlanking::RacsTools,
+            nan_fraction: DEFAULT_NAN_FRACTION,
             dryrun: false,
             ncores: None,
             progress: false,
@@ -215,14 +215,14 @@ fn smooth_images_in_pool(files: &[PathBuf], opts: &SmoothOptions) -> Result<Smoo
                 &output,
                 &target,
                 kernel.is_none(),
-                opts.nan_blanking,
+                opts.nan_fraction,
             ),
             PixelType::F64 => smooth_image_as::<f64>(
                 header,
                 &output,
                 &target,
                 kernel.is_none(),
-                opts.nan_blanking,
+                opts.nan_fraction,
             ),
         }?;
         pb.suspend(|| info!("{} → {}", header.path.display(), output.display()));
@@ -270,7 +270,7 @@ fn smooth_image_as<T: CubeElem>(
     out: &Path,
     target: &Beam,
     blank: bool,
-    nan_blanking: NanBlanking,
+    nan_fraction: f64,
 ) -> Result<()> {
     let file = &header.path;
     if blank {
@@ -286,7 +286,7 @@ fn smooth_image_as<T: CubeElem>(
         target,
         header.pixel_scale,
         header.unit,
-        nan_blanking,
+        nan_fraction,
         None,
     )
     .with_context(|| format!("smoothing {}", file.display()))?;
@@ -354,7 +354,7 @@ fn smooth_cubes_in_pool(files: &[PathBuf], opts: &CubeOptions) -> Result<Vec<Smo
             mode: opts.mode,
             ref_chan: opts.ref_chan,
             cutoff: shared.cutoff,
-            nan_blanking: shared.nan_blanking,
+            nan_fraction: shared.nan_fraction,
             pb: &pb,
         };
         match meta.dtype {
@@ -537,7 +537,7 @@ struct CubeJob<'a> {
     mode: CubeMode,
     ref_chan: RefChan,
     cutoff: Option<f64>,
-    nan_blanking: NanBlanking,
+    nan_fraction: f64,
     pb: &'a ProgressBar,
 }
 
@@ -563,7 +563,13 @@ impl CubeJob<'_> {
         let written: Vec<Option<Beam>> = (0..meta.nfreq)
             .map(|c| self.targets[c].filter(|_| self.convolves(c)))
             .collect();
-        let plans = FftPlans::<T>::new(meta.ny, meta.nx);
+        // One set of plans, large enough for the widest kernel of any channel.
+        let (prows, pcols) = (0..meta.nfreq)
+            .filter(|&c| self.convolves(c))
+            .filter_map(|c| Some((meta.beams[c]?, self.targets[c]?)))
+            .map(|(old, new)| padded_size((meta.ny, meta.nx), &old, &new, meta.pixel_scale))
+            .fold((1, 1), |(r, c), (pr, pc)| (r.max(pr), c.max(pc)));
+        let plans = FftPlans::<T>::new(prows, pcols);
         let cap = (rayon::current_num_threads() * 2).max(4);
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
 
@@ -644,7 +650,7 @@ impl CubeJob<'_> {
             &target,
             meta.pixel_scale,
             meta.unit,
-            self.nan_blanking,
+            self.nan_fraction,
             Some(plans),
         )
         .with_context(|| format!("smoothing channel {c}"))

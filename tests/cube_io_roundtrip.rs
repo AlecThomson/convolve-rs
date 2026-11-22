@@ -6,11 +6,28 @@ use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 use ndarray::Array2;
 
-const NX: usize = 8;
-const NY: usize = 8;
+const NX: usize = 64;
+const NY: usize = 64;
 const NFREQ: usize = 3;
 
 /// Build a 3D image cube with a CASA `BEAMS` binary-table extension.
+/// No infinities, and NaNs only in the corners, which take most of their
+/// kernel's weight from beyond the image and so are blanked.
+fn assert_finite_but_corners<T: num_traits::Float>(plane: &[T], what: &str) {
+    assert!(
+        plane.iter().all(|v| !v.is_infinite()),
+        "{what} has infinities"
+    );
+    for (k, v) in plane.iter().enumerate() {
+        let (i, j) = (k / NX, k % NX);
+        let from_corner = i.min(NY - 1 - i) + j.min(NX - 1 - j);
+        assert!(
+            v.is_finite() || from_corner < NX / 4,
+            "{what}: NaN at ({i}, {j})"
+        );
+    }
+}
+
 fn make_cube(path: &std::path::Path) {
     let mut f = FitsFile::create(path)
         .with_custom_primary(&fitsio::images::ImageDescription {
@@ -342,10 +359,7 @@ fn cli_total_mode_smooths_cube() {
     // (a point source convolved to a Gaussian), not zeros or NaNs.
     for c in 0..NFREQ {
         let plane = read_channel::<f32>(&out, c, &meta);
-        assert!(
-            plane.iter().all(|v| v.is_finite()),
-            "channel {c} has non-finite pixels"
-        );
+        assert_finite_but_corners(plane.as_slice().unwrap(), &format!("channel {c}"));
         let peak = plane.iter().cloned().fold(f32::MIN, f32::max);
         assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
     }
@@ -486,10 +500,7 @@ fn cli_total_mode_smooths_f64_cube() {
 
     for c in 0..NFREQ {
         let plane = read_channel::<f64>(&out, c, &meta);
-        assert!(
-            plane.iter().all(|v| v.is_finite()),
-            "channel {c} has non-finite pixels"
-        );
+        assert_finite_but_corners(plane.as_slice().unwrap(), &format!("channel {c}"));
         let peak = plane.iter().cloned().fold(f64::MIN, f64::max);
         assert!(peak > 0.0, "channel {c} is empty (peak {peak})");
     }
@@ -605,10 +616,7 @@ fn cli_masked_channel_is_blanked_not_infinite() {
     // Valid channels: finite, non-empty, and crucially not infinite.
     for c in [0, 2] {
         let plane = read_channel::<f32>(&out, c, &meta);
-        assert!(
-            plane.iter().all(|v| v.is_finite()),
-            "channel {c} has non-finite pixels"
-        );
+        assert_finite_but_corners(plane.as_slice().unwrap(), &format!("channel {c}"));
         assert!(
             plane.iter().cloned().fold(f32::MIN, f32::max) > 0.0,
             "channel {c} is empty"
@@ -883,10 +891,9 @@ fn cli_target_ignores_cutoff_channels() {
             .iter()
             .all(|v| v.is_nan())
     );
-    assert!(
-        read_channel::<f32>(&out, 0, &meta)
-            .iter()
-            .all(|v| v.is_finite())
+    assert_finite_but_corners(
+        read_channel::<f32>(&out, 0, &meta).as_slice().unwrap(),
+        "channel 0",
     );
 }
 

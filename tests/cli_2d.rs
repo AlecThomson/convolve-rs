@@ -196,7 +196,9 @@ fn four_d_image_uses_first_plane() {
     let out = dir.join("a.sm.fits");
     let header = read_fits_header(&out).unwrap();
     assert_eq!((header.nx, header.ny, header.nplanes), (N, N, 1));
-    assert_eq!(read_fits::<f32>(&out).unwrap().image, want);
+    let got = read_fits::<f32>(&out).unwrap().image;
+    // Bit patterns, so the blanked corners compare equal.
+    assert_eq!(got.mapv(f32::to_bits), want.mapv(f32::to_bits));
 }
 
 fn dryrun(args: &[&str]) -> String {

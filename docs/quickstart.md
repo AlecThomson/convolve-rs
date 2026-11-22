@@ -112,7 +112,10 @@ plt.show()
 
 ## NaN handling
 
-NaN pixels stay blank, and the rest of the image is smoothed as usual:
+NaN pixels, like the sky beyond the image's edges, are missing data. Pixels
+near them are divided by the share of their kernel that fell on data, so
+their flux scale is right, and a pixel with more than half its kernel on
+missing data is blanked:
 
 ```{code-cell} ipython3
 image_nan = image.copy()
@@ -122,14 +125,14 @@ smoothed_nan = smooth(image_nan, old_beam, new_beam, dx_deg, dx_deg, bunit="Jy/b
 print(f"NaN pixels in: {np.isnan(image_nan).sum()}, out: {np.isnan(smoothed_nan).sum()}")
 ```
 
-`nan_fraction` blanks the NaN pixels and every pixel where more than that
-fraction of the smoothed signal came from them, as patchwork does with 0.5:
+`nan_fraction` sets that tolerance. A lower one keeps only pixels whose kernel
+lies almost all on data:
 
 ```{code-cell} ipython3
-patchwork_like = smooth(
-    image_nan, old_beam, new_beam, dx_deg, dx_deg, bunit="Jy/beam", nan_fraction=0.5
+strict = smooth(
+    image_nan, old_beam, new_beam, dx_deg, dx_deg, bunit="Jy/beam", nan_fraction=0.01
 )
-print(f"NaN pixels out: {np.isnan(patchwork_like).sum()}")
+print(f"NaN pixels out: {np.isnan(strict).sum()}")
 ```
 
 For a rotated or skewed grid, pass the pixel-to-sky matrix in degrees, as
