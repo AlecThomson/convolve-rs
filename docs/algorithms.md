@@ -101,16 +101,8 @@ the beams are nearly equal and round-off leaves the mask just under 1. With
 along with every pixel where more than that fraction of the convolved signal
 came from them; patchwork uses 0.5.
 
-The smeared mask only matters within the kernel's reach of a NaN edge: far
-from NaNs nothing is blanked, and deep inside them everything is. So unless
-the kernel is large next to the image, the mask is convolved in tiles instead
-of whole. A tile with no NaN within 6.1 standard deviations of the kernel is
-skipped, one that is all NaN is blanked, and only tiles in between are
-convolved, each with that margin around it. The margins wrap round the image
-edges, as the whole-image transform does. The kernel beyond them holds under
-1e-8 of its sum, so the tiles blank the same pixels as the whole-image mask.
-On images whose NaNs are a few regions, such as the corners a mosaic leaves,
-that makes an image with NaNs cost little more than one without.
+Only the part of the mask near NaN edges is convolved, which blanks the same
+pixels at a fraction of the cost.
 
 Because the image is real-valued, a real-input FFT is used along the
 contiguous axis, which halves the spectrum's memory.
