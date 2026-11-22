@@ -284,7 +284,13 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
     let grid = UvGrid::new(dim, row_step, col_step, &taper);
     // Done before the image is unpacked, so the mask's buffer is freed first.
     let blank = if nan_count > 0 {
-        Some(nan_spread(image.view(), &taper, &grid, plans, blanking)?)
+        Some(nan_spread(
+            image.view(),
+            &taper,
+            (&grid, (row_step, col_step)),
+            plans,
+            blanking,
+        )?)
     } else {
         None
     };
@@ -306,7 +312,41 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
 /// reaches 1; with nearly equal beams (g_ratio ≈ 1) a solid NaN region sits
 /// at 1 minus round-off and the NaN pixels on its edge just under 1, and both
 /// must stay blank, hence 0.99.
+///
+/// The mask only matters within the kernel's reach of a NaN edge, so it is
+/// convolved tile by tile ([`nan_spread_tiled`]) where the kernel is small
+/// next to the image, and whole otherwise.
 fn nan_spread<T: FftFloat>(
+    image: ArrayView2<'_, T>,
+    taper: &UvTaper,
+    (grid, steps): (&UvGrid, (f64, f64)),
+    plans: &FftPlans<T>,
+    blanking: NanBlanking,
+) -> Result<Bitset, ConvolveError> {
+    match Tiling::new(image.dim(), taper, steps) {
+        Some(tiling) => nan_spread_tiled(image, taper, steps, &tiling, blanking),
+        None => nan_spread_whole(image, taper, grid, plans, blanking),
+    }
+}
+
+/// Whether a pixel whose convolved mask is `m` is blanked. `m` is the
+/// filter's unit-gain response for [`NanBlanking::Fraction`] and includes
+/// `g_ratio` for [`NanBlanking::RacsTools`] (see [`mask_gain`]).
+fn blanks<T: FftFloat>(blanking: NanBlanking, was_nan: bool, m: T) -> bool {
+    match blanking {
+        NanBlanking::RacsTools => m >= T::one() - cast_saturating::<T>(1e-2),
+        NanBlanking::Fraction(f) => was_nan || m > cast_saturating::<T>(f),
+    }
+}
+
+fn mask_gain(blanking: NanBlanking, taper: &UvTaper) -> f64 {
+    match blanking {
+        NanBlanking::RacsTools => taper.ratio,
+        NanBlanking::Fraction(_) => 1.0,
+    }
+}
+
+fn nan_spread_whole<T: FftFloat>(
     image: ArrayView2<'_, T>,
     taper: &UvTaper,
     grid: &UvGrid,
@@ -319,20 +359,149 @@ fn nan_spread<T: FftFloat>(
             .iter()
             .map(|x| if x.is_nan() { T::one() } else { T::zero() }),
     );
+    let nans = Bitset::from_predicate(&mask, |m| m > T::zero());
     let npix = (plans.nrows * plans.ncols) as f64;
+    convolve_in_place(
+        &mut mask,
+        taper,
+        mask_gain(blanking, taper) / npix,
+        grid,
+        plans,
+    )?;
+    let spread = Bitset::from_predicate(&mask, |m| blanks(blanking, false, m));
     Ok(match blanking {
-        NanBlanking::RacsTools => {
-            convolve_in_place(&mut mask, taper, taper.ratio / npix, grid, plans)?;
-            let threshold = T::one() - cast_saturating::<T>(1e-2);
-            Bitset::from_predicate(&mask, |m| m >= threshold)
-        }
-        NanBlanking::Fraction(fraction) => {
-            let nans = Bitset::from_predicate(&mask, |m| m > T::zero());
-            convolve_in_place(&mut mask, taper, 1.0 / npix, grid, plans)?;
-            let fraction = cast_saturating::<T>(fraction);
-            Bitset::from_predicate(&mask, |m| m > fraction).union(&nans)
-        }
+        NanBlanking::RacsTools => spread,
+        NanBlanking::Fraction(_) => spread.union(&nans),
     })
+}
+
+/// Square tiles of `inner` pixels, each convolved with a halo of `halo` pixels
+/// on every side in a `size`-pixel transform.
+struct Tiling {
+    inner: usize,
+    halo: usize,
+    size: usize,
+}
+
+impl Tiling {
+    /// Tiles for the kernel `taper` gives, or `None` if they would not be
+    /// much smaller than the image. The halo is 6.1 standard deviations of the
+    /// kernel along its major axis, beyond which it holds under 1e-8 of its
+    /// sum, below float32 round-off of the whole-image mask.
+    fn new(
+        (nrows, ncols): (usize, usize),
+        taper: &UvTaper,
+        (row_step, col_step): (f64, f64),
+    ) -> Option<Self> {
+        // exp(-2π² fᵀ S f) is the transform of a Gaussian of covariance S.
+        let k = -1.0 / (2.0 * std::f64::consts::PI.powi(2));
+        let (srr, scc) = (
+            k * taper.a / row_step.powi(2),
+            k * taper.c / col_step.powi(2),
+        );
+        let src = k * taper.b / 2.0 / (row_step * col_step);
+        let largest = (srr + scc) / 2.0 + (((srr - scc) / 2.0).powi(2) + src * src).sqrt();
+        let halo = (6.1 * largest.max(0.0).sqrt()).ceil() as usize + 1;
+        let size = fast_len((6 * halo).max(128));
+        (8 * size <= nrows.min(ncols) * 2).then_some(Self {
+            inner: size - 2 * halo,
+            halo,
+            size,
+        })
+    }
+}
+
+/// The smallest `n' >= n` whose only prime factors are 2, 3 and 5.
+fn fast_len(n: usize) -> usize {
+    (n..)
+        .find(|&m| {
+            let mut m = m;
+            for p in [2, 3, 5] {
+                while m % p == 0 {
+                    m /= p;
+                }
+            }
+            m == 1
+        })
+        .unwrap_or(n)
+}
+
+/// [`nan_spread_whole`], tile by tile. A tile with no NaN within the halo is
+/// left alone, one with nothing else is blanked, and only those in between
+/// are convolved. The halo wraps round the image edges, as the whole-image
+/// transform does, so the two agree to round-off.
+fn nan_spread_tiled<T: FftFloat>(
+    image: ArrayView2<'_, T>,
+    taper: &UvTaper,
+    (row_step, col_step): (f64, f64),
+    tiling: &Tiling,
+    blanking: NanBlanking,
+) -> Result<Bitset, ConvolveError> {
+    let (nrows, ncols) = image.dim();
+    let Tiling { inner, halo, size } = *tiling;
+    let plans = FftPlans::<T>::new(size, size);
+    let grid = UvGrid::new((size, size), row_step, col_step, taper);
+    let gain = mask_gain(blanking, taper) / (size * size) as f64;
+    // Rows and columns of the image a tile's transform covers, from its corner.
+    let wrap = |start: usize, n: usize| (0..size).map(move |k| (start + n - halo + k) % n);
+
+    let tiles: Vec<(usize, usize)> = (0..nrows.div_ceil(inner))
+        .flat_map(|ti| (0..ncols.div_ceil(inner)).map(move |tj| (ti * inner, tj * inner)))
+        .collect();
+    let spans = tiles
+        .par_iter()
+        .map(|&(r0, c0)| -> Result<Vec<(usize, usize)>, ConvolveError> {
+            let rows: Vec<usize> = wrap(r0, nrows).collect();
+            let cols: Vec<usize> = wrap(c0, ncols).collect();
+            let (r1, c1) = ((r0 + inner).min(nrows), (c0 + inner).min(ncols));
+            let mut nan_count = 0;
+            for &r in &rows {
+                nan_count += cols.iter().filter(|&&c| image[(r, c)].is_nan()).count();
+            }
+            let row_span = |r: usize| (r * ncols + c0, r * ncols + c1);
+            if nan_count == 0 {
+                return Ok(Vec::new());
+            }
+            if nan_count == size * size {
+                return Ok((r0..r1).map(row_span).collect());
+            }
+            let mut mask = Vec::with_capacity(size * 2 * plans.nhalf);
+            for &r in &rows {
+                mask.extend(cols.iter().map(|&c| {
+                    if image[(r, c)].is_nan() {
+                        T::one()
+                    } else {
+                        T::zero()
+                    }
+                }));
+            }
+            convolve_in_place(&mut mask, taper, gain, &grid, &plans)?;
+            let mut out = Vec::new();
+            for r in r0..r1 {
+                let row = &mask[(r - r0 + halo) * size..];
+                let mut start = None;
+                for c in c0..=c1 {
+                    let hit =
+                        c < c1 && blanks(blanking, image[(r, c)].is_nan(), row[c - c0 + halo]);
+                    match (hit, start) {
+                        (true, None) => start = Some(c),
+                        (false, Some(s)) => {
+                            out.push((r * ncols + s, r * ncols + c));
+                            start = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut bits = Bitset::zeros(nrows * ncols);
+    for (start, end) in spans.into_iter().flatten() {
+        bits.set_range(start, end);
+    }
+    Ok(bits)
 }
 
 fn spectrum_len<T: FftNum>(plans: &FftPlans<T>) -> usize {
@@ -550,6 +719,19 @@ impl Bitset {
             })
             .collect();
         Self { words }
+    }
+
+    fn zeros(len: usize) -> Self {
+        Self {
+            words: vec![0; len.div_ceil(64)],
+        }
+    }
+
+    /// Set bits `start..end`.
+    fn set_range(&mut self, start: usize, end: usize) {
+        for k in start..end {
+            self.words[k / 64] |= 1 << (k % 64);
+        }
     }
 
     fn union(mut self, other: &Self) -> Self {
@@ -1089,6 +1271,76 @@ mod tests {
                 assert_eq!(a.to_bits(), b.to_bits(), "dx={dx} dy={dy}");
             }
         }
+    }
+
+    /// The tiled NaN mask is the whole-image one, NaN regions on the edges
+    /// (where the halo wraps) and lone NaN pixels included, for both rules
+    /// and precisions.
+    fn tiled_matches_whole<T: FftFloat + std::fmt::Debug>() {
+        let (nrows, ncols) = (600, 560);
+        let d = 2.0 / 3600.0;
+        let old = Beam::from_arcsec(10.0, 8.0, 30.0).unwrap();
+        let new = Beam::from_arcsec(16.0, 11.0, 75.0).unwrap();
+        let mut image = Array2::<T>::from_elem((nrows, ncols), T::one());
+        let nan = T::nan();
+        for i in 0..nrows {
+            for j in 0..ncols {
+                let corner = i + j < 150 || (nrows - i) + (ncols - j) < 120;
+                let block = (300..340).contains(&i) && (200..330).contains(&j);
+                let left_edge = (420..470).contains(&i) && j < 6;
+                if corner || block || left_edge {
+                    image[(i, j)] = nan;
+                }
+            }
+        }
+        image[(100, 400)] = nan;
+        image[(0, 300)] = nan;
+        let taper = UvTaper::new(&old, &new);
+        let steps = (d.to_radians(), d.to_radians());
+        let tiling = Tiling::new((nrows, ncols), &taper, steps).expect("tiles fit");
+        assert!(
+            tiling.size * 3 < nrows,
+            "tiles of {} for {nrows}",
+            tiling.size
+        );
+        let plans = FftPlans::<T>::new(nrows, ncols);
+        let grid = UvGrid::new((nrows, ncols), steps.0, steps.1, &taper);
+        for blanking in [
+            NanBlanking::RacsTools,
+            NanBlanking::Fraction(0.5),
+            NanBlanking::Fraction(0.05),
+        ] {
+            let whole = nan_spread_whole(image.view(), &taper, &grid, &plans, blanking).unwrap();
+            let tiled = nan_spread_tiled(image.view(), &taper, steps, &tiling, blanking).unwrap();
+            let differ: u32 = whole
+                .words
+                .iter()
+                .zip(&tiled.words)
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum();
+            assert_eq!(differ, 0, "{blanking:?}: {differ} pixels differ");
+            let blanked: u32 = whole.words.iter().map(|w| w.count_ones()).sum();
+            let nans = image.iter().filter(|x| x.is_nan()).count() as u32;
+            assert!(blanked > nans / 2, "{blanking:?} blanked only {blanked}");
+        }
+    }
+
+    #[test]
+    fn test_tiled_nan_mask_matches_whole() {
+        tiled_matches_whole::<f64>();
+        tiled_matches_whole::<f32>();
+    }
+
+    /// A kernel large next to the image falls back to the whole-image mask.
+    #[test]
+    fn test_no_tiles_for_large_kernels() {
+        let taper = UvTaper::new(
+            &Beam::from_arcsec(10.0, 10.0, 0.0).unwrap(),
+            &Beam::from_arcsec(200.0, 200.0, 0.0).unwrap(),
+        );
+        let step = (2.0f64 / 3600.0).to_radians();
+        assert!(Tiling::new((600, 600), &taper, (step, step)).is_none());
+        assert!(Tiling::new((20000, 20000), &taper, (step, step)).is_some());
     }
 
     /// Blanking by fraction matches the reference, and blanks a lone NaN
