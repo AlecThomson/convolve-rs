@@ -280,7 +280,8 @@ class TestSmoothCubes:
             hdul[0].data = (
                 np.random.default_rng(5).normal(size=shape).astype(np.float32)
             )
-        beams = cr.cube_beams(path)
+        beams = [b for b in cr.cube_beams(path) if b is not None]
+        assert len(beams) == len(BEAMS_3D)
         targets = [
             cr.Beam.from_arcsec(b.major_arcsec + 0.3, b.minor_arcsec + 0.3, b.pa_deg)
             if c != 2
