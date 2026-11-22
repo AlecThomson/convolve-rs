@@ -269,6 +269,30 @@ class TestSmoothCubes:
         for ours, theirs in zip(cr.cube_beams(path), data.beams, strict=True):
             _same_beam(ours, theirs)
 
+    def test_channels_smooth_as_they_would_alone(self, tmp_path):
+        """A channel of a cube comes out exactly as the same plane smoothed on
+        its own, whatever kernels the other channels need. A kernel narrower
+        than a pixel on noise with power at the Nyquist frequency would show
+        any extra padding."""
+        path = _cube(tmp_path / "c.fits", BEAMS_3D)
+        with fits.open(path, mode="update") as hdul:
+            shape = hdul[0].data.shape
+            hdul[0].data = (
+                np.random.default_rng(5).normal(size=shape).astype(np.float32)
+            )
+        beams = cr.cube_beams(path)
+        targets = [
+            cr.Beam.from_arcsec(b.major_arcsec + 0.3, b.minor_arcsec + 0.3, b.pa_deg)
+            if c != 2
+            else cr.Beam.from_arcsec(40, 40, 0)
+            for c, b in enumerate(beams)
+        ]
+        (cube,) = cr.smooth_cubes([path], target_beams=targets)
+        data, out = fits.getdata(path)[0], fits.getdata(cube.output)[0]
+        for c, (old, new) in enumerate(zip(beams, targets, strict=True)):
+            alone = cr.smooth(data[c], old, new, PIX, PIX)
+            np.testing.assert_array_equal(out[c], alone)
+
     def test_cutoff_channel_is_masked(self, tmp_path):
         path = _cube(tmp_path / "c.fits", BEAMS_3D)
         (cube,) = cr.smooth_cubes(
