@@ -49,6 +49,49 @@ def _image(path: Path, beam, seed=0) -> Path:
     return path
 
 
+def test_smooth_images_takes_3d_and_4d_planes(tmp_path: Path):
+    """An image with degenerate third and fourth axes, as wsclean and flint
+    write, smooths as its 2D plane does."""
+    beam, target = (10.0, 8.0, 30.0), cr.Beam.from_arcsec(14.0, 12.0, 45.0)
+    flat = _image(tmp_path / "flat.fits", beam)
+    data, header = fits.getdata(flat), fits.getheader(flat)
+    header["CTYPE3"], header["CRPIX3"], header["CRVAL3"], header["CDELT3"] = (
+        "FREQ",
+        1.0,
+        1e9,
+        1e6,
+    )
+    fits.writeto(tmp_path / "cube3.fits", data[None], header)
+    header["CTYPE4"], header["CRPIX4"], header["CRVAL4"], header["CDELT4"] = (
+        "STOKES",
+        1.0,
+        1.0,
+        1.0,
+    )
+    fits.writeto(tmp_path / "cube4.fits", data[None, None], header)
+    paths = [flat, tmp_path / "cube3.fits", tmp_path / "cube4.fits"]
+    result = cr.smooth_images(paths, target_beam=target)
+    want = fits.getdata(result.images[0].output)
+    for image, naxis in zip(result.images[1:], (3, 4), strict=True):
+        got = fits.getdata(image.output)
+        assert got.ndim == naxis
+        np.testing.assert_array_equal(got.squeeze(), want)
+
+
+def test_smooth_images_blanks_all_beyond_cutoff_with_a_target(tmp_path: Path):
+    """With a target given, images beyond the cutoff are blanked with a zero
+    beam, even when that is every image, as racs_tools does."""
+    path = _image(tmp_path / "coarse.fits", (20.0, 15.0, 0.0))
+    target = cr.Beam.from_arcsec(25.0, 25.0, 0.0)
+    result = cr.smooth_images([path], target_beam=target, cutoff=18.0)
+    assert result.images[0].kernel is None
+    out = result.images[0].output
+    assert np.isnan(fits.getdata(out)).all()
+    assert fits.getheader(out)["BMAJ"] == 0.0
+    with pytest.raises(ValueError, match="flagged or invalid"):
+        cr.smooth_images([path], cutoff=18.0, dryrun=True)
+
+
 def _cube(path: Path, beams) -> Path:
     """A cube with a CASA BEAMS table of ``beams`` (arcsec, arcsec, deg)."""
     data = np.stack([_sky(b, seed=i) for i, b in enumerate(beams)])[None]
