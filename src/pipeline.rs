@@ -563,13 +563,16 @@ impl CubeJob<'_> {
         let written: Vec<Option<Beam>> = (0..meta.nfreq)
             .map(|c| self.targets[c].filter(|_| self.convolves(c)))
             .collect();
-        // One set of plans, large enough for the widest kernel of any channel.
-        let (prows, pcols) = (0..meta.nfreq)
+        // One set of plans per padded size the channels need, so each channel
+        // is convolved exactly as it would be on its own.
+        let plans: std::collections::BTreeMap<(usize, usize), FftPlans<T>> = (0..meta.nfreq)
             .filter(|&c| self.convolves(c))
             .filter_map(|c| Some((meta.beams[c]?, self.targets[c]?)))
             .map(|(old, new)| padded_size((meta.ny, meta.nx), &old, &new, meta.pixel_scale))
-            .fold((1, 1), |(r, c), (pr, pc)| (r.max(pr), c.max(pc)));
-        let plans = FftPlans::<T>::new(prows, pcols);
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|(r, c)| ((r, c), FftPlans::new(r, c)))
+            .collect();
         let cap = (rayon::current_num_threads() * 2).max(4);
         let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Array2<T>)>(cap);
 
@@ -615,7 +618,7 @@ impl CubeJob<'_> {
         &self,
         reader: &mut CubeReader,
         c: usize,
-        plans: &FftPlans<T>,
+        plans: &std::collections::BTreeMap<(usize, usize), FftPlans<T>>,
     ) -> Result<Array2<T>> {
         let meta = self.meta;
         if !self.convolves(c) {
@@ -644,6 +647,7 @@ impl CubeJob<'_> {
         let raw = reader
             .read_channel::<T>(c, meta)
             .with_context(|| format!("reading channel {c} from {}", meta.path.display()))?;
+        let size = padded_size((meta.ny, meta.nx), &old_beam, &target, meta.pixel_scale);
         smooth_with(
             raw,
             &old_beam,
@@ -651,7 +655,7 @@ impl CubeJob<'_> {
             meta.pixel_scale,
             meta.unit,
             self.nan_fraction,
-            Some(plans),
+            plans.get(&size),
         )
         .with_context(|| format!("smoothing channel {c}"))
     }

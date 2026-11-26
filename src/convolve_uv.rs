@@ -152,8 +152,9 @@ pub const DEFAULT_NAN_FRACTION: f64 = 0.5;
 /// is divided by the share of its kernel's weight that fell on data, and
 /// blanked where more than [`DEFAULT_NAN_FRACTION`] fell on missing data.
 ///
-/// Pass `plans` to reuse FFT plans across images; they are used when at least
-/// [`padded_size`], and new ones are made otherwise.
+/// Pass `plans` to reuse FFT plans across images; they are used when exactly
+/// [`padded_size`], and new ones are made otherwise, so the result never
+/// depends on the plans passed.
 ///
 /// # Errors
 ///
@@ -218,7 +219,7 @@ pub fn convolve_uv_with<'a, T: FftFloat>(
 
 /// The transform size [`convolve_uv`] pads an image of `dim` to, for
 /// convolving `old_beam` to `new_beam`: each axis grown by the kernel's reach
-/// and rounded up to a fast FFT length. Plans at least this large are reused.
+/// and rounded up to a fast FFT length. Plans of this size are reused.
 ///
 /// ```
 /// use convolve_rs::{Beam, PixelScale, padded_size};
@@ -309,7 +310,9 @@ pub(crate) fn convolve_with_gain<T: FftFloat>(
     let needed = (fast_len(nrows + reach), fast_len(ncols + reach));
     let local_plans;
     let plans = match plans {
-        Some(p) if p.nrows >= needed.0 && p.ncols >= needed.1 => p,
+        // Padding more than needed changes the result slightly for a kernel
+        // narrower than a pixel, so only plans of exactly this size are used.
+        Some(p) if p.dim() == needed => p,
         _ => {
             local_plans = FftPlans::new(needed.0, needed.1);
             &local_plans
@@ -1597,8 +1600,9 @@ mod tests {
         }
     }
 
-    /// Plans too small for the padded image are replaced; larger ones are
-    /// used, which only moves the padding further out.
+    /// Plans of the wrong size are replaced, so the image is the same to the
+    /// bit whatever plans are passed. Padding more would change it slightly
+    /// for a kernel narrower than a pixel.
     #[test]
     fn test_plans_of_any_size_give_the_same_image() {
         let img = test_image(40, 36, true);
@@ -1606,18 +1610,14 @@ mod tests {
         let new = Beam::from_arcsec(11.0, 9.0, 15.0).unwrap();
         let d = 2.0 / 3600.0;
         let want = convolve_uv(&img, &old, &new, d, d, None).unwrap().image;
-        for (r, c) in [(16, 17), (80, 75)] {
+        let exact = padded_size((40, 36), &old, &new, PixelScale::cdelt(d, d));
+        for (r, c) in [(16, 17), (80, 75), exact] {
             let plans = FftPlans::<f64>::new(r, c);
             let got = convolve_uv(&img, &old, &new, d, d, Some(&plans))
                 .unwrap()
                 .image;
             for (a, b) in want.iter().zip(got.iter()) {
-                assert_eq!(a.is_nan(), b.is_nan());
-                if !a.is_nan() {
-                    // Padding more changes the result by the kernel's response at
-                    // the Nyquist frequency times the image's power there.
-                    assert!((a - b).abs() < 1e-5, "plans {r}x{c}: {a} vs {b}");
-                }
+                assert_eq!(a.to_bits(), b.to_bits(), "plans {r}x{c}");
             }
         }
     }
