@@ -440,6 +440,18 @@ class TestMissingData:
         assert kept.size > 0.8 * out.size
         np.testing.assert_allclose(kept, 1.0, rtol=0, atol=1e-6)
 
+    @pytest.mark.parametrize("shape", [(96, 80), (700, 760)])
+    def test_flat_image_stays_flat_for_a_kernel_under_a_pixel(self, shape):
+        """A kernel this narrow rings, so its missing shares are found over the
+        whole image even where it is large enough for tiles."""
+        image = np.ones(shape)
+        image[30:50, 40:70] = np.nan
+        old, new = Beam.from_arcsec(10, 10, 0), Beam.from_arcsec(10.5, 10.3, 0)
+        out = smooth(image, old, new, self.PIX, self.PIX, bunit="K")
+        kept = out[~np.isnan(out)]
+        assert kept.size > 0.9 * out.size
+        np.testing.assert_allclose(kept, 1.0, rtol=0, atol=1e-5)
+
     def test_corners_and_nan_interiors_are_blank(self):
         out = smooth(self._flat(), self.OLD, self.NEW, self.PIX, self.PIX)
         assert np.isnan(out[[0, 0, -1, -1], [0, -1, 0, -1]]).all()
