@@ -273,9 +273,10 @@ fn kernel_reach(taper: &UvTaper, steps: (f64, f64)) -> usize {
     (6.1 * largest.max(0.0).sqrt()).ceil() as usize + 1
 }
 
-/// Whether the kernel's transform is still above round-off somewhere at the
-/// Nyquist frequency. Such a kernel, under about two pixels wide, rings beyond
-/// its reach, and differently in transforms of different sizes.
+/// Whether the kernel's transform is above 1e-5 somewhere at the Nyquist
+/// frequency. Such a kernel, under about 1.5 pixels of standard deviation,
+/// rings beyond its reach, and differently in transforms of different sizes,
+/// so its missing shares found in tiles would be off by more than that.
 fn rings(taper: &UvTaper, steps: (f64, f64)) -> bool {
     let (srr, scc, src) = pixel_covariance(taper, steps);
     // The least of fᵀ S f along an edge of the band, one frequency at ±1/2.
@@ -288,7 +289,7 @@ fn rings(taper: &UvTaper, steps: (f64, f64)) -> bool {
         s_fixed / 4.0 + src * free + s_free * free * free
     };
     let least = edge(srr, scc).min(edge(scc, srr));
-    (-2.0 * std::f64::consts::PI.powi(2) * least).exp() >= MISSING_ROUND_OFF
+    (-2.0 * std::f64::consts::PI.powi(2) * least).exp() >= 1e-5
 }
 
 /// [`convolve_uv`] with the filter's DC gain set to `gain(g_ratio)`, where
@@ -1426,6 +1427,10 @@ mod tests {
         // Wide along one axis, but under a pixel along the other
         assert!(ring((10.0, 10.0, 0.0), (30.0, 10.3, 0.0)));
         assert!(ring((10.0, 10.0, 0.0), (30.0, 10.3, 37.0)));
+        // About 1.4 pixels of standard deviation along the narrow axis
+        assert!(ring((10.0, 8.0, 0.0), (20.0, 10.0, 0.0)));
+        // About 1.8 pixels, where the transform at Nyquist is about 2e-7
+        assert!(!ring((10.0, 10.0, 0.0), (13.0, 13.0, 0.0)));
         // 2.5 pixels of standard deviation along every axis
         assert!(!ring((10.0, 10.0, 0.0), (15.3, 15.3, 0.0)));
         assert!(!ring((10.0, 8.0, 30.0), (25.0, 20.0, 75.0)));
