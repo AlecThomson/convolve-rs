@@ -254,18 +254,41 @@ fn taper_for(old_beam: &Beam, new_beam: &Beam, scale: PixelScale) -> (UvTaper, (
     }
 }
 
-/// The kernel's reach in pixels: 6.1 standard deviations along its major
-/// axis, plus one. Beyond it the kernel holds under 1e-8 of its sum.
-fn kernel_reach(taper: &UvTaper, (row_step, col_step): (f64, f64)) -> usize {
-    // exp(-2π² fᵀ S f) is the transform of a Gaussian of covariance S.
+/// The kernel's covariance in pixels, `(rows, columns, cross)`: its
+/// transform is exp(-2π² fᵀ S f) at f cycles per pixel.
+fn pixel_covariance(taper: &UvTaper, (row_step, col_step): (f64, f64)) -> (f64, f64, f64) {
     let k = -1.0 / (2.0 * std::f64::consts::PI.powi(2));
-    let (srr, scc) = (
+    (
         k * taper.a / row_step.powi(2),
         k * taper.c / col_step.powi(2),
-    );
-    let src = k * taper.b / 2.0 / (row_step * col_step);
+        k * taper.b / 2.0 / (row_step * col_step),
+    )
+}
+
+/// The kernel's reach in pixels: 6.1 standard deviations along its major
+/// axis, plus one. Beyond it the kernel holds under 1e-8 of its sum.
+fn kernel_reach(taper: &UvTaper, steps: (f64, f64)) -> usize {
+    let (srr, scc, src) = pixel_covariance(taper, steps);
     let largest = (srr + scc) / 2.0 + (((srr - scc) / 2.0).powi(2) + src * src).sqrt();
     (6.1 * largest.max(0.0).sqrt()).ceil() as usize + 1
+}
+
+/// Whether the kernel's transform is still above round-off somewhere at the
+/// Nyquist frequency. Such a kernel, under about two pixels wide, rings beyond
+/// its reach, and differently in transforms of different sizes.
+fn rings(taper: &UvTaper, steps: (f64, f64)) -> bool {
+    let (srr, scc, src) = pixel_covariance(taper, steps);
+    // The least of fᵀ S f along an edge of the band, one frequency at ±1/2.
+    let edge = |s_fixed: f64, s_free: f64| {
+        let free = if s_free > 0.0 {
+            (-src / (2.0 * s_free)).clamp(-0.5, 0.5)
+        } else {
+            0.5
+        };
+        s_fixed / 4.0 + src * free + s_free * free * free
+    };
+    let least = edge(srr, scc).min(edge(scc, srr));
+    (-2.0 * std::f64::consts::PI.powi(2) * least).exp() >= MISSING_ROUND_OFF
 }
 
 /// [`convolve_uv`] with the filter's DC gain set to `gain(g_ratio)`, where
@@ -361,7 +384,7 @@ struct MissingSpan<T> {
 /// Where the kernel reaches missing data: NaN pixels and the sky beyond the
 /// image. Away from it a pixel is left as it is, so only the part near it is
 /// computed, tile by tile ([`Tiling`]), unless the kernel is large next to
-/// the image.
+/// the image or [`rings`].
 fn missing_fractions<T: FftFloat>(
     image: ArrayView2<'_, T>,
     taper: &UvTaper,
@@ -370,7 +393,7 @@ fn missing_fractions<T: FftFloat>(
     has_nans: bool,
     (grid, plans): (&UvGrid, &FftPlans<T>),
 ) -> Result<Vec<MissingSpan<T>>, ConvolveError> {
-    match Tiling::new(image.dim(), reach) {
+    match Tiling::new(image.dim(), reach).filter(|_| !rings(taper, steps)) {
         Some(tiling) => missing_tiled(image, taper, steps, &tiling, has_nans),
         None => missing_whole(image, taper, grid, plans),
     }
@@ -1388,6 +1411,24 @@ mod tests {
     fn test_tiled_missing_matches_whole() {
         tiled_matches_whole::<f64>();
         tiled_matches_whole::<f32>();
+    }
+
+    /// Kernels under about two pixels wide ring, in any orientation; wider
+    /// ones do not.
+    #[test]
+    fn test_narrow_kernels_ring() {
+        let step = (2.0f64 / 3600.0).to_radians();
+        let ring = |old: (f64, f64, f64), new: (f64, f64, f64)| {
+            let beam = |(a, b, pa)| Beam::from_arcsec(a, b, pa).unwrap();
+            rings(&UvTaper::new(&beam(old), &beam(new)), (step, step))
+        };
+        assert!(ring((10.0, 10.0, 0.0), (10.5, 10.3, 0.0)));
+        // Wide along one axis, but under a pixel along the other
+        assert!(ring((10.0, 10.0, 0.0), (30.0, 10.3, 0.0)));
+        assert!(ring((10.0, 10.0, 0.0), (30.0, 10.3, 37.0)));
+        // 2.5 pixels of standard deviation along every axis
+        assert!(!ring((10.0, 10.0, 0.0), (15.3, 15.3, 0.0)));
+        assert!(!ring((10.0, 8.0, 30.0), (25.0, 20.0, 75.0)));
     }
 
     /// A kernel large next to the image is done whole.
